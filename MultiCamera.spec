@@ -11,7 +11,8 @@ import pathlib
 from PyInstaller.building.build_main import Analysis, COLLECT, EXE, PYZ
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs, collect_submodules
 
-ROOT = pathlib.Path(SPECPATH).resolve().parent
+# PyInstaller sets SPECPATH to the directory containing this .spec file.
+ROOT = pathlib.Path(SPECPATH).resolve()
 SRC = ROOT / "src"
 ENTRY = SRC / "multicamera" / "__main__.py"
 
@@ -53,7 +54,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter"],
+    excludes=[
+        "tkinter",
+        "torch",
+        "open3d.ml.torch",
+        "open3d.ml.tf",
+        "PySide6.scripts.deploy_lib",
+    ],
     noarchive=False,
 )
 
