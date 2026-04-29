@@ -1,0 +1,43 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build app and installer
+        shell: cmd
+        run: scripts\build_windows_installer.bat
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiCamera-Windows-Installer
+          path: installer_output\MultiCamera_Setup_*_x64.exe
+          if-no-files-found: error
+
+      - name: Upload portable app folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiCamera-Windows-Portable-Folder
+          path: dist\MultiCamera
+          if-no-files-found: error

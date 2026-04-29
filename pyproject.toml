@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multicamera"
+version = "0.1.0"
+description = "Multi stereo camera joint calibration and point cloud fusion"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "opencv-contrib-python>=4.9",
+    "open3d>=0.18",
+    "numpy>=1.24",
+    "aiohttp>=3.9",
+    "scipy>=1.11",
+    "zeroconf>=0.130",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.3",
+]
+build-win = [
+    "pyinstaller>=6.0",
+]
+
+[project.scripts]
+multicamera = "multicamera.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
