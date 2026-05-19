@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 
 from ...board.charuco_board import CharucoBoard
 from ...board.detector import CharucoDetector, DetectionResult
+from ...perf import perf_timer
 from ...streaming.stream_manager import StreamManager
 from ..opencv_unicode_text import TextPainter
-from ..theme import ACCENT, BG_CARD, BG_DARK, BG_MID, BORDER, TEXT, TEXT_DIM, TEXT_HINT
+from ..theme import ACCENT, BG_CARD, BG_DARK, BORDER, TEXT_DIM, TEXT_HINT
 from .capture_guide import CaptureSequence, CaptureTarget, draw_target_overlay
 
 
@@ -132,6 +133,31 @@ def _render_heatmap(grid: np.ndarray, w: int, h: int) -> np.ndarray:
     return cv2.resize(small_color, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
+def _scale_detection_result(
+    result: DetectionResult,
+    scale: float,
+    image_size: tuple[int, int],
+) -> DetectionResult:
+    corners = None
+    if result.charuco_corners is not None:
+        corners = result.charuco_corners.copy()
+        corners *= scale
+
+    marker_corners = []
+    for marker in result.marker_corners:
+        scaled = marker.copy()
+        scaled *= scale
+        marker_corners.append(scaled)
+
+    return DetectionResult(
+        charuco_corners=corners,
+        charuco_ids=result.charuco_ids,
+        marker_corners=marker_corners,
+        marker_ids=result.marker_ids,
+        image_size=image_size,
+    )
+
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Camera tile widget
@@ -184,6 +210,8 @@ class CameraView(QFrame):
         layout.addWidget(header)
 
         self._last_frame: Optional[np.ndarray] = None
+        self._last_label_size: Optional[tuple[int, int]] = None
+        self._last_pixmap: Optional[QPixmap] = None
 
         self._image_label = _PreviewLabel()
         self._image_label.setAlignment(Qt.AlignCenter)
@@ -222,7 +250,8 @@ class CameraView(QFrame):
             self._render_cached_frame()
 
     def update_frame(self, frame: np.ndarray):
-        self._last_frame = np.copy(frame)
+        self._last_frame = frame
+        self._last_label_size = None
         self._render_cached_frame()
 
     def _render_cached_frame(self):
@@ -231,14 +260,21 @@ class CameraView(QFrame):
         frame = self._last_frame
         lw = max(1, self._image_label.width())
         lh = max(1, self._image_label.height())
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        scaled = QPixmap.fromImage(qimg).scaled(
-            QSize(lw, lh),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        label_size = (lw, lh)
+        if self._last_pixmap is not None and self._last_label_size == label_size:
+            self._image_label.setPixmap(self._last_pixmap)
+            return
+        with perf_timer(f"preview render {self.camera_id}", threshold_ms=30.0):
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+            scaled = QPixmap.fromImage(qimg).scaled(
+                QSize(lw, lh),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        self._last_pixmap = scaled
+        self._last_label_size = label_size
         self._image_label.setPixmap(scaled)
 
     def refresh_preview_if_cached(self) -> None:
@@ -309,7 +345,8 @@ class MultiStreamView(QWidget):
     """Dynamic grid of camera views with calibration board guide overlay."""
 
     UI_FPS_CAP = 15
-    DETECT_EVERY_N = 3
+    DETECT_FPS_CAP = 2.0
+    DETECT_MAX_WIDTH = 960
 
     def __init__(
         self,
@@ -329,9 +366,10 @@ class MultiStreamView(QWidget):
         self._capture_sequence: Optional[CaptureSequence] = None
 
         self._last_render_ts: Dict[str, float] = {}
-        self._frame_counters: Dict[str, int] = {}
+        self._last_detect_ts: Dict[str, float] = {}
         self._last_detection: Dict[str, DetectionResult] = {}
         self._min_interval = 1.0 / self.UI_FPS_CAP
+        self._detect_min_interval = 1.0 / self.DETECT_FPS_CAP
         self._expanded_id: Optional[str] = None
 
         self._layout = QGridLayout(self)
@@ -352,6 +390,8 @@ class MultiStreamView(QWidget):
         self._board = board
         self._detector = CharucoDetector(board)
         self._trackers.clear()
+        self._last_detection.clear()
+        self._last_detect_ts.clear()
 
     def set_capture_sequence(self, seq: Optional[CaptureSequence]):
         self._capture_sequence = seq
@@ -372,7 +412,7 @@ class MultiStreamView(QWidget):
             if camera_id not in self._trackers:
                 self._trackers[camera_id] = CoverageTracker((w, h))
 
-            result = self._detector.detect(frame)
+            result = self._detect_for_preview(frame)
             if self._show_guide:
                 display = self._detector.draw_detected(frame, result)
                 display = draw_guide_overlay(
@@ -408,10 +448,10 @@ class MultiStreamView(QWidget):
         if camera_id not in self._trackers:
             self._trackers[camera_id] = CoverageTracker((w, h))
 
-        cnt = self._frame_counters.get(camera_id, 0)
-        self._frame_counters[camera_id] = cnt + 1
-        if cnt % self.DETECT_EVERY_N == 0 or camera_id not in self._last_detection:
-            result = self._detector.detect(frame)
+        last_detect = self._last_detect_ts.get(camera_id, 0.0)
+        if now - last_detect >= self._detect_min_interval or camera_id not in self._last_detection:
+            self._last_detect_ts[camera_id] = now
+            result = self._detect_for_preview(frame)
             self._last_detection[camera_id] = result
         else:
             result = self._last_detection[camera_id]
@@ -441,6 +481,23 @@ class MultiStreamView(QWidget):
 
         fps = self._fps.get(camera_id, 0)
         view.update_info(f"{w}x{h} | {fps:.1f} fps")
+
+    def _detect_for_preview(self, frame: np.ndarray) -> DetectionResult:
+        h, w = frame.shape[:2]
+        scale = 1.0
+        detect_frame = frame
+        if w > self.DETECT_MAX_WIDTH:
+            scale = self.DETECT_MAX_WIDTH / float(w)
+            detect_frame = cv2.resize(
+                frame,
+                (self.DETECT_MAX_WIDTH, max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        with perf_timer("preview charuco detect", threshold_ms=40.0):
+            result = self._detector.detect(detect_frame)
+        if scale == 1.0:
+            return result
+        return _scale_detection_result(result, 1.0 / scale, (w, h))
 
     @Slot(str)
     def _on_connected(self, camera_id: str):

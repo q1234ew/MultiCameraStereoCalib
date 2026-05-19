@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..opencv_unicode_text import TextPainter, draw_text_baseline_bgr as _put_text
+from ..opencv_unicode_text import TextPainter
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -131,6 +131,32 @@ def build_default_sequence() -> List[CaptureTarget]:
     seq.append(CaptureTarget(2, 2, BoardTilt.TILT_LEFT))
     seq.append(CaptureTarget(0, 1, BoardTilt.TILT_DOWN))
 
+    return seq
+
+
+def build_multimodal_sequence() -> List[CaptureTarget]:
+    """RGB_L + AUX 平面板采图序：覆盖视场 + 倾角，用于跨模态单目标定。"""
+    seq: List[CaptureTarget] = []
+    for r, c in (
+        (1, 1),
+        (1, 0),
+        (1, 2),
+        (0, 1),
+        (2, 1),
+        (0, 0),
+        (0, 2),
+        (2, 0),
+        (2, 2),
+    ):
+        seq.append(CaptureTarget(r, c, BoardTilt.FRONT))
+
+    for tilt in (
+        BoardTilt.TILT_LEFT,
+        BoardTilt.TILT_RIGHT,
+        BoardTilt.TILT_UP,
+        BoardTilt.TILT_DOWN,
+    ):
+        seq.append(CaptureTarget(1, 1, tilt))
     return seq
 
 

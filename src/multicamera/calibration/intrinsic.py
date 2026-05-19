@@ -10,6 +10,7 @@ import numpy as np
 
 from ..board.charuco_board import CharucoBoard
 from ..board.detector import CharucoDetector, DetectionResult
+from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel
 
 logger = logging.getLogger(__name__)
@@ -50,13 +51,25 @@ class IntrinsicCalibrator:
 
     def add_frame(self, image: np.ndarray) -> DetectionResult:
         """Detect ChArUco in image and store if valid."""
-        result = self.detector.detect(image)
+        with perf_timer("intrinsic add_frame", threshold_ms=120.0):
+            result = self.detector.detect(image)
+        self.add_detection(result, image=image)
+        return result
+
+    def add_detection(
+        self,
+        result: DetectionResult,
+        image: Optional[np.ndarray] = None,
+    ) -> bool:
+        """Store an already computed ChArUco detection."""
         if result.valid and result.num_corners >= MIN_CORNERS_PER_FRAME:
             self._all_corners.append(result.charuco_corners)
             self._all_ids.append(result.charuco_ids)
-            self._images.append(image.copy())
+            if image is not None:
+                self._images.append(image.copy())
             self._image_size = result.image_size
-        return result
+            return True
+        return False
 
     def pop_last_frame(self) -> bool:
         """Remove the most recently stored frame. Returns False if empty."""
@@ -78,8 +91,10 @@ class IntrinsicCalibrator:
             )
 
         if self.model == CameraModel.FISHEYE:
-            return self._calibrate_fisheye(flags)
-        return self._calibrate_pinhole(flags)
+            with perf_timer("fisheye intrinsic calibrate", threshold_ms=500.0):
+                return self._calibrate_fisheye(flags)
+        with perf_timer("pinhole intrinsic calibrate", threshold_ms=500.0):
+            return self._calibrate_pinhole(flags)
 
     def _calibrate_pinhole(self, flags: int) -> CameraIntrinsics:
         rms, K, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(

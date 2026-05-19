@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -30,12 +31,18 @@ from PySide6.QtWidgets import (
 from ...board.charuco_board import ArucoDictType, CharucoBoard, CharucoBoardConfig
 from ...calibration.models import CameraModel
 from ...streaming.discovery import DiscoveredService, DiscoveryWorker
-from ...streaming.stream_manager import CameraConfig, StereoPairConfig, StreamManager
+from ...streaming.stream_manager import (
+    AuxiliaryCameraConfig,
+    CameraConfig,
+    StereoPairConfig,
+    StreamManager,
+)
 
 _SOURCE_LABELS = {"mdns": "mDNS", "probe": "扫描"}
 _STREAM_TYPE_LABELS = {
     "rgb": "RGB",
     "ir": "红外",
+    "acoustic_rgb": "声像仪 RGB",
     "control": "控制台",
     "unknown": "未知",
 }
@@ -94,6 +101,7 @@ class ConfigDialog(QDialog):
         top_row.addWidget(self._create_model_group(), 1)
         top_row.addWidget(self._create_board_group(), 2)
         layout.addLayout(top_row)
+        layout.addWidget(self._create_multimodal_group())
         layout.addWidget(self._create_pairs_group(), 1)
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -120,6 +128,48 @@ class ConfigDialog(QDialog):
         self._lbl_model_hint.setWordWrap(True)
         form.addRow(self._lbl_model_hint)
 
+        return group
+
+    def _create_multimodal_group(self) -> QGroupBox:
+        group = QGroupBox("融合辅助单目")
+        form = QFormLayout(group)
+        form.setContentsMargins(10, 6, 10, 6)
+        form.setSpacing(4)
+
+        self._combo_fusion_mode = QComboBox()
+        self._combo_fusion_mode.addItem("不启用", "")
+        self._combo_fusion_mode.addItem("RGB 双目 + IR 单目", "ir")
+        self._combo_fusion_mode.addItem("RGB 双目 + 声像仪 RGB 单目", "acoustic_rgb")
+        self._combo_fusion_mode.currentIndexChanged.connect(self._update_aux_enabled)
+        self._combo_fusion_mode.currentIndexChanged.connect(self._refresh_aux_dropdown)
+        form.addRow("融合模式:", self._combo_fusion_mode)
+
+        aux_pick_row = QHBoxLayout()
+        self._combo_aux_camera = QComboBox()
+        self._combo_aux_camera.setMinimumWidth(320)
+        aux_pick_row.addWidget(self._combo_aux_camera, 1)
+        self._btn_use_aux_service = QPushButton("使用发现服务")
+        self._btn_use_aux_service.clicked.connect(self._use_selected_aux_service)
+        aux_pick_row.addWidget(self._btn_use_aux_service)
+        form.addRow("已发现辅助流:", aux_pick_row)
+
+        self._edit_aux_id = QLineEdit()
+        self._edit_aux_id.setPlaceholderText("aux_cam")
+        form.addRow("辅助相机 ID:", self._edit_aux_id)
+
+        self._edit_aux_url = QLineEdit()
+        self._edit_aux_url.setPlaceholderText("http://...")
+        form.addRow("辅助相机 URL:", self._edit_aux_url)
+
+        self._combo_aux_board = QComboBox()
+        self._combo_aux_board.addItem("棋盘格 (chessboard)", "chessboard")
+        self._combo_aux_board.addItem("圆点阵 (circles_grid)", "circles_grid")
+        form.addRow("平面板类型:", self._combo_aux_board)
+
+        hint = QLabel("辅助单目用于 RGB_L 参考系外参求解；无配对观测时不会计算跨模态外参。")
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        form.addRow(hint)
         return group
 
     def _create_board_group(self) -> QGroupBox:
@@ -247,9 +297,9 @@ class ConfigDialog(QDialog):
         self._table_splitter.addWidget(self._discovered_table)
 
         # stereo pair table
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["组名称", "类型", "左相机 ID", "左相机 URL", "右相机 URL"]
+            ["组名称", "类型", "左相机 ID", "左相机 URL", "右相机 ID", "右相机 URL"]
         )
         self._configure_scrollable_table(self._table)
         self._table.verticalHeader().setVisible(False)
@@ -380,7 +430,11 @@ class ConfigDialog(QDialog):
         self._refresh_camera_dropdowns()
 
         if has:
-            camera_count = sum(1 for s in self._discovered if s.stream_type in {"rgb", "ir"})
+            camera_count = sum(
+                1
+                for s in self._discovered
+                if s.stream_type in {"rgb", "ir", "acoustic_rgb"}
+            )
             n_mdns = sum(1 for s in self._discovered if s.source == "mdns")
             n_probe = sum(1 for s in self._discovered if s.source == "probe")
             parts = []
@@ -426,6 +480,7 @@ class ConfigDialog(QDialog):
         ]
         self._fill_camera_combo(self._combo_left_camera, candidates, preferred_eye="left")
         self._fill_camera_combo(self._combo_right_camera, candidates, preferred_eye="right")
+        self._refresh_aux_dropdown()
 
     def _fill_camera_combo(
         self,
@@ -451,6 +506,50 @@ class ConfigDialog(QDialog):
         eye = _EYE_LABELS.get(svc.eye, svc.eye)
         stype = _STREAM_TYPE_LABELS.get(svc.stream_type, svc.stream_type)
         return f"{stype} / {eye}  {svc.name}  {svc.url}"
+
+    def _refresh_aux_dropdown(self, *_):
+        if not hasattr(self, "_combo_aux_camera"):
+            return
+        modality = self._combo_fusion_mode.currentData() or ""
+        self._combo_aux_camera.blockSignals(True)
+        self._combo_aux_camera.clear()
+        if not modality:
+            self._combo_aux_camera.blockSignals(False)
+            return
+
+        candidates = [
+            svc
+            for svc in getattr(self, "_discovered", [])
+            if self._service_matches_aux_mode(svc, modality)
+        ]
+        for svc in candidates:
+            self._combo_aux_camera.addItem(self._service_combo_label(svc), svc)
+        self._combo_aux_camera.blockSignals(False)
+
+    def _service_matches_aux_mode(self, svc: DiscoveredService, modality: str) -> bool:
+        if modality == "ir":
+            return svc.stream_type == "ir"
+        if modality == "acoustic_rgb":
+            if svc.stream_type == "acoustic_rgb":
+                return True
+            haystack = f"{svc.name} {svc.url} {svc.path}".lower()
+            return svc.stream_type == "rgb" and any(
+                token in haystack for token in ("acoustic", "sound", "声像仪")
+            )
+        return False
+
+    def _use_selected_aux_service(self):
+        svc = self._combo_aux_camera.currentData()
+        if svc is None:
+            self._lbl_scan_status.setText("请先发现并选择辅助相机服务")
+            self._lbl_scan_status.setStyleSheet("font-size:11px; color:#e09f3e;")
+            return
+        modality = self._combo_fusion_mode.currentData() or svc.stream_type
+        prefix = "aux_ir" if modality == "ir" else "aux_acoustic"
+        self._edit_aux_id.setText(self._camera_id_from_service(svc, prefix))
+        self._edit_aux_url.setText(svc.url)
+        self._lbl_scan_status.setText(f"已选择辅助服务: {svc.name}")
+        self._lbl_scan_status.setStyleSheet("font-size:11px; color:#52b788;")
 
     def _add_pair_from_dropdowns(self):
         left = self._combo_left_camera.currentData()
@@ -503,9 +602,10 @@ class ConfigDialog(QDialog):
         self._table.setItem(
             row, 1, QTableWidgetItem(_STREAM_TYPE_LABELS.get(stream_type, stream_type))
         )
-        self._table.setItem(row, 2, QTableWidgetItem(f"{prefix}_cam_{pair_idx}"))
+        self._table.setItem(row, 2, QTableWidgetItem(f"{prefix}_cam_{pair_idx}_L"))
         self._table.setItem(row, 3, QTableWidgetItem(left.url))
-        self._table.setItem(row, 4, QTableWidgetItem(right.url))
+        self._table.setItem(row, 4, QTableWidgetItem(f"{prefix}_cam_{pair_idx}_R"))
+        self._table.setItem(row, 5, QTableWidgetItem(right.url))
 
     def _load_current(self):
         idx = self._combo_model.findData(self._camera_model)
@@ -533,7 +633,20 @@ class ConfigDialog(QDialog):
             )
             self._table.setItem(row, 2, QTableWidgetItem(pair.left.camera_id))
             self._table.setItem(row, 3, QTableWidgetItem(pair.left.url))
-            self._table.setItem(row, 4, QTableWidgetItem(pair.right.url))
+            self._table.setItem(row, 4, QTableWidgetItem(pair.right.camera_id))
+            self._table.setItem(row, 5, QTableWidgetItem(pair.right.url))
+
+        aux = self._stream_manager.auxiliary_camera
+        if aux is not None:
+            idx = self._combo_fusion_mode.findData(aux.modality)
+            if idx >= 0:
+                self._combo_fusion_mode.setCurrentIndex(idx)
+            self._edit_aux_id.setText(aux.camera_id)
+            self._edit_aux_url.setText(aux.url)
+            idx = self._combo_aux_board.findData(aux.board_pattern)
+            if idx >= 0:
+                self._combo_aux_board.setCurrentIndex(idx)
+        self._update_aux_enabled()
 
     def _add_row(self):
         row = self._table.rowCount()
@@ -542,7 +655,8 @@ class ConfigDialog(QDialog):
         self._table.setItem(row, 1, QTableWidgetItem("RGB"))
         self._table.setItem(row, 2, QTableWidgetItem(f"cam_{row * 2 + 1}"))
         self._table.setItem(row, 3, QTableWidgetItem("http://"))
-        self._table.setItem(row, 4, QTableWidgetItem("http://"))
+        self._table.setItem(row, 4, QTableWidgetItem(f"cam_{row * 2 + 2}"))
+        self._table.setItem(row, 5, QTableWidgetItem("http://"))
 
     def _remove_row(self):
         rows = set(idx.row() for idx in self._table.selectedIndexes())
@@ -565,16 +679,17 @@ class ConfigDialog(QDialog):
         self._stream_manager.stop_all()
         for name in list(self._stream_manager.stereo_pairs.keys()):
             self._stream_manager.remove_stereo_pair(name)
+        self._stream_manager.clear_auxiliary_camera()
 
         for row in range(self._table.rowCount()):
             name = self._item_text(row, 0)
             stream_type = self._stream_type_from_label(self._item_text(row, 1))
             left_id = self._item_text(row, 2)
             left_url = self._item_text(row, 3)
-            right_url = self._item_text(row, 4)
-            right_id = f"{left_id}_R"
+            right_id = self._item_text(row, 4)
+            right_url = self._item_text(row, 5)
 
-            if not name or not left_url or not right_url:
+            if not name or not left_id or not right_id or not left_url or not right_url:
                 continue
 
             pair = StereoPairConfig(
@@ -596,6 +711,20 @@ class ConfigDialog(QDialog):
             )
             self._stream_manager.add_stereo_pair(pair)
 
+        modality = self._combo_fusion_mode.currentData() or ""
+        aux_id = self._edit_aux_id.text().strip() or "aux_cam"
+        aux_url = self._edit_aux_url.text().strip()
+        if modality and aux_url:
+            self._stream_manager.set_auxiliary_camera(
+                AuxiliaryCameraConfig(
+                    camera_id=aux_id,
+                    url=aux_url,
+                    modality=modality,
+                    board_pattern=self._combo_aux_board.currentData() or "chessboard",
+                    stream_type="ir" if modality == "ir" else "acoustic_rgb",
+                )
+            )
+
         self.accept()
 
     @staticmethod
@@ -610,3 +739,17 @@ class ConfigDialog(QDialog):
     def _item_text(self, row: int, col: int) -> str:
         item = self._table.item(row, col)
         return item.text().strip() if item is not None else ""
+
+    def _update_aux_enabled(self, *_):
+        enabled = bool(self._combo_fusion_mode.currentData())
+        self._edit_aux_id.setEnabled(enabled)
+        self._edit_aux_url.setEnabled(enabled)
+        self._combo_aux_board.setEnabled(enabled)
+        self._combo_aux_camera.setEnabled(enabled)
+        self._btn_use_aux_service.setEnabled(enabled)
+
+    @staticmethod
+    def _camera_id_from_service(svc: DiscoveredService, fallback_prefix: str) -> str:
+        raw = svc.name or svc.host or fallback_prefix
+        cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw).strip("_")
+        return cleaned or fallback_prefix

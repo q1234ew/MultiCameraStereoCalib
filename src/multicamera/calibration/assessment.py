@@ -339,9 +339,6 @@ class CalibrationEvaluator:
         stereo = pair.stereo
         errors = []
 
-        from ..board.charuco_board import CharucoBoard
-        from ..board.detector import CharucoDetector
-
         for left, right in zip(left_images, right_images):
             rect_l = cv2.remap(left, stereo.map1_left, stereo.map2_left, cv2.INTER_LINEAR)
             rect_r = cv2.remap(right, stereo.map1_right, stereo.map2_right, cv2.INTER_LINEAR)

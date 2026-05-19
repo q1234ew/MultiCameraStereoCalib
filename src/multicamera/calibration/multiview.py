@@ -7,14 +7,12 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
 
 from .models import (
     CameraExtrinsics,
     CameraIntrinsics,
     MultiCameraRig,
     StereoPairCalibration,
-    StereoCalibResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,11 +184,11 @@ class MultiViewCalibrator:
 
     def _refine_bundle_adjustment(self, rig: MultiCameraRig):
         """Global refinement of all camera extrinsics via reprojection error minimisation."""
+        from scipy.optimize import least_squares
+
         camera_ids = sorted(rig.extrinsics.keys())
         if len(camera_ids) < 2:
             return
-
-        ref_idx = camera_ids.index(self.reference_camera)
 
         intrinsics_map: Dict[str, CameraIntrinsics] = {}
         for pair in rig.pairs.values():

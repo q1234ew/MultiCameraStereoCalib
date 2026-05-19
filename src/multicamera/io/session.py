@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,8 +12,9 @@ import cv2
 import numpy as np
 
 from ..board.charuco_board import CharucoBoard
-from ..calibration.models import MultiCameraRig, StereoPairCalibration
-from ..streaming.stream_manager import StereoPairConfig
+from ..calibration.models import MultiCameraRig
+from ..perf import perf_timer
+from ..streaming.stream_manager import AuxiliaryCameraConfig, StereoPairConfig
 
 
 class CalibrationSession:
@@ -22,6 +22,7 @@ class CalibrationSession:
 
     METADATA_FILE = "session.json"
     IMAGES_DIR = "images"
+    MULTIMODAL_DIR = "multimodal"
     RESULTS_DIR = "results"
 
     def __init__(self, session_dir: Path):
@@ -32,6 +33,7 @@ class CalibrationSession:
     def _ensure_dirs(self):
         self.session_dir.mkdir(parents=True, exist_ok=True)
         (self.session_dir / self.IMAGES_DIR).mkdir(exist_ok=True)
+        (self.session_dir / self.MULTIMODAL_DIR).mkdir(exist_ok=True)
         (self.session_dir / self.RESULTS_DIR).mkdir(exist_ok=True)
 
     # ── Factory ───────────────────────────────────────────────
@@ -42,6 +44,7 @@ class CalibrationSession:
         base_dir: Path,
         board: CharucoBoard,
         pairs: List[StereoPairConfig],
+        auxiliary: AuxiliaryCameraConfig | None = None,
         name: str = "",
     ) -> CalibrationSession:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -64,7 +67,19 @@ class CalibrationSession:
                 }
                 for p in pairs
             ],
+            "auxiliary_camera": (
+                {
+                    "camera_id": auxiliary.camera_id,
+                    "url": auxiliary.url,
+                    "modality": auxiliary.modality,
+                    "board_pattern": auxiliary.board_pattern,
+                    "stream_type": auxiliary.stream_type,
+                }
+                if auxiliary is not None
+                else None
+            ),
             "frame_count": 0,
+            "multimodal_frame_count": 0,
         }
         session._save_metadata()
         return session
@@ -93,8 +108,17 @@ class CalibrationSession:
         pair_dir = self.session_dir / self.IMAGES_DIR / pair_name
         pair_dir.mkdir(parents=True, exist_ok=True)
 
-        cv2.imwrite(str(pair_dir / f"left_{frame_idx:04d}.png"), left)
-        cv2.imwrite(str(pair_dir / f"right_{frame_idx:04d}.png"), right)
+        left_path = pair_dir / f"left_{frame_idx:04d}.png"
+        right_path = pair_dir / f"right_{frame_idx:04d}.png"
+        with perf_timer("save frame pair", threshold_ms=100.0):
+            ok_left = cv2.imwrite(str(left_path), left)
+            ok_right = cv2.imwrite(str(right_path), right)
+        if not ok_left or not ok_right:
+            if ok_left:
+                left_path.unlink(missing_ok=True)
+            if ok_right:
+                right_path.unlink(missing_ok=True)
+            raise OSError(f"Failed to save stereo frame pair to {pair_dir}")
 
         self._metadata["frame_count"] = max(
             self._metadata.get("frame_count", 0), frame_idx + 1
@@ -159,6 +183,51 @@ class CalibrationSession:
                     frames.append((idx, left, right))
         return frames
 
+    def save_multimodal_pair(
+        self,
+        rgb_left: np.ndarray,
+        aux: np.ndarray,
+        frame_idx: Optional[int] = None,
+    ) -> int:
+        """Save a paired RGB_L/AUX observation under the session multimodal folder."""
+        if frame_idx is None:
+            frame_idx = self._metadata.get("multimodal_frame_count", 0)
+
+        mm_dir = self.session_dir / self.MULTIMODAL_DIR
+        mm_dir.mkdir(parents=True, exist_ok=True)
+        rgb_path = mm_dir / f"rgb_left_{frame_idx:04d}.png"
+        aux_path = mm_dir / f"aux_{frame_idx:04d}.png"
+        ok_rgb = cv2.imwrite(str(rgb_path), rgb_left)
+        ok_aux = cv2.imwrite(str(aux_path), aux)
+        if not ok_rgb or not ok_aux:
+            if ok_rgb:
+                rgb_path.unlink(missing_ok=True)
+            if ok_aux:
+                aux_path.unlink(missing_ok=True)
+            raise OSError(f"Failed to save multimodal frame pair to {mm_dir}")
+        self._metadata["multimodal_frame_count"] = max(
+            self._metadata.get("multimodal_frame_count", 0), frame_idx + 1
+        )
+        self._save_metadata()
+        return frame_idx
+
+    def record_multimodal_result(
+        self,
+        aux_camera_id: str,
+        modality: str,
+        board_type: str,
+        valid_pairs: int,
+        rms_error: float,
+    ):
+        self._metadata["multimodal_result"] = {
+            "aux_camera_id": aux_camera_id,
+            "modality": modality,
+            "board_type": board_type,
+            "valid_pairs": valid_pairs,
+            "rms_error": rms_error,
+        }
+        self._save_metadata()
+
     @property
     def frame_count(self) -> int:
         return self._metadata.get("frame_count", 0)
@@ -219,9 +288,10 @@ class SessionManager:
         self,
         board: CharucoBoard,
         pairs: List[StereoPairConfig],
+        auxiliary: AuxiliaryCameraConfig | None = None,
         name: str = "",
     ) -> CalibrationSession:
-        return CalibrationSession.create(self.base_dir, board, pairs, name)
+        return CalibrationSession.create(self.base_dir, board, pairs, auxiliary, name)
 
     def delete_session(self, session_name: str):
         session_dir = self.base_dir / session_name

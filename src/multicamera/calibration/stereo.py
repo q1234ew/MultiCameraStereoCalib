@@ -10,6 +10,7 @@ import numpy as np
 
 from ..board.charuco_board import CharucoBoard
 from ..board.detector import CharucoDetector, DetectionResult
+from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel, StereoCalibResult
 
 logger = logging.getLogger(__name__)
@@ -51,9 +52,18 @@ class StereoCalibrator:
     def add_frame_pair(
         self, left: np.ndarray, right: np.ndarray
     ) -> Tuple[DetectionResult, DetectionResult]:
-        det_l = self.detector.detect(left)
-        det_r = self.detector.detect(right)
+        with perf_timer("stereo add_frame_pair", threshold_ms=160.0):
+            det_l = self.detector.detect(left)
+            det_r = self.detector.detect(right)
+        self.add_detection_pair(det_l, det_r)
+        return det_l, det_r
 
+    def add_detection_pair(
+        self,
+        det_l: DetectionResult,
+        det_r: DetectionResult,
+    ) -> bool:
+        """Store an already computed left/right ChArUco detection pair."""
         if det_l.valid and det_r.valid:
             obj_pts, img_l, img_r = self._find_common_points(det_l, det_r)
             if obj_pts is not None and len(obj_pts) >= MIN_COMMON_CORNERS:
@@ -61,8 +71,8 @@ class StereoCalibrator:
                 self._img_points_left.append(img_l)
                 self._img_points_right.append(img_r)
                 self._image_size = det_l.image_size
-
-        return det_l, det_r
+                return True
+        return False
 
     def pop_last_frame(self) -> bool:
         """Remove the last accepted stereo pair. Returns False if empty."""
@@ -87,8 +97,10 @@ class StereoCalibrator:
             )
 
         if self.model == CameraModel.FISHEYE:
-            return self._calibrate_fisheye(left_intrinsics, right_intrinsics, flags)
-        return self._calibrate_pinhole(left_intrinsics, right_intrinsics, flags)
+            with perf_timer("fisheye stereo calibrate", threshold_ms=500.0):
+                return self._calibrate_fisheye(left_intrinsics, right_intrinsics, flags)
+        with perf_timer("pinhole stereo calibrate", threshold_ms=500.0):
+            return self._calibrate_pinhole(left_intrinsics, right_intrinsics, flags)
 
     # ── Pinhole ───────────────────────────────────────────────
 

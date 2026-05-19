@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
+from ..perf import perf_timer
+
 
 class MJPEGGrabber(QThread):
     """Grabs frames from an MJPEG over HTTP stream in a dedicated thread.
@@ -27,20 +29,24 @@ class MJPEGGrabber(QThread):
     RECONNECT_DELAY = 2.0
     READ_TIMEOUT = 10.0
     FPS_UPDATE_INTERVAL = 1.0
+    DEFAULT_MAX_DECODE_FPS = 20.0
 
     def __init__(
         self,
         camera_id: str,
         url: str,
+        max_decode_fps: float = DEFAULT_MAX_DECODE_FPS,
         parent=None,
     ):
         super().__init__(parent)
         self.camera_id = camera_id
         self.url = url
+        self.max_decode_fps = max_decode_fps
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._frame_count = 0
         self._fps_time = 0.0
+        self._last_decode_time = 0.0
 
     def run(self):
         self._running = True
@@ -149,8 +155,16 @@ class MJPEGGrabber(QThread):
                 self._decode_and_emit(jpeg_data)
 
     def _decode_and_emit(self, jpeg_data: bytes):
+        now = time.monotonic()
+        if self.max_decode_fps > 0:
+            min_interval = 1.0 / self.max_decode_fps
+            if now - self._last_decode_time < min_interval:
+                return
+            self._last_decode_time = now
+
         arr = np.frombuffer(jpeg_data, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        with perf_timer(f"mjpeg decode {self.camera_id}", threshold_ms=20.0):
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is not None:
             ts = time.time()
             self.frame_ready.emit(self.camera_id, frame, ts)

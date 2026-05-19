@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from typing import Optional
 
 import numpy as np
@@ -10,20 +9,13 @@ from PySide6.QtCore import Qt, QPoint, QPointF, Slot, QRectF
 from PySide6.QtGui import (
     QColor,
     QFont,
-    QMatrix4x4,
     QMouseEvent,
     QPainter,
     QPen,
-    QVector3D,
     QWheelEvent,
     QImage,
 )
 from PySide6.QtWidgets import QWidget
-
-try:
-    import open3d as o3d
-except ImportError:
-    o3d = None
 
 
 class PointCloudViewer(QWidget):
@@ -63,9 +55,9 @@ class PointCloudViewer(QWidget):
     @Slot(object)
     def set_pointcloud(self, pcd):
         """Accept an Open3D PointCloud or (points, colors) tuple."""
-        if o3d is not None and isinstance(pcd, o3d.geometry.PointCloud):
+        if hasattr(pcd, "points"):
             self._points = np.asarray(pcd.points, dtype=np.float32)
-            if pcd.has_colors():
+            if hasattr(pcd, "has_colors") and pcd.has_colors():
                 self._colors = np.asarray(pcd.colors, dtype=np.float32)
             else:
                 self._colors = np.full_like(self._points, 0.7)

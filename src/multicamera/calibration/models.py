@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 
@@ -171,12 +170,62 @@ class StereoPairCalibration:
 
 
 @dataclass
+class AuxCameraCalibration:
+    """Calibration data for an auxiliary mono camera fused with RGB_L."""
+
+    camera_id: str
+    modality: str
+    intrinsics: CameraIntrinsics
+    T_rgb_left_aux: np.ndarray  # 4x4 transform from AUX camera frame to RGB_L frame
+    rms_error: float = 0.0
+    board_type: str = ""
+    frame_count: int = 0
+    per_frame_errors: Optional[List[float]] = None
+
+    @property
+    def R_rgb_left_aux(self) -> np.ndarray:
+        return self.T_rgb_left_aux[:3, :3]
+
+    @property
+    def t_rgb_left_aux(self) -> np.ndarray:
+        return self.T_rgb_left_aux[:3, 3].reshape(3, 1)
+
+    def to_dict(self) -> dict:
+        d = {
+            "camera_id": self.camera_id,
+            "modality": self.modality,
+            "intrinsics": self.intrinsics.to_dict(),
+            "T_rgb_left_aux": self.T_rgb_left_aux.tolist(),
+            "rms_error": self.rms_error,
+            "board_type": self.board_type,
+            "frame_count": self.frame_count,
+        }
+        if self.per_frame_errors is not None:
+            d["per_frame_errors"] = self.per_frame_errors
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> AuxCameraCalibration:
+        return cls(
+            camera_id=d["camera_id"],
+            modality=d.get("modality", "ir"),
+            intrinsics=CameraIntrinsics.from_dict(d["intrinsics"]),
+            T_rgb_left_aux=np.array(d["T_rgb_left_aux"], dtype=np.float64),
+            rms_error=d.get("rms_error", 0.0),
+            board_type=d.get("board_type", ""),
+            frame_count=d.get("frame_count", 0),
+            per_frame_errors=d.get("per_frame_errors"),
+        )
+
+
+@dataclass
 class MultiCameraRig:
     """Full multi-camera rig calibration: all pairs + global extrinsics."""
 
     pairs: Dict[str, StereoPairCalibration] = field(default_factory=dict)
     extrinsics: Dict[str, CameraExtrinsics] = field(default_factory=dict)
     reference_camera: str = ""
+    aux_cameras: Dict[str, AuxCameraCalibration] = field(default_factory=dict)
 
     def get_pair(self, name: str) -> Optional[StereoPairCalibration]:
         return self.pairs.get(name)
@@ -189,6 +238,7 @@ class MultiCameraRig:
             "reference_camera": self.reference_camera,
             "pairs": {k: v.to_dict() for k, v in self.pairs.items()},
             "extrinsics": {k: v.to_dict() for k, v in self.extrinsics.items()},
+            "aux_cameras": {k: v.to_dict() for k, v in self.aux_cameras.items()},
         }
 
     @classmethod
@@ -202,5 +252,9 @@ class MultiCameraRig:
             extrinsics={
                 k: CameraExtrinsics.from_dict(v)
                 for k, v in d.get("extrinsics", {}).items()
+            },
+            aux_cameras={
+                k: AuxCameraCalibration.from_dict(v)
+                for k, v in d.get("aux_cameras", {}).items()
             },
         )

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,6 +34,16 @@ class StereoPairConfig:
     right: CameraConfig
 
 
+@dataclass
+class AuxiliaryCameraConfig:
+    camera_id: str
+    url: str
+    modality: str = "ir"  # "ir" or "acoustic_rgb"
+    board_pattern: str = "chessboard"
+    stream_type: str = "ir"
+    group: str = "multimodal"
+
+
 class StreamManager(QObject):
     """Lifecycle manager for all camera streams with soft-sync capability."""
 
@@ -46,35 +55,81 @@ class StreamManager(QObject):
 
     # 双目帧时间戳允许偏差；过小易导致「采集一帧」拿不到同步对、进度与磁盘保存都不触发
     DEFAULT_SYNC_TOLERANCE = 0.35  # 350 ms（嵌入式 MJPEG 左右帧到达 UI 常有抖动）
+    DEFAULT_MAX_DECODE_FPS = 20.0
 
-    def __init__(self, sync_tolerance: float = DEFAULT_SYNC_TOLERANCE, parent=None):
+    def __init__(
+        self,
+        sync_tolerance: float = DEFAULT_SYNC_TOLERANCE,
+        max_decode_fps: float = DEFAULT_MAX_DECODE_FPS,
+        parent=None,
+    ):
         super().__init__(parent)
         self._sync_tolerance = sync_tolerance
+        self._max_decode_fps = max_decode_fps
         self._grabbers: Dict[str, MJPEGGrabber] = {}
         self._latest_frames: Dict[str, FrameEntry] = {}
         self._stereo_pairs: Dict[str, StereoPairConfig] = {}
+        self._auxiliary_camera: Optional[AuxiliaryCameraConfig] = None
+        self._virtual_pairs: set[str] = set()
         self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────
 
     def add_stereo_pair(self, pair: StereoPairConfig):
+        self._virtual_pairs.discard(pair.name)
         self._stereo_pairs[pair.name] = pair
         self._add_camera(pair.left)
         self._add_camera(pair.right)
 
+    def add_virtual_stereo_pair(self, pair: StereoPairConfig):
+        """Register an offline pair without creating stream grabber threads."""
+        self._stereo_pairs[pair.name] = pair
+        self._virtual_pairs.add(pair.name)
+
     def remove_stereo_pair(self, name: str):
+        self._virtual_pairs.discard(name)
         pair = self._stereo_pairs.pop(name, None)
         if pair:
             self._remove_camera(pair.left.camera_id)
             self._remove_camera(pair.right.camera_id)
 
+    def set_auxiliary_camera(self, cfg: AuxiliaryCameraConfig):
+        self._auxiliary_camera = cfg
+        self._add_camera(
+            CameraConfig(
+                camera_id=cfg.camera_id,
+                url=cfg.url,
+                role="aux",
+                group=cfg.group,
+                stream_type=cfg.stream_type,
+            )
+        )
+
+    def clear_auxiliary_camera(self):
+        cfg = self._auxiliary_camera
+        self._auxiliary_camera = None
+        if cfg is not None:
+            self._remove_camera(cfg.camera_id)
+
     def start_all(self):
         # Ensure grabber objects exist for every configured camera, then start.
         # After stop_all(), MJPEGGrabber QThreads are finished — they must be recreated
         # (Qt does not reliably allow restarting the same QThread instance).
-        for pair in self._stereo_pairs.values():
+        for name, pair in self._stereo_pairs.items():
+            if name in self._virtual_pairs:
+                continue
             self._add_camera(pair.left)
             self._add_camera(pair.right)
+        if self._auxiliary_camera is not None:
+            self._add_camera(
+                CameraConfig(
+                    camera_id=self._auxiliary_camera.camera_id,
+                    url=self._auxiliary_camera.url,
+                    role="aux",
+                    group=self._auxiliary_camera.group,
+                    stream_type=self._auxiliary_camera.stream_type,
+                )
+            )
         for g in self._grabbers.values():
             if not g.isRunning():
                 g.start()
@@ -129,6 +184,10 @@ class StreamManager(QObject):
         return dict(self._stereo_pairs)
 
     @property
+    def auxiliary_camera(self) -> Optional[AuxiliaryCameraConfig]:
+        return self._auxiliary_camera
+
+    @property
     def camera_ids(self) -> List[str]:
         return list(self._grabbers.keys())
 
@@ -143,7 +202,12 @@ class StreamManager(QObject):
             existing.wait(3000)
             self._grabbers.pop(cfg.camera_id, None)
 
-        grabber = MJPEGGrabber(cfg.camera_id, cfg.url, parent=self)
+        grabber = MJPEGGrabber(
+            cfg.camera_id,
+            cfg.url,
+            max_decode_fps=self._max_decode_fps,
+            parent=self,
+        )
         grabber.frame_ready.connect(self._on_frame)
         grabber.connection_established.connect(self.camera_connected)
         grabber.connection_lost.connect(self.camera_disconnected)

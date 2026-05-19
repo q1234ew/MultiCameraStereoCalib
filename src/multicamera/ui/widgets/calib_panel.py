@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -28,7 +29,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -45,18 +45,25 @@ from ...calibration.assessment import (
 )
 from ...calibration.intrinsic import IntrinsicCalibrator
 from ...calibration.models import (
+    AuxCameraCalibration,
     CameraIntrinsics,
     CameraModel,
     MultiCameraRig,
     StereoPairCalibration,
 )
 from ...calibration.multiview import MultiViewCalibrator
+from ...calibration.planar import (
+    PatternBoardConfig,
+    PlanarDetectionResult,
+    PlanarPatternDetector,
+)
 from ...calibration.stereo import StereoCalibrator
-from ...fusion.fusion import MultiViewFusion
-from ...fusion.pointcloud import depth_to_pointcloud
-from ...fusion.stereo_matching import StereoMatcher
 from ...io.session import CalibrationSession
+from ...perf import perf_timer
 from ...streaming.stream_manager import StreamManager
+from ..threads.calibration_worker import AuxCalibrationWorker, PairCalibrationWorker
+from ..threads.import_worker import AuxImageImportWorker, StereoImageImportWorker
+from ..threads.save_worker import FrameSaveWorker
 from ..theme import (
     ACCENT, BG_CARD, BG_DARK, BG_INPUT,
     BORDER, SUCCESS, TEXT, TEXT_DIM, TEXT_HINT, WARNING,
@@ -65,6 +72,7 @@ from .capture_guide import (
     CaptureSequence,
     CaptureSequenceWidget,
     build_default_sequence,
+    build_multimodal_sequence,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +86,7 @@ class _UndoCaptureEntry:
     lid: str
     rid: str
     session_frame_idx: Optional[int]
+    save_token: Optional[str]
     pop_intrinsic_l: bool
     pop_intrinsic_r: bool
     pop_stereo: bool
@@ -138,7 +147,7 @@ class StepTimeline(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
+        w = self.width()
         if self._count == 0:
             p.end()
             return
@@ -356,10 +365,26 @@ class CalibrationPanel(QWidget):
         self._evaluator = CalibrationEvaluator()
 
         self._capture_sequence = CaptureSequence(build_default_sequence())
+        self._aux_capture_sequence = CaptureSequence(build_multimodal_sequence())
         self._sections: List[CollapsibleSection] = []
         self._pair_rows: Dict[str, _PairRow] = {}
         self._undo_stack: List[tuple[List[_UndoCaptureEntry], bool]] = []
         self._pair_capture_press_count: Dict[str, int] = {}
+        self._next_session_frame_idx: Optional[int] = None
+        self._save_workers: Dict[str, FrameSaveWorker] = {}
+        self._save_queue: list[tuple[str, str, np.ndarray, np.ndarray, int]] = []
+        self._pending_save_tokens: set[str] = set()
+        self._canceled_save_tokens: set[str] = set()
+        self._calib_worker: Optional[PairCalibrationWorker] = None
+        self._aux_worker: Optional[AuxCalibrationWorker] = None
+        self._stereo_import_worker: Optional[StereoImageImportWorker] = None
+        self._aux_import_worker: Optional[AuxImageImportWorker] = None
+        self._calib_queue: List[str] = []
+        self._aux_pairs: list[tuple[str, PlanarDetectionResult, PlanarDetectionResult]] = []
+        self._aux_images: list[tuple[np.ndarray, np.ndarray]] = []
+        self._aux_intrinsics: Optional[CameraIntrinsics] = None
+        self._aux_capture_count = 0
+        self._pending_aux_context = None
 
         self._init_ui()
         self._connect_signals()
@@ -379,6 +404,7 @@ class CalibrationPanel(QWidget):
 
     def set_session(self, session: CalibrationSession):
         self._session = session
+        self._next_session_frame_idx = session.frame_count
         self._log(f"会话: {session.name}")
         self._refresh_disk_hint()
 
@@ -393,8 +419,8 @@ class CalibrationPanel(QWidget):
         ml.setContentsMargins(8, 8, 8, 8)
         ml.setSpacing(8)
 
-        # Timeline: 3 steps
-        self._timeline = StepTimeline(["共视采图", "双目标定", "点云融合"])
+        # Timeline: stereo capture/calibration, optional multimodal mono, then point cloud.
+        self._timeline = StepTimeline(["共视采图", "双目标定", "多模态", "点云融合"])
         ml.addWidget(self._timeline)
 
         # ── 0. Capture ────────────────────────────────
@@ -543,31 +569,72 @@ class CalibrationPanel(QWidget):
         ml.addWidget(s1)
         self._sections.append(s1)
 
-        # ── 2. Fusion / multi-view ────────────────────
-        s2 = CollapsibleSection("3  点云融合")
+        # ── 2. Multimodal auxiliary mono calibration ─────────
+        s2 = CollapsibleSection("3  多模态单目标定")
         l2 = s2.content_layout
+
+        self._lbl_aux_info = QLabel(
+            "导入 rgb_left_XXXX.* 与 aux_XXXX.* 配对图像，先完成 RGB 双目标定后可求辅助单目内参和 AUX→RGB_L 外参。"
+        )
+        self._lbl_aux_info.setWordWrap(True)
+        self._lbl_aux_info.setStyleSheet(f"font-size:12px; color:{TEXT_HINT};")
+        l2.addWidget(self._lbl_aux_info)
+
+        self._aux_seq_widget = CaptureSequenceWidget()
+        self._aux_seq_widget.set_sequence(self._aux_capture_sequence)
+        l2.addWidget(self._aux_seq_widget)
+
+        self._aux_cap_progress = QProgressBar()
+        self._aux_cap_progress.setFormat("%v / %m")
+        self._aux_cap_progress.setMaximum(self._aux_capture_sequence.total)
+        self._aux_cap_progress.setValue(0)
+        l2.addWidget(self._aux_cap_progress)
+
+        aux_btn_row = QHBoxLayout()
+        self._btn_capture_aux = QPushButton("采集多模态一帧")
+        self._btn_capture_aux.setProperty("class", "primary")
+        aux_btn_row.addWidget(self._btn_capture_aux)
+        self._btn_import_aux = QPushButton("导入多模态图片")
+        aux_btn_row.addWidget(self._btn_import_aux)
+        self._btn_calib_aux = QPushButton("标定辅助单目")
+        self._btn_calib_aux.setProperty("class", "primary")
+        self._btn_calib_aux.setEnabled(False)
+        aux_btn_row.addWidget(self._btn_calib_aux)
+        l2.addLayout(aux_btn_row)
+
+        self._lbl_aux_status = QLabel("等待多模态配对图像")
+        self._lbl_aux_status.setWordWrap(True)
+        self._lbl_aux_status.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
+        l2.addWidget(self._lbl_aux_status)
+
+        ml.addWidget(s2)
+        self._sections.append(s2)
+
+        # ── 3. Fusion / multi-view ────────────────────
+        s3 = CollapsibleSection("4  点云融合")
+        l3 = s3.content_layout
 
         self._lbl_fusion_info = QLabel("全部双目标定完成后可生成融合点云")
         self._lbl_fusion_info.setWordWrap(True)
         self._lbl_fusion_info.setStyleSheet(f"font-size:12px; color:{TEXT_HINT};")
-        l2.addWidget(self._lbl_fusion_info)
+        l3.addWidget(self._lbl_fusion_info)
 
         self._btn_multi = QPushButton("联合优化")
         self._btn_multi.setProperty("class", "primary")
         self._btn_multi.setEnabled(False)
-        l2.addWidget(self._btn_multi)
+        l3.addWidget(self._btn_multi)
 
         self._lbl_multi = QLabel("")
         self._lbl_multi.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
-        l2.addWidget(self._lbl_multi)
+        l3.addWidget(self._lbl_multi)
 
         self._btn_cloud = QPushButton("生成融合点云")
         self._btn_cloud.setProperty("class", "primary")
         self._btn_cloud.setEnabled(False)
-        l2.addWidget(self._btn_cloud)
+        l3.addWidget(self._btn_cloud)
 
-        ml.addWidget(s2)
-        self._sections.append(s2)
+        ml.addWidget(s3)
+        self._sections.append(s3)
 
         # ── Log ──────────────────────────────────────
         self._log_text = QTextEdit()
@@ -587,6 +654,9 @@ class CalibrationPanel(QWidget):
         self._btn_undo.clicked.connect(self._on_undo_capture)
         self._btn_auto.toggled.connect(self._on_auto_toggle)
         self._btn_import.clicked.connect(self._on_import_images)
+        self._btn_capture_aux.clicked.connect(self._on_capture_aux)
+        self._btn_import_aux.clicked.connect(self._on_import_aux_images)
+        self._btn_calib_aux.clicked.connect(self._on_calibrate_aux)
         self._btn_calib_all.clicked.connect(self._on_calibrate_all)
         self._btn_multi.clicked.connect(self._on_calibrate_multiview)
         self._btn_cloud.clicked.connect(self._on_generate_cloud)
@@ -597,6 +667,7 @@ class CalibrationPanel(QWidget):
 
         self._timeline.step_clicked.connect(self._activate_step)
         self._seq_widget.user_navigated.connect(self._on_sequence_user_nav)
+        self._aux_seq_widget.user_navigated.connect(self._on_aux_sequence_user_nav)
         for i, sec in enumerate(self._sections):
             idx = i
             sec.toggled.connect(lambda _, ii=idx: self._on_section_toggled(ii))
@@ -618,6 +689,11 @@ class CalibrationPanel(QWidget):
     def _on_sequence_user_nav(self):
         """User changed active guide step (grid / prev-next / skip)."""
         self.sequence_updated.emit(self._capture_sequence)
+
+    @Slot()
+    def _on_aux_sequence_user_nav(self):
+        """User changed active multimodal guide step."""
+        self.sequence_updated.emit(self._aux_capture_sequence)
 
     # ── Pair selector ────────────────────────────────────────
 
@@ -662,7 +738,6 @@ class CalibrationPanel(QWidget):
 
         for name, row in self._pair_rows.items():
             cal = self._stereo_cals.get(name)
-            pair_cfg = self._sm.stereo_pairs.get(name)
             done = name in self._pair_calibs
 
             if done:
@@ -670,10 +745,10 @@ class CalibrationPanel(QWidget):
                 rms_i_l = pc.left_intrinsics.rms_error
                 rms_i_r = pc.right_intrinsics.rms_error
                 rms_s = pc.stereo.rms_error
-                bl = np.linalg.norm(pc.stereo.T)
+                bl_mm = np.linalg.norm(pc.stereo.T) * 1000.0
                 row.set_status(
                     f"✓  内参 L={rms_i_l:.3f}px R={rms_i_r:.3f}px  |  "
-                    f"外参 RMS={rms_s:.3f}px 基线={bl:.1f}mm",
+                    f"外参 RMS={rms_s:.3f}px 基线={bl_mm:.1f}mm",
                     SUCCESS,
                 )
                 row.btn.setEnabled(False)
@@ -739,7 +814,70 @@ class CalibrationPanel(QWidget):
             )
 
     def _refresh_undo_btn(self):
-        self._btn_undo.setEnabled(bool(self._undo_stack))
+        self._btn_undo.setEnabled(bool(self._undo_stack) and self._calib_worker is None)
+
+    def _start_frame_save(
+        self,
+        pair_name: str,
+        left: np.ndarray,
+        right: np.ndarray,
+    ) -> tuple[Optional[int], Optional[str]]:
+        if self._session is None:
+            return None, None
+        if self._next_session_frame_idx is None:
+            self._next_session_frame_idx = self._session.frame_count
+        frame_idx = self._next_session_frame_idx
+        self._next_session_frame_idx += 1
+        token = uuid.uuid4().hex
+        self._pending_save_tokens.add(token)
+        self._save_queue.append((token, pair_name, left.copy(), right.copy(), frame_idx))
+        self._start_next_frame_save()
+        return frame_idx, token
+
+    def _start_next_frame_save(self):
+        if self._save_workers or not self._save_queue or self._session is None:
+            return
+        token, pair_name, left, right, frame_idx = self._save_queue.pop(0)
+        if token in self._canceled_save_tokens:
+            self._pending_save_tokens.discard(token)
+            self._canceled_save_tokens.discard(token)
+            self._start_next_frame_save()
+            return
+        worker = FrameSaveWorker(
+            token,
+            self._session,
+            pair_name,
+            left,
+            right,
+            frame_idx,
+            parent=self,
+        )
+        worker.saved.connect(self._on_frame_save_finished)
+        worker.failed.connect(self._on_frame_save_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._save_workers[token] = worker
+        worker.start()
+
+    @Slot(str, str, int)
+    def _on_frame_save_finished(self, token: str, pair_name: str, frame_idx: int):
+        self._save_workers.pop(token, None)
+        self._pending_save_tokens.discard(token)
+        if token in self._canceled_save_tokens:
+            self._canceled_save_tokens.discard(token)
+            if self._session is not None:
+                self._session.delete_saved_pair_frame(pair_name, frame_idx)
+        self._start_next_frame_save()
+
+    @Slot(str, str, int, str)
+    def _on_frame_save_failed(self, token: str, pair_name: str, frame_idx: int, reason: str):
+        self._save_workers.pop(token, None)
+        self._pending_save_tokens.discard(token)
+        if token in self._canceled_save_tokens:
+            self._canceled_save_tokens.discard(token)
+            self._start_next_frame_save()
+            return
+        self._log(f"{pair_name}: 保存图片失败（帧 {frame_idx}）— {reason}")
+        self._start_next_frame_save()
 
     def _undo_apply_entry(self, e: _UndoCaptureEntry) -> None:
         if e.pop_stereo and e.pair_name in self._stereo_cals:
@@ -752,7 +890,9 @@ class CalibrationPanel(QWidget):
             self._intr_cals[e.lid].pop_last_frame()
             if self._fqs.get(e.lid):
                 self._fqs[e.lid].pop()
-        if e.session_frame_idx is not None and self._session:
+        if e.save_token is not None and e.save_token in self._pending_save_tokens:
+            self._canceled_save_tokens.add(e.save_token)
+        elif e.session_frame_idx is not None and self._session:
             self._session.delete_saved_pair_frame(e.pair_name, e.session_frame_idx)
 
     @Slot()
@@ -777,6 +917,10 @@ class CalibrationPanel(QWidget):
 
     @Slot()
     def _on_capture(self):
+        with perf_timer("capture click", threshold_ms=100.0):
+            self._capture_impl()
+
+    def _capture_impl(self):
         pairs = self._selected_pairs()
         if not pairs:
             self._log("未配置相机组，请先通过 ⚙ 添加相机")
@@ -822,7 +966,7 @@ class CalibrationPanel(QWidget):
 
             det_l = self._intr_cals[lid].add_frame(left)
             det_r = self._intr_cals[rid].add_frame(right)
-            self._stereo_cals[name].add_frame_pair(left, right)
+            self._stereo_cals[name].add_detection_pair(det_l, det_r)
 
             fi = len(self._fqs[lid])
             fq_l = self._assessor.assess_frame(left, det_l.num_corners, fi)
@@ -831,8 +975,9 @@ class CalibrationPanel(QWidget):
             self._fqs[rid].append(fq_r)
 
             sess_idx = None
+            save_token = None
             if self._session:
-                sess_idx = self._session.save_frame_pair(name, left, right)
+                sess_idx, save_token = self._start_frame_save(name, left, right)
 
             if relaxed_note:
                 self._log(relaxed_note)
@@ -859,6 +1004,7 @@ class CalibrationPanel(QWidget):
                     lid=lid,
                     rid=rid,
                     session_frame_idx=sess_idx,
+                    save_token=save_token,
                     pop_intrinsic_l=self._intr_cals[lid].num_frames > n_ib_l,
                     pop_intrinsic_r=self._intr_cals[rid].num_frames > n_ib_r,
                     pop_stereo=self._stereo_cals[name].num_frames > n_sb,
@@ -887,39 +1033,29 @@ class CalibrationPanel(QWidget):
     @Slot()
     def _on_import_images(self):
         """Load pre-captured image pairs from a folder (NNNN_left.png / NNNN_right.png)."""
+        if self._stereo_import_worker is not None:
+            self._log("图片导入正在进行，请稍候")
+            return
         folder = QFileDialog.getExistingDirectory(self, "选择图片目录")
         if not folder:
             return
 
-        import glob
         import os
 
-        lefts = sorted(glob.glob(os.path.join(folder, "*_left.png")))
-        if not lefts:
-            lefts = sorted(glob.glob(os.path.join(folder, "*_left.jpg")))
-        if not lefts:
-            self._log("未找到 *_left.png/jpg 文件")
-            return
+        self._log(f"正在后台导入图片: {os.path.basename(folder)}")
+        self._set_import_busy(True)
+        worker = StereoImageImportWorker(folder, self._board, parent=self)
+        worker.finished_ok.connect(self._on_import_images_ready)
+        worker.failed.connect(self._on_import_images_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._stereo_import_worker = worker
+        worker.start()
 
-        img_pairs = []
-        for lp in lefts:
-            for ext in (".png", ".jpg"):
-                rp = lp.replace("_left.", "_right.")
-                if os.path.isfile(rp):
-                    break
-            else:
-                continue
-            img_l = cv2.imread(lp)
-            img_r = cv2.imread(rp)
-            if img_l is not None and img_r is not None:
-                idx = os.path.basename(lp).split("_")[0]
-                img_pairs.append((idx, img_l, img_r))
-
-        if not img_pairs:
-            self._log("未能加载任何有效图片对")
-            return
-
-        self._log(f"导入 {len(img_pairs)} 对图片自 {os.path.basename(folder)}")
+    @Slot(object)
+    def _on_import_images_ready(self, img_pairs):
+        self._stereo_import_worker = None
+        self._set_import_busy(False)
+        self._log(f"导入 {len(img_pairs)} 对图片")
 
         pair_name = "offline"
         lid, rid = "offline_L", "offline_R"
@@ -933,7 +1069,7 @@ class CalibrationPanel(QWidget):
                 left=CameraConfig(camera_id=lid, url="", role="left", group=pair_name),
                 right=CameraConfig(camera_id=rid, url="", role="right", group=pair_name),
             )
-            self._sm._stereo_pairs[pair_name] = virt_pair
+            self._sm.add_virtual_stereo_pair(virt_pair)
 
             self._intr_cals[lid] = IntrinsicCalibrator(self._board, self._camera_model, min_f)
             self._intr_cals[rid] = IntrinsicCalibrator(self._board, self._camera_model, min_f)
@@ -943,10 +1079,10 @@ class CalibrationPanel(QWidget):
             self._rebuild_pair_rows()
             self.refresh_pairs()
 
-        for idx, img_l, img_r in img_pairs:
-            det_l = self._intr_cals[lid].add_frame(img_l)
-            det_r = self._intr_cals[rid].add_frame(img_r)
-            self._stereo_cals[pair_name].add_frame_pair(img_l, img_r)
+        for idx, img_l, img_r, det_l, det_r in img_pairs:
+            self._intr_cals[lid].add_detection(det_l, image=img_l)
+            self._intr_cals[rid].add_detection(det_r, image=img_r)
+            self._stereo_cals[pair_name].add_detection_pair(det_l, det_r)
 
             fi = len(self._fqs[lid])
             fq_l = self._assessor.assess_frame(img_l, det_l.num_corners, fi)
@@ -963,7 +1099,8 @@ class CalibrationPanel(QWidget):
             )
 
         self._import_last_pair = (img_pairs[-1][1], img_pairs[-1][2])
-        self._imported_frames = [(lid, rid, il, ir) for (_, il, ir) in img_pairs]
+        self._imported_frames = [(lid, rid, il, ir) for (_, il, ir, _, _) in img_pairs]
+        self._imported_pair_frames = {pair_name: [(il, ir) for (_, il, ir, _, _) in img_pairs]}
         self._import_view_idx = 0
 
         self._seq_widget.refresh()
@@ -981,6 +1118,12 @@ class CalibrationPanel(QWidget):
         self._btn_import_next.setVisible(True)
         self._lbl_import_nav.setVisible(True)
         self._update_import_nav_label()
+
+    @Slot(str)
+    def _on_import_images_failed(self, message: str):
+        self._stereo_import_worker = None
+        self._set_import_busy(False)
+        self._log(message.splitlines()[0])
 
     def _show_imported_frame(self, idx: int):
         if not hasattr(self, "_imported_frames") or not self._imported_frames:
@@ -1074,78 +1217,117 @@ class CalibrationPanel(QWidget):
 
     # ── Stereo calibration (per pair: intrinsic + extrinsic) ──
 
-    def _calibrate_pair(self, pair_name: str):
+    def _calibrate_pair(self, pair_name: str, continue_queue: bool = False):
         """Run full calibration for one stereo pair: intrinsic L+R then stereo."""
+        if self._calib_worker is not None:
+            if continue_queue:
+                self._calib_queue.append(pair_name)
+            else:
+                self._log("已有标定任务正在运行，请稍候")
+            return
+
         pair_cfg = self._sm.stereo_pairs.get(pair_name)
         cal = self._stereo_cals.get(pair_name)
         if not pair_cfg or not cal or not cal.ready:
             self._log(f"{pair_name}: 数据不足")
+            if continue_queue:
+                self._start_next_calibration()
             return
 
         self._activate_step(1)
         lid = pair_cfg.left.camera_id
         rid = pair_cfg.right.camera_id
 
-        # 1) intrinsic left
-        if lid not in self._intrinsics:
-            self._log(f"标定内参: {lid}...")
-            try:
-                intr_l = self._intr_cals[lid].calibrate()
-                self._intrinsics[lid] = intr_l
-                q = self._evaluator.evaluate_intrinsic(intr_l)
-                self._log(f"  {lid}: RMS={intr_l.rms_error:.4f}px [{q.grade.label}]")
-            except Exception as e:
-                self._log(f"  {lid}: 内参失败 — {e}")
-                self._sync_pair_states()
-                return
-
-        # 2) intrinsic right
-        if rid not in self._intrinsics:
-            self._log(f"标定内参: {rid}...")
-            try:
-                intr_r = self._intr_cals[rid].calibrate()
-                self._intrinsics[rid] = intr_r
-                q = self._evaluator.evaluate_intrinsic(intr_r)
-                self._log(f"  {rid}: RMS={intr_r.rms_error:.4f}px [{q.grade.label}]")
-            except Exception as e:
-                self._log(f"  {rid}: 内参失败 — {e}")
-                self._sync_pair_states()
-                return
-
-        # 3) stereo extrinsic
-        left_intr = self._intrinsics[lid]
-        right_intr = self._intrinsics[rid]
-        self._log(f"标定外参: {pair_name}...")
-        try:
-            sr = cal.calibrate(left_intr, right_intr)
-            pc = StereoPairCalibration(
-                pair_name=pair_name,
-                left_id=lid, right_id=rid,
-                left_intrinsics=left_intr, right_intrinsics=right_intr,
-                stereo=sr,
-            )
-            self._pair_calibs[pair_name] = pc
-            q = self._evaluator.evaluate_stereo(pc)
-            bl = np.linalg.norm(sr.T)
-            self._log(
-                f"  ✓ {pair_name}: 外参 RMS={sr.rms_error:.4f}px "
-                f"基线={bl:.1f}mm [{q.grade.label}]"
-            )
-            self._show_rect_preview(pair_name, pc)
-        except Exception as e:
-            self._log(f"  {pair_name}: 外参失败 — {e}")
-
-        self._sync_pair_states()
+        self._set_calibration_busy(True)
+        worker = PairCalibrationWorker(
+            pair_name=pair_name,
+            left_id=lid,
+            right_id=rid,
+            left_calibrator=self._intr_cals[lid],
+            right_calibrator=self._intr_cals[rid],
+            stereo_calibrator=cal,
+            left_intrinsics=self._intrinsics.get(lid),
+            right_intrinsics=self._intrinsics.get(rid),
+            parent=self,
+        )
+        worker.log.connect(self._log)
+        worker.finished_ok.connect(self._on_pair_calibration_finished)
+        worker.failed.connect(self._on_pair_calibration_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._calib_worker = worker
+        worker.start()
 
     @Slot()
     def _on_calibrate_all(self):
         """Batch calibrate all ready pairs."""
+        if self._calib_worker is not None:
+            self._log("已有标定任务正在运行，请稍候")
+            return
+        self._calib_queue = []
         for name in list(self._sm.stereo_pairs.keys()):
             if name in self._pair_calibs:
                 continue
             cal = self._stereo_cals.get(name)
             if cal and cal.ready:
-                self._calibrate_pair(name)
+                self._calib_queue.append(name)
+        self._start_next_calibration()
+
+    def _start_next_calibration(self):
+        if self._calib_worker is not None:
+            return
+        if not self._calib_queue:
+            self._set_calibration_busy(False)
+            self._sync_pair_states()
+            return
+        name = self._calib_queue.pop(0)
+        self._calibrate_pair(name, continue_queue=True)
+
+    @Slot(str, str, str, object, object, object)
+    def _on_pair_calibration_finished(
+        self,
+        pair_name: str,
+        lid: str,
+        rid: str,
+        intr_l,
+        intr_r,
+        pair_calib,
+    ):
+        self._calib_worker = None
+        self._intrinsics[lid] = intr_l
+        self._intrinsics[rid] = intr_r
+        self._pair_calibs[pair_name] = pair_calib
+
+        q_l = self._evaluator.evaluate_intrinsic(intr_l)
+        q_r = self._evaluator.evaluate_intrinsic(intr_r)
+        q_s = self._evaluator.evaluate_stereo(pair_calib)
+        bl_mm = np.linalg.norm(pair_calib.stereo.T) * 1000.0
+        self._log(f"  {lid}: RMS={intr_l.rms_error:.4f}px [{q_l.grade.label}]")
+        self._log(f"  {rid}: RMS={intr_r.rms_error:.4f}px [{q_r.grade.label}]")
+        self._log(
+            f"  ✓ {pair_name}: 外参 RMS={pair_calib.stereo.rms_error:.4f}px "
+            f"基线={bl_mm:.1f}mm [{q_s.grade.label}]"
+        )
+        self._show_rect_preview(pair_name, pair_calib)
+        self._sync_pair_states()
+        self._start_next_calibration()
+
+    @Slot(str, str)
+    def _on_pair_calibration_failed(self, pair_name: str, message: str):
+        self._calib_worker = None
+        self._log(f"  {pair_name}: 标定失败 — {message.splitlines()[0]}")
+        self._sync_pair_states()
+        self._start_next_calibration()
+
+    def _set_calibration_busy(self, busy: bool):
+        if busy and self._btn_auto.isChecked():
+            self._btn_auto.setChecked(False)
+        self._btn_capture.setEnabled(not busy)
+        self._btn_import.setEnabled(not busy)
+        self._btn_undo.setEnabled((not busy) and bool(self._undo_stack))
+        self._btn_auto.setEnabled(not busy)
+        self._btn_calib_all.setEnabled(False if busy else self._btn_calib_all.isEnabled())
+        for row in self._pair_rows.values():
+            row.btn.setEnabled(False if busy else row.btn.isEnabled())
 
     def _show_rect_preview(self, pair_name: str, pair: StereoPairCalibration):
         sync = self._sm.get_sync_pair(pair_name)
@@ -1168,18 +1350,275 @@ class CalibrationPanel(QWidget):
             qimg = QImage(rgb.data, nw, nh, nw * 3, QImage.Format_RGB888)
             self._lbl_rect_preview.setPixmap(QPixmap.fromImage(qimg))
 
+    # ── Multimodal auxiliary mono calibration ────────────────
+
+    @Slot()
+    def _on_capture_aux(self):
+        aux = self._sm.auxiliary_camera
+        if aux is None:
+            self._log("请先在配置窗口启用并选择融合辅助单目相机")
+            return
+        rgb_left_id = self._rgb_left_camera_id()
+        if not rgb_left_id:
+            self._log("请先配置 RGB 左相机")
+            return
+
+        rgb_entry = self._sm.get_latest_frame(rgb_left_id)
+        aux_entry = self._sm.get_latest_frame(aux.camera_id)
+        if rgb_entry is None or aux_entry is None:
+            self._log("未取到 RGB_L/AUX 最新帧，请先连接相机并确认两路有预览")
+            return
+
+        rgb_frame, rgb_ts = rgb_entry
+        aux_frame, aux_ts = aux_entry
+        dt_ms = abs(rgb_ts - aux_ts) * 1000.0
+        if dt_ms > self._sm.sync_tolerance_seconds * 1000.0:
+            self._log(f"RGB_L/AUX 时间差 {dt_ms:.0f}ms，已使用最新帧作为软同步采集")
+
+        board_cfg = self._aux_board_config()
+        detector = PlanarPatternDetector(board_cfg)
+        rgb_det = detector.detect(rgb_frame)
+        aux_det = detector.detect(aux_frame)
+        idx = f"live_{self._aux_capture_count:04d}"
+        self._aux_images.append((rgb_frame.copy(), aux_frame.copy()))
+
+        if rgb_det.valid and aux_det.valid:
+            self._aux_pairs.append((idx, rgb_det, aux_det))
+            self._log(f"{idx}: RGB_L={rgb_det.num_points} AUX={aux_det.num_points}")
+            if not self._aux_capture_sequence.finished:
+                self._aux_capture_sequence.advance()
+                self._aux_seq_widget.refresh()
+                self.sequence_updated.emit(self._aux_capture_sequence)
+        else:
+            self._log(f"{idx}: 平面板检测失败 RGB_L={rgb_det.valid} AUX={aux_det.valid}")
+
+        if self._session is not None:
+            try:
+                self._session.save_multimodal_pair(rgb_frame, aux_frame)
+            except Exception as exc:
+                self._log(f"{idx}: 多模态图片保存失败 — {str(exc).splitlines()[0]}")
+
+        self._aux_capture_count += 1
+        self._refresh_aux_capture_state()
+        self.images_imported.emit({rgb_left_id: rgb_frame, aux.camera_id: aux_frame})
+
+    @Slot()
+    def _on_import_aux_images(self):
+        if self._aux_import_worker is not None:
+            self._log("多模态图片导入正在进行，请稍候")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "选择多模态图片目录")
+        if not folder:
+            return
+
+        board_cfg = self._aux_board_config()
+        self._log("正在后台导入多模态图片")
+        self._set_aux_import_busy(True)
+        worker = AuxImageImportWorker(folder, board_cfg, parent=self)
+        worker.finished_ok.connect(self._on_import_aux_images_ready)
+        worker.failed.connect(self._on_import_aux_images_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._aux_import_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_import_aux_images_ready(self, img_pairs):
+        self._aux_import_worker = None
+        self._set_aux_import_busy(False)
+        self._aux_pairs.clear()
+        self._aux_images.clear()
+
+        for key, rgb, aux, rgb_det, aux_det in img_pairs:
+            self._aux_images.append((rgb, aux))
+            if rgb_det.valid and aux_det.valid:
+                self._aux_pairs.append((key, rgb_det, aux_det))
+                self._log(f"  [{key}] RGB_L={rgb_det.num_points} AUX={aux_det.num_points}")
+            else:
+                self._log(f"  [{key}] 检测失败 RGB_L={rgb_det.valid} AUX={aux_det.valid}")
+
+        valid = len(self._aux_pairs)
+        for _ in range(min(valid, self._aux_capture_sequence.total)):
+            if self._aux_capture_sequence.finished:
+                break
+            self._aux_capture_sequence.advance()
+        self._aux_seq_widget.refresh()
+        self._refresh_aux_capture_state()
+        if self._aux_images:
+            rgb, aux = self._aux_images[-1]
+            aux_id = self._aux_camera_id()
+            self.images_imported.emit({"RGB_L": rgb, aux_id: aux})
+        self._log(f"多模态导入完成：有效 {valid}/{len(img_pairs)} 组")
+
+    @Slot(str)
+    def _on_import_aux_images_failed(self, message: str):
+        self._aux_import_worker = None
+        self._set_aux_import_busy(False)
+        self._log(message.splitlines()[0])
+
+    @Slot()
+    def _on_calibrate_aux(self):
+        if len(self._aux_pairs) < 3:
+            self._log("多模态配对观测不足，至少需要 3 组有效图像")
+            return
+        rgb_left_id = self._rgb_left_camera_id()
+        if not rgb_left_id or rgb_left_id not in self._intrinsics:
+            self._log("请先完成 RGB_L 所在双目标定，再进行辅助单目标定")
+            return
+
+        board_cfg = self._aux_board_config()
+        aux_id = self._aux_camera_id()
+        modality = self._aux_modality()
+
+        min_frames = min(max(3, self._spin_min.value()), len(self._aux_pairs))
+        if self._aux_worker is not None:
+            self._log("已有多模态标定任务正在运行，请稍候")
+            return
+
+        self._activate_step(2)
+        self._set_aux_busy(True)
+        self._pending_aux_context = (aux_id, modality, board_cfg, rgb_left_id)
+        worker = AuxCalibrationWorker(
+            aux_id=aux_id,
+            board_config=board_cfg,
+            camera_model=self._camera_model,
+            detections=list(self._aux_pairs),
+            rgb_left_intrinsics=self._intrinsics[rgb_left_id],
+            min_intrinsic_frames=min_frames,
+            parent=self,
+        )
+        worker.log.connect(self._log)
+        worker.finished_ok.connect(self._on_aux_calibration_finished)
+        worker.failed.connect(self._on_aux_calibration_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._aux_worker = worker
+        worker.start()
+
+    @Slot(object, object)
+    def _on_aux_calibration_finished(self, aux_intr, extr):
+        self._aux_worker = None
+        aux_id, modality, board_cfg, rgb_left_id = self._pending_aux_context
+        self._aux_intrinsics = aux_intr
+        aux_calib = AuxCameraCalibration(
+            camera_id=aux_id,
+            modality=modality,
+            intrinsics=aux_intr,
+            T_rgb_left_aux=extr.T_rgb_left_aux,
+            rms_error=extr.rms_error,
+            board_type=board_cfg.pattern_type.value,
+            frame_count=extr.frame_count,
+            per_frame_errors=extr.per_frame_errors,
+        )
+        rig = self._ensure_rig()
+        rig.reference_camera = rgb_left_id
+        rig.aux_cameras[aux_id] = aux_calib
+        self._lbl_aux_status.setText(
+            f"✓ {aux_id} ({modality}) RMS={extr.rms_error:.3f}px，参与帧 {extr.frame_count}"
+        )
+        self._sections[2].set_status_hint("✓ 完成", SUCCESS)
+        self._timeline.mark_completed(2)
+        self._log(
+            f"✓ {aux_id}: T_rgb_left_aux 已生成，RMS={extr.rms_error:.4f}px，帧数={extr.frame_count}"
+        )
+        if self._session is not None:
+            self._session.record_multimodal_result(
+                aux_camera_id=aux_id,
+                modality=modality,
+                board_type=board_cfg.pattern_type.value,
+                valid_pairs=extr.frame_count,
+                rms_error=extr.rms_error,
+            )
+        self._set_aux_busy(False)
+        self.calibration_finished.emit(rig)
+
+    @Slot(str)
+    def _on_aux_calibration_failed(self, message: str):
+        self._aux_worker = None
+        self._set_aux_busy(False)
+        aux_id = self._aux_camera_id()
+        self._log(f"{aux_id}: 多模态标定失败 — {message.splitlines()[0]}")
+
+    def _set_aux_busy(self, busy: bool):
+        self._btn_capture_aux.setEnabled(not busy)
+        self._btn_import_aux.setEnabled(not busy)
+        self._btn_calib_aux.setEnabled((not busy) and len(self._aux_pairs) >= 3)
+
+    def _set_import_busy(self, busy: bool):
+        self._btn_import.setEnabled(not busy)
+        self._btn_capture.setEnabled(not busy)
+        self._btn_auto.setEnabled(not busy)
+        self._btn_undo.setEnabled((not busy) and bool(self._undo_stack))
+
+    def _set_aux_import_busy(self, busy: bool):
+        self._btn_capture_aux.setEnabled(not busy)
+        self._btn_import_aux.setEnabled(not busy)
+        self._btn_calib_aux.setEnabled((not busy) and len(self._aux_pairs) >= 3)
+
+    def _refresh_aux_capture_state(self):
+        valid = len(self._aux_pairs)
+        total = self._aux_capture_sequence.total
+        self._aux_cap_progress.setMaximum(total)
+        self._aux_cap_progress.setValue(min(valid, total))
+        self._btn_calib_aux.setEnabled(valid >= 3 and self._aux_worker is None)
+        self._lbl_aux_status.setText(
+            f"多模态观测 {valid}/{total} 组有效，至少 3 组可标定，建议按引导采满"
+        )
+        if valid >= total:
+            self._sections[2].set_status_hint("✓ 采图完成", SUCCESS)
+        elif valid >= 3:
+            self._sections[2].set_status_hint("✓ 可标定", SUCCESS)
+
+    def _aux_board_config(self) -> PatternBoardConfig:
+        aux = self._sm.auxiliary_camera
+        pattern = aux.board_pattern if aux is not None else "chessboard"
+        cfg = self._board.config
+        return PatternBoardConfig(
+            cols=max(2, cfg.cols - 1),
+            rows=max(2, cfg.rows - 1),
+            square_size=cfg.square_length,
+            pattern_type=pattern,
+        )
+
+    def _aux_camera_id(self) -> str:
+        aux = self._sm.auxiliary_camera
+        return aux.camera_id if aux is not None else "aux_cam"
+
+    def _aux_modality(self) -> str:
+        aux = self._sm.auxiliary_camera
+        return aux.modality if aux is not None else "ir"
+
+    def _rgb_left_camera_id(self) -> Optional[str]:
+        for pair in self._sm.stereo_pairs.values():
+            if pair.left.stream_type == "rgb":
+                return pair.left.camera_id
+        for pair in self._sm.stereo_pairs.values():
+            return pair.left.camera_id
+        for pair in self._pair_calibs.values():
+            return pair.left_id
+        return None
+
+    def _ensure_rig(self) -> MultiCameraRig:
+        if self._rig is not None:
+            return self._rig
+        mv = MultiViewCalibrator()
+        for pc in self._pair_calibs.values():
+            mv.add_pair_calibration(pc)
+        self._rig = mv.calibrate()
+        return self._rig
+
     # ── Multi-view ────────────────────────────────────────────
 
     @Slot()
     def _on_calibrate_multiview(self):
-        self._activate_step(2)
+        self._activate_step(3)
         self._log("联合优化...")
 
-        mv = MultiViewCalibrator()
-        for pc in self._pair_calibs.values():
-            mv.add_pair_calibration(pc)
         try:
+            previous_aux = dict(self._rig.aux_cameras) if self._rig is not None else {}
+            mv = MultiViewCalibrator()
+            for pc in self._pair_calibs.values():
+                mv.add_pair_calibration(pc)
             self._rig = mv.calibrate()
+            self._rig.aux_cameras.update(previous_aux)
             self._lbl_multi.setText(
                 f"✓ {len(self._rig.extrinsics)} 相机, "
                 f"参考: {self._rig.reference_camera}"
@@ -1210,13 +1649,17 @@ class CalibrationPanel(QWidget):
             return
 
         self._log("生成点云...")
+        from ...fusion.fusion import MultiViewFusion
+        from ...fusion.pointcloud import depth_to_pointcloud
+        from ...fusion.stereo_matching import StereoMatcher
+
         matcher = StereoMatcher()
         clouds = {}
         for pn, pair in self._rig.pairs.items():
             sr = pair.stereo
             if sr.Q is None or sr.map1_left is None:
                 continue
-            sync = self._sm.get_sync_pair(pn)
+            sync = self._image_pair_for_cloud(pn)
             if sync is None:
                 continue
             left, right = sync
@@ -1233,13 +1676,25 @@ class CalibrationPanel(QWidget):
         try:
             fused = MultiViewFusion().fuse(clouds, self._rig)
             self._log(f"融合完成: {len(fused.points)} 点")
-            self._timeline.mark_completed(2)
-            self._sections[2].set_status_hint("✓ 完成", SUCCESS)
+            self._timeline.mark_completed(3)
+            self._sections[3].set_status_hint("✓ 完成", SUCCESS)
             self.pointcloud_ready.emit(fused)
         except Exception as e:
             self._log(f"融合失败: {e}")
 
     # ── Helpers ───────────────────────────────────────────────
+
+    def _image_pair_for_cloud(self, pair_name: str):
+        sync = self._sm.get_sync_pair(pair_name)
+        if sync is not None:
+            return sync
+        if not hasattr(self, "_imported_pair_frames"):
+            return None
+        frames = self._imported_pair_frames.get(pair_name)
+        if not frames:
+            return None
+        idx = getattr(self, "_import_view_idx", 0)
+        return frames[max(0, min(idx, len(frames) - 1))]
 
     def _reset_all(self):
         self._intr_cals.clear()
@@ -1248,6 +1703,16 @@ class CalibrationPanel(QWidget):
         self._pair_calibs.clear()
         self._fqs.clear()
         self._rig = None
+        self._aux_pairs.clear()
+        self._aux_images.clear()
+        self._aux_intrinsics = None
+        self._aux_capture_count = 0
+        self._aux_capture_sequence = CaptureSequence(build_multimodal_sequence())
+        self._aux_seq_widget.set_sequence(self._aux_capture_sequence)
+        self._aux_cap_progress.setMaximum(self._aux_capture_sequence.total)
+        self._aux_cap_progress.setValue(0)
+        self._btn_calib_aux.setEnabled(False)
+        self._lbl_aux_status.setText("等待多模态配对图像")
         self._data_score.clear()
         self._capture_sequence.reset()
         self._seq_widget.refresh()
@@ -1255,6 +1720,16 @@ class CalibrationPanel(QWidget):
         self._undo_stack.clear()
         self._refresh_undo_btn()
         self._pair_capture_press_count.clear()
+        self._canceled_save_tokens.update(self._pending_save_tokens)
+        self._calib_queue.clear()
+        for attr in (
+            "_import_last_pair",
+            "_imported_frames",
+            "_imported_pair_frames",
+            "_import_view_idx",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
         for sec in self._sections:
             sec.set_status_hint("")
         self._rebuild_pair_rows()

@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from ..perf import perf_timer
 from .charuco_board import CharucoBoard
 
 
@@ -62,9 +63,10 @@ class CharucoDetector:
 
         h, w = gray.shape[:2]
 
-        charuco_corners, charuco_ids, marker_corners, marker_ids = (
-            self._detector.detectBoard(gray)
-        )
+        with perf_timer("charuco detect", threshold_ms=80.0):
+            charuco_corners, charuco_ids, marker_corners, marker_ids = (
+                self._detector.detectBoard(gray)
+            )
 
         return DetectionResult(
             charuco_corners=charuco_corners,

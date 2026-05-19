@@ -5,16 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
-    QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QSplitter,
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -23,9 +24,7 @@ from ..calibration.models import CameraModel, MultiCameraRig
 from ..io.session import CalibrationSession, SessionManager
 from ..runtime_paths import logo_png_path, sessions_dir
 from ..streaming.stream_manager import StreamManager
-from .theme import app_stylesheet
 from .widgets.calib_panel import CalibrationPanel
-from .widgets.cloud_viewer import PointCloudViewer
 from .widgets.config_dialog import ConfigDialog
 from .widgets.stream_view import MultiStreamView
 
@@ -63,13 +62,16 @@ class MainWindow(QMainWindow):
         )
         self._stream_view.set_capture_sequence(self._calib_panel._capture_sequence)
 
-        self._cloud_viewer = PointCloudViewer()
+        self._cloud_viewer = None
+        self._cloud_placeholder = self._create_cloud_placeholder()
 
         # Right side: tabs for control panel and 3D viewer
         self._right_tabs = QTabWidget()
         self._right_tabs.setTabPosition(QTabWidget.North)
         self._right_tabs.addTab(self._calib_panel, "标定控制")
-        self._right_tabs.addTab(self._cloud_viewer, "3D 点云")
+        self._cloud_tab_index = self._right_tabs.addTab(
+            self._cloud_placeholder, "3D 点云"
+        )
 
         # Splitter for main content
         self._splitter = QSplitter(Qt.Horizontal)
@@ -80,6 +82,14 @@ class MainWindow(QMainWindow):
         self._splitter.setSizes([1050, 450])
 
         self.setCentralWidget(self._splitter)
+
+    def _create_cloud_placeholder(self) -> QWidget:
+        placeholder = QWidget()
+        layout = QVBoxLayout(placeholder)
+        label = QLabel("完成标定并生成点云后此处显示 3D 点云")
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+        return placeholder
 
     def _init_menus(self):
         menubar = self.menuBar()
@@ -196,7 +206,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先配置相机")
             return
         self._current_session = self._session_manager.create_session(
-            self._board, pairs, name="calib"
+            self._board,
+            pairs,
+            auxiliary=self._stream_manager.auxiliary_camera,
+            name="calib",
         )
         self._calib_panel.set_session(self._current_session)
         self._statusbar.showMessage(f"✓  新建会话: {self._current_session.name}")
@@ -215,17 +228,23 @@ class MainWindow(QMainWindow):
     def _on_export(self):
         if self._rig is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出标定结果",
             "calibration_result.json",
-            "JSON (*.json);;YAML (*.yml *.yaml)",
+            "JSON (*.json);;OpenCV YAML (*.yml *.yaml);;Kalibr camchain YAML (*.yaml *.yml)",
         )
         if path:
-            from ..io.export import export_rig_json, export_rig_yaml
+            from ..io.export import (
+                export_rig_json,
+                export_rig_kalibr_yaml,
+                export_rig_opencv_yaml,
+            )
 
-            if path.endswith((".yml", ".yaml")):
-                export_rig_yaml(self._rig, path)
+            if "Kalibr" in selected_filter:
+                export_rig_kalibr_yaml(self._rig, path)
+            elif "OpenCV" in selected_filter or path.endswith((".yml", ".yaml")):
+                export_rig_opencv_yaml(self._rig, path)
             else:
                 export_rig_json(self._rig, path)
             self._statusbar.showMessage(f"✓  已导出: {path}")
@@ -272,8 +291,16 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_pointcloud(self, pcd):
+        if self._cloud_viewer is None:
+            from .widgets.cloud_viewer import PointCloudViewer
+
+            self._cloud_viewer = PointCloudViewer()
+            self._right_tabs.removeTab(self._cloud_tab_index)
+            self._cloud_tab_index = self._right_tabs.addTab(
+                self._cloud_viewer, "3D 点云"
+            )
         self._cloud_viewer.set_pointcloud(pcd)
-        self._right_tabs.setCurrentWidget(self._cloud_viewer)
+        self._right_tabs.setCurrentIndex(self._cloud_tab_index)
 
     def closeEvent(self, event):
         self._stream_manager.stop_all()

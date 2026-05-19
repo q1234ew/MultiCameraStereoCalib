@@ -50,7 +50,7 @@ class DiscoveredService:
     name: str = ""
     url: str = ""
     source: str = ""  # "mdns" | "probe"
-    stream_type: str = "unknown"  # "rgb" | "ir" | "control" | "unknown"
+    stream_type: str = "unknown"  # "rgb" | "ir" | "acoustic_rgb" | "control" | "unknown"
     eye: str = "unknown"  # "left" | "right" | "unknown"
 
     def __post_init__(self):
@@ -71,11 +71,15 @@ class DiscoveredService:
 
     @property
     def key(self) -> str:
-        return f"{self.host}:{self.port}"
+        return f"{self.host}:{self.port}{self.path}"
 
     @property
     def is_camera_stream(self) -> bool:
-        return self.stream_type in {"rgb", "ir"} and self.eye in {"left", "right"}
+        return self.stream_type in {"rgb", "ir", "acoustic_rgb"} and self.eye in {
+            "left",
+            "right",
+            "unknown",
+        }
 
 
 # ── mDNS / Zeroconf listener ────────────────────────────────────
@@ -217,15 +221,26 @@ def infer_stream_role(
     stream_type = "unknown"
     if prop_type in {"rgb", "color", "colour", "彩色", "可见光"}:
         stream_type = "rgb"
-    elif prop_type in {"ir", "infrared", "mono", "红外", "ir_camera"}:
+    elif prop_type in {"ir", "infrared", "thermal", "thermal_ir", "mono", "红外", "热成像", "ir_camera"}:
         stream_type = "ir"
+    elif prop_type in {
+        "acoustic_rgb",
+        "acoustic",
+        "sound_rgb",
+        "sound_camera",
+        "声像仪",
+        "声像仪rgb",
+    }:
+        stream_type = "acoustic_rgb"
     elif prop_type in {"console", "control", "web", "ui"}:
         stream_type = "control"
     elif any(word in haystack for word in ("console", "control", "admin", "webui")):
         stream_type = "control"
+    elif any(word in haystack for word in ("acoustic", "sound", "声像仪")):
+        stream_type = "acoustic_rgb"
     elif any(word in haystack for word in ("rgb", "color", "colour", "彩色", "可见光")):
         stream_type = "rgb"
-    elif any(word in haystack for word in ("ir", "infrared", "gray", "grey", "mono", "红外")):
+    elif any(word in haystack for word in ("thermal", "ir", "infrared", "gray", "grey", "mono", "红外", "热成像")):
         stream_type = "ir"
 
     eye = "unknown"
@@ -233,9 +248,9 @@ def infer_stream_role(
         eye = "left"
     elif prop_eye in {"right", "r"}:
         eye = "right"
-    elif _contains_eye_word(haystack, "left") or "_l" in haystack or "-l" in haystack:
+    elif _contains_eye_word(haystack, "left") or _contains_eye_abbrev(haystack, "l"):
         eye = "left"
-    elif _contains_eye_word(haystack, "right") or "_r" in haystack or "-r" in haystack:
+    elif _contains_eye_word(haystack, "right") or _contains_eye_abbrev(haystack, "r"):
         eye = "right"
 
     return stream_type, eye
@@ -248,6 +263,18 @@ def _normalise_token(value: str | None) -> str:
 def _contains_eye_word(text: str, word: str) -> bool:
     aliases = {"left": ("left", "左", "左目"), "right": ("right", "右", "右目")}
     return any(alias in text for alias in aliases[word])
+
+
+def _contains_eye_abbrev(text: str, letter: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            f"_{letter}_",
+            f"-{letter}-",
+            f"/{letter}/",
+            f" {letter} ",
+        )
+    ) or text.endswith((f"_{letter}", f"-{letter}", f"/{letter}", f" {letter}"))
 
 def _get_local_ip() -> Optional[str]:
     try:
@@ -308,15 +335,15 @@ async def _probe_host(
     paths: List[str],
 ) -> List[DiscoveredService]:
     results: List[DiscoveredService] = []
-    found_ports: Set[int] = set()
+    found_keys: Set[str] = set()
     tasks = []
     for port in ports:
         for path in paths:
             tasks.append(_probe_mjpeg(session, host, port, path))
     done = await asyncio.gather(*tasks, return_exceptions=True)
     for r in done:
-        if isinstance(r, DiscoveredService) and r.port not in found_ports:
-            found_ports.add(r.port)
+        if isinstance(r, DiscoveredService) and r.key not in found_keys:
+            found_keys.add(r.key)
             results.append(r)
     return results
 

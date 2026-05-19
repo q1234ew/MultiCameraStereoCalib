@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -12,7 +12,7 @@ try:
 except ImportError:
     o3d = None
 
-from ..calibration.models import CameraExtrinsics, MultiCameraRig
+from ..calibration.models import MultiCameraRig
 from .pointcloud import statistical_filter, to_open3d_cloud, voxel_downsample
 
 logger = logging.getLogger(__name__)
