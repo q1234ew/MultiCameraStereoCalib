@@ -254,7 +254,15 @@ PyInstaller 优化原则：
 - 不再对 `PySide6` 做全量 `collect_all()`，交给 PyInstaller Qt hooks 按实际导入收集。
 - 默认排除 `open3d`、`torch`、`tensorflow`、`matplotlib`、`notebook` 等大依赖。
 - `aiohttp`、`zeroconf` 仅收集子模块，避免把无关数据文件打进去。
+- `scipy` 只补充 `optimize/spatial` 相关子模块，不全量复制 data files。
 - OpenCV 动态库和数据仍显式收集，保证 ChArUco/aruco 能正常工作。
+
+GitHub Actions 打包策略：
+
+- 手动触发默认只生成便携 ZIP，不安装 Inno Setup。
+- tag 构建或手动勾选 `installer` 时才生成 Inno 安装包。
+- 上传 `MultiCamera_portable_x64.zip`，不再上传散文件夹，减少 artifact 打包时间。
+- 手动勾选 `pointcloud` 时才把 Open3D 纳入 CI 包。
 
 ## 10. 导出格式
 

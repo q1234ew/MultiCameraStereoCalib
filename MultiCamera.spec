@@ -40,6 +40,8 @@ if _assets.is_dir():
 
 for pkg in ("aiohttp", "zeroconf"):
     hiddenimports += collect_submodules(pkg)
+for pkg in ("scipy.optimize", "scipy.spatial"):
+    hiddenimports += collect_submodules(pkg)
 
 if include_open3d:
     d, b, h = collect_all("open3d")
@@ -55,11 +57,6 @@ try:
     binaries += collect_dynamic_libs("cv2")
 except Exception:
     pass
-try:
-    datas += collect_data_files("scipy")
-except Exception:
-    pass
-
 block_cipher = None
 
 a = Analysis(
