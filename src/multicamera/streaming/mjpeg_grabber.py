@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Optional
 
@@ -12,6 +13,8 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from ..perf import perf_timer
+
+logger = logging.getLogger(__name__)
 
 
 class MJPEGGrabber(QThread):
@@ -69,6 +72,12 @@ class MJPEGGrabber(QThread):
                 break
             except Exception as e:
                 reason = str(e) or e.__class__.__name__
+                logger.warning(
+                    "MJPEG connection lost: camera=%s url=%s reason=%s",
+                    self.camera_id,
+                    self.url,
+                    reason,
+                )
                 self.connection_lost.emit(self.camera_id, reason)
                 if self._running:
                     await asyncio.sleep(self.RECONNECT_DELAY)
@@ -76,14 +85,24 @@ class MJPEGGrabber(QThread):
     async def _connect_and_read(self):
         timeout = aiohttp.ClientTimeout(
             total=None,
+            connect=5.0,
+            sock_connect=5.0,
             sock_read=self.READ_TIMEOUT,
         )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(self.url) as resp:
+        connector = aiohttp.TCPConnector(family=0, force_close=True)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            logger.info("Connecting MJPEG stream: camera=%s url=%s", self.camera_id, self.url)
+            async with session.get(self.url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     raise ConnectionError(f"HTTP {resp.status}")
 
                 content_type = resp.headers.get("Content-Type", "")
+                logger.info(
+                    "MJPEG connected: camera=%s status=%s content_type=%s",
+                    self.camera_id,
+                    resp.status,
+                    content_type,
+                )
 
                 if "multipart" in content_type:
                     await self._read_multipart(resp)
@@ -169,6 +188,12 @@ class MJPEGGrabber(QThread):
             ts = time.time()
             self.frame_ready.emit(self.camera_id, frame, ts)
             self._update_fps()
+        else:
+            logger.warning(
+                "Failed to decode JPEG frame: camera=%s bytes=%d",
+                self.camera_id,
+                len(jpeg_data),
+            )
 
     def _update_fps(self):
         self._frame_count += 1

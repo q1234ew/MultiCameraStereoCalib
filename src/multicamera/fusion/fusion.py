@@ -30,7 +30,10 @@ class MultiViewFusion:
         statistical_std: float = 2.0,
     ):
         if o3d is None:
-            raise ImportError("open3d is required for MultiViewFusion")
+            raise ImportError(
+                "open3d is required for point cloud fusion. "
+                "Install the pointcloud extra or build Windows package with --pointcloud."
+            )
 
         self.voxel_size = voxel_size
         self.icp_max_distance = icp_max_distance

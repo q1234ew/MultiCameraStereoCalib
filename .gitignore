@@ -19,6 +19,7 @@ env/
 .DS_Store
 
 sessions/
+logs/
 data/
 *.ply
 *.pcd

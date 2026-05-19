@@ -138,9 +138,10 @@ class MdnsListener:
         if not addresses and not server:
             return
 
-        # Prefer the advertised .local hostname for stable UI/config URLs.
-        # Fall back to IP address when the service does not publish a server name.
-        host = server or addresses[0]
+        # Prefer the numeric address for the actual stream URL. Windows targets
+        # often discover mDNS services correctly but cannot resolve *.local
+        # without Bonjour, which looks like "found device but cannot connect".
+        host = addresses[0] if addresses else server
         port = info.port
         props = _decode_properties(info.properties)
         path = props.get("path", "/")
@@ -162,7 +163,14 @@ class MdnsListener:
             eye=eye,
         )
         self._services[svc.key] = svc
-        logger.info("mDNS discovered: %s -> %s", friendly, svc.url)
+        logger.info(
+            "mDNS discovered: name=%s url=%s type=%s eye=%s props=%s",
+            friendly,
+            svc.url,
+            svc.stream_type,
+            svc.eye,
+            props,
+        )
         if self._on_change:
             self._on_change()
 
@@ -385,6 +393,14 @@ async def scan_subnet(
         await asyncio.gather(*tasks)
 
     logger.info("Subnet probe complete: found %d services", len(all_results))
+    for svc in all_results:
+        logger.info(
+            "Probe discovered: name=%s url=%s type=%s eye=%s",
+            svc.name,
+            svc.url,
+            svc.stream_type,
+            svc.eye,
+        )
     return all_results
 
 
@@ -445,6 +461,7 @@ class DiscoveryWorker(QThread):
 
         # keep mDNS listener alive until explicitly stopped
         results = list(self._all.values())
+        logger.info("DiscoveryWorker finished: total_services=%d", len(results))
         self.scan_finished.emit(results)
         self.finished.emit(results)
 

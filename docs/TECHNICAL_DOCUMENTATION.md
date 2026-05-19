@@ -77,6 +77,13 @@ python -m multicamera
 - 开发环境：当前工作目录下的 `sessions/`。
 - PyInstaller 打包后：exe 同级的 `sessions/`。
 
+日志目录由 `runtime_paths.logs_dir()` 决定：
+
+- 开发环境：当前工作目录下的 `logs/`。
+- PyInstaller 打包后：exe 同级的 `logs/`。
+- 主日志文件为 `multicamera.log`，采用 5MB 轮转并保留 5 个历史文件。
+- UI 菜单 `工具 -> 打开日志目录` 可直接打开日志位置。
+
 会话结构：
 
 ```text
@@ -199,6 +206,12 @@ UI 主线程负责：
 
 启动路径不再导入 Open3D。
 
+Windows 打包默认也不包含 Open3D：
+
+- `scripts\build_windows.bat` 生成轻量包，保留标定、导出和多模态功能。
+- `scripts\build_windows.bat --pointcloud` 生成点云完整包，会安装并打包 Open3D。
+- 轻量包中点击点云生成/PLY/PCD 导出会提示需要 `pointcloud` extra 或 `--pointcloud` 包。
+
 懒加载策略：
 
 - 主窗口启动时只创建 3D 点云占位页。
@@ -214,7 +227,36 @@ UI 主线程负责：
 - 入口导入：约 `3.98s / 330MB` 降到约 `1.42s / 170MB`。
 - GUI offscreen 烟测：约 `5.19s / 382MB` 降到约 `2.60s / 223MB`。
 
-## 9. 导出格式
+## 9. Windows 打包优化
+
+默认构建目标是“标定工具轻量包”：
+
+```bat
+scripts\build_windows.bat
+```
+
+该包不安装、不收集 Open3D，适合现场采集、标定、JSON/OpenCV/Kalibr 导出，打包速度和分发体积都明显低于完整点云包。
+
+需要点云功能时使用：
+
+```bat
+scripts\build_windows.bat --pointcloud
+```
+
+对应安装包脚本会透传参数：
+
+```bat
+scripts\build_windows_installer.bat --pointcloud
+```
+
+PyInstaller 优化原则：
+
+- 不再对 `PySide6` 做全量 `collect_all()`，交给 PyInstaller Qt hooks 按实际导入收集。
+- 默认排除 `open3d`、`torch`、`tensorflow`、`matplotlib`、`notebook` 等大依赖。
+- `aiohttp`、`zeroconf` 仅收集子模块，避免把无关数据文件打进去。
+- OpenCV 动态库和数据仍显式收集，保证 ChArUco/aruco 能正常工作。
+
+## 10. 导出格式
 
 标定完成后支持：
 
@@ -237,7 +279,7 @@ UI 主线程负责：
 
 注意：Kalibr 导出的 `rostopic` 默认使用 `/<camera_id>/image_raw`，如需对接真实 ROS bag，可在后续增加可配置映射。
 
-## 10. 多模态融合单目标定
+## 11. 多模态融合单目标定
 
 第一版支持固定设备形态 `RGB_L/R + AUX`：
 
@@ -278,9 +320,17 @@ UI 和线程模型：
 - 有效平面板配对观测少于 3 组。
 - AUX 内参或任一外参 `solvePnP` 有效帧不足。
 
-## 11. 性能观测
+## 12. 性能观测
 
 `multicamera.perf.perf_timer()` 用于记录慢操作。
+
+应用启动时会写入运行环境信息，包括 frozen 状态、exe 路径、Python 版本、平台、工作目录和进程 ID。日志同时捕获：
+
+- 未处理 Python 异常和线程异常。
+- Qt warning/critical/fatal 消息。
+- mDNS/子网扫描发现到的服务、类型、目别和 URL。
+- 每路 MJPEG 连接 URL、HTTP 状态、Content-Type、断开原因和 JPEG 解码失败。
+- 用户触发的配置、连接、断开、导出、新建/加载会话等关键操作。
 
 已接入位置：
 
@@ -297,7 +347,7 @@ UI 和线程模型：
 
 默认日志只在超过阈值时输出，便于发现异常慢操作，而不会在正常帧率下刷屏。
 
-## 12. 验证步骤
+## 13. 验证步骤
 
 推荐使用项目虚拟环境：
 
@@ -336,7 +386,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -c "import sys; from PySide6.QtCore i
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
-## 13. 手工回归清单
+## 14. 手工回归清单
 
 相机配置：
 
@@ -383,7 +433,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -c "import sys; from PySide6.QtCore i
 - 未完成 RGB 双目标定时点击辅助单目标定，应提示先完成 RGB_L。
 - 辅助单目标定期间按钮禁用，完成后恢复并启用导出。
 
-## 14. 当前边界与后续方向
+## 15. 当前边界与后续方向
 
 当前边界：
 

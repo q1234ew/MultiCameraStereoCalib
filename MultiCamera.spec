@@ -4,12 +4,20 @@
 用法（在仓库根目录、已安装本项目与构建依赖时）：
     pyinstaller --noconfirm MultiCamera.spec
 
-建议在 Windows 64 位环境、Python 3.10–3.12 下执行；体积较大（含 Open3D / Qt / OpenCV）。
+默认生成轻量包，不包含 Open3D 点云运行库；需要点云完整包时：
+    set MULTICAMERA_WITH_OPEN3D=1
+    pyinstaller --noconfirm MultiCamera.spec
 """
+import os
 import pathlib
 
 from PyInstaller.building.build_main import Analysis, COLLECT, EXE, PYZ
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 # PyInstaller sets SPECPATH to the directory containing this .spec file.
 ROOT = pathlib.Path(SPECPATH).resolve()
@@ -19,13 +27,22 @@ ENTRY = SRC / "multicamera" / "__main__.py"
 datas: list = []
 binaries: list = []
 hiddenimports: list = collect_submodules("multicamera")
+include_open3d = os.environ.get("MULTICAMERA_WITH_OPEN3D", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 _assets = ROOT / "assets"
 if _assets.is_dir():
     datas.append((str(_assets), "assets"))
 
-for pkg in ("PySide6", "open3d"):
-    d, b, h = collect_all(pkg)
+for pkg in ("aiohttp", "zeroconf"):
+    hiddenimports += collect_submodules(pkg)
+
+if include_open3d:
+    d, b, h = collect_all("open3d")
     datas += d
     binaries += b
     hiddenimports += h
@@ -56,7 +73,30 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         "tkinter",
+        "matplotlib",
+        "notebook",
+        "IPython",
+        "jupyter",
+        "pandas",
+        "sklearn",
         "torch",
+        "tensorflow",
+        "tensorboard",
+        "open3d.ml.torch",
+        "open3d.ml.tf",
+        "open3d",
+        "PySide6.scripts.deploy_lib",
+    ] if not include_open3d else [
+        "tkinter",
+        "matplotlib",
+        "notebook",
+        "IPython",
+        "jupyter",
+        "pandas",
+        "sklearn",
+        "torch",
+        "tensorflow",
+        "tensorboard",
         "open3d.ml.torch",
         "open3d.ml.tf",
         "PySide6.scripts.deploy_lib",

@@ -46,7 +46,10 @@ def to_open3d_cloud(
 ) -> "o3d.geometry.PointCloud":
     """Create an Open3D point cloud from numpy arrays."""
     if o3d is None:
-        raise ImportError("open3d is required for point cloud operations")
+        raise ImportError(
+            "open3d is required for point cloud operations. "
+            "Install the pointcloud extra or build Windows package with --pointcloud."
+        )
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
@@ -62,7 +65,9 @@ def statistical_filter(
 ) -> "o3d.geometry.PointCloud":
     """Remove statistical outliers."""
     if o3d is None:
-        raise ImportError("open3d is required")
+        raise ImportError(
+            "open3d is required. Install the pointcloud extra or build Windows package with --pointcloud."
+        )
     filtered, _ = pcd.remove_statistical_outlier(
         nb_neighbors=nb_neighbors, std_ratio=std_ratio
     )
@@ -75,5 +80,7 @@ def voxel_downsample(
 ) -> "o3d.geometry.PointCloud":
     """Downsample point cloud using a voxel grid."""
     if o3d is None:
-        raise ImportError("open3d is required")
+        raise ImportError(
+            "open3d is required. Install the pointcloud extra or build Windows package with --pointcloud."
+        )
     return pcd.voxel_down_sample(voxel_size=voxel_size)

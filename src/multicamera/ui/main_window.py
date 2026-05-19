@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, QUrl, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -22,11 +24,14 @@ from PySide6.QtWidgets import (
 from ..board.charuco_board import CharucoBoard, CharucoBoardConfig
 from ..calibration.models import CameraModel, MultiCameraRig
 from ..io.session import CalibrationSession, SessionManager
-from ..runtime_paths import logo_png_path, sessions_dir
+from ..runtime_paths import logo_png_path, logs_dir, sessions_dir
 from ..streaming.stream_manager import StreamManager
 from .widgets.calib_panel import CalibrationPanel
 from .widgets.config_dialog import ConfigDialog
 from .widgets.stream_view import MultiStreamView
+
+logger = logging.getLogger(__name__)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -124,6 +129,9 @@ class MainWindow(QMainWindow):
         tools_menu = menubar.addMenu("工具(&T)")
         self._act_gen_board = QAction("生成标定板图像(&G)...", self)
         tools_menu.addAction(self._act_gen_board)
+        tools_menu.addSeparator()
+        self._act_open_logs = QAction("打开日志目录(&L)", self)
+        tools_menu.addAction(self._act_open_logs)
 
     def _init_toolbar(self):
         toolbar = QToolBar("主工具栏")
@@ -164,6 +172,7 @@ class MainWindow(QMainWindow):
         self._act_stop_streams.triggered.connect(self._on_stop_streams)
         self._act_gen_board.triggered.connect(self._on_gen_board)
         self._act_gen_board_tb.triggered.connect(self._on_gen_board)
+        self._act_open_logs.triggered.connect(self._on_open_logs)
 
         self._calib_panel.calibration_finished.connect(self._on_calib_finished)
         self._calib_panel.pointcloud_ready.connect(self._on_pointcloud)
@@ -175,15 +184,14 @@ class MainWindow(QMainWindow):
 
         self._stream_manager.camera_connected.connect(self._on_camera_connected)
         self._stream_manager.camera_disconnected.connect(
-            lambda cid, reason: self._statusbar.showMessage(
-                f"✗  相机 {cid} 断开: {reason}"
-            )
+            self._on_camera_disconnected
         )
 
     # ── Slots ─────────────────────────────────────────────────
 
     @Slot()
     def _on_config(self):
+        logger.info("Open camera configuration dialog")
         dlg = ConfigDialog(
             self._stream_manager, self._board, self._camera_model, parent=self
         )
@@ -195,6 +203,13 @@ class MainWindow(QMainWindow):
             self._calib_panel.set_camera_model(self._camera_model)
             self._calib_panel.refresh_pairs()
             model_name = "针孔" if self._camera_model == CameraModel.PINHOLE else "鱼眼"
+            logger.info(
+                "Configuration accepted: pairs=%d aux=%s model=%s board=%s",
+                len(self._stream_manager.stereo_pairs),
+                bool(self._stream_manager.auxiliary_camera),
+                self._camera_model.value,
+                self._board.config,
+            )
             self._statusbar.showMessage(
                 f"✓  已配置 {len(self._stream_manager.stereo_pairs)} 组相机 [{model_name}模型]"
             )
@@ -205,6 +220,7 @@ class MainWindow(QMainWindow):
         if not pairs:
             QMessageBox.warning(self, "提示", "请先配置相机")
             return
+        logger.info("Create calibration session: pairs=%d", len(pairs))
         self._current_session = self._session_manager.create_session(
             self._board,
             pairs,
@@ -220,6 +236,7 @@ class MainWindow(QMainWindow):
             self, "选择会话目录", str(sessions_dir())
         )
         if dir_path:
+            logger.info("Load calibration session: %s", dir_path)
             self._current_session = CalibrationSession.load(Path(dir_path))
             self._calib_panel.set_session(self._current_session)
             self._statusbar.showMessage(f"✓  加载会话: {self._current_session.name}")
@@ -235,6 +252,7 @@ class MainWindow(QMainWindow):
             "JSON (*.json);;OpenCV YAML (*.yml *.yaml);;Kalibr camchain YAML (*.yaml *.yml)",
         )
         if path:
+            logger.info("Export calibration: path=%s filter=%s", path, selected_filter)
             from ..io.export import (
                 export_rig_json,
                 export_rig_kalibr_yaml,
@@ -251,11 +269,18 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_camera_connected(self, cid: str):
+        logger.info("Camera connected: %s", cid)
         self._statusbar.showMessage(f"✓  相机 {cid} 已连接")
         self._calib_panel.refresh_pairs()
 
+    @Slot(str, str)
+    def _on_camera_disconnected(self, cid: str, reason: str):
+        logger.warning("Camera disconnected: %s reason=%s", cid, reason)
+        self._statusbar.showMessage(f"✗  相机 {cid} 断开: {reason}")
+
     @Slot()
     def _on_start_streams(self):
+        logger.info("User requested start streams")
         self._stream_manager.start_all()
         self._act_start_streams.setEnabled(False)
         self._act_stop_streams.setEnabled(True)
@@ -264,6 +289,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_stop_streams(self):
+        logger.info("User requested stop streams")
         self._stream_manager.stop_all()
         self._act_start_streams.setEnabled(True)
         self._act_stop_streams.setEnabled(False)
@@ -278,11 +304,29 @@ class MainWindow(QMainWindow):
             "PNG (*.png);;JPEG (*.jpg)",
         )
         if path:
+            logger.info("Save board image: %s", path)
             self._board.save_image(path)
             self._statusbar.showMessage(f"✓  标定板已保存: {path}")
 
+    @Slot()
+    def _on_open_logs(self):
+        path = logs_dir()
+        logger.info("Open logs directory: %s", path)
+        ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if ok:
+            self._statusbar.showMessage(f"日志目录: {path}")
+        else:
+            QMessageBox.information(self, "日志目录", str(path))
+
     @Slot(object)
     def _on_calib_finished(self, rig: MultiCameraRig):
+        logger.info(
+            "Calibration finished: pairs=%d cameras=%d aux=%d reference=%s",
+            len(rig.pairs),
+            len(rig.extrinsics),
+            len(rig.aux_cameras),
+            rig.reference_camera,
+        )
         self._rig = rig
         self._act_export.setEnabled(True)
         if self._current_session:

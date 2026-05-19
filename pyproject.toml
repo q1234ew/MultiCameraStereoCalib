@@ -10,7 +10,6 @@ requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6",
     "opencv-contrib-python>=4.9",
-    "open3d>=0.18",
     "numpy>=1.24",
     "aiohttp>=3.9",
     "scipy>=1.11",
@@ -21,6 +20,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "ruff>=0.3",
+]
+pointcloud = [
+    "open3d>=0.18",
 ]
 build-win = [
     "pyinstaller>=6.0",

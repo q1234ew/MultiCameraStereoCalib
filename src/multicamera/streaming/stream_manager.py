@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -10,6 +11,8 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .mjpeg_grabber import MJPEGGrabber
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,6 +79,15 @@ class StreamManager(QObject):
     # ── Public API ────────────────────────────────────────────
 
     def add_stereo_pair(self, pair: StereoPairConfig):
+        logger.info(
+            "Register stereo pair: name=%s left=%s url=%s right=%s url=%s type=%s",
+            pair.name,
+            pair.left.camera_id,
+            pair.left.url,
+            pair.right.camera_id,
+            pair.right.url,
+            pair.left.stream_type,
+        )
         self._virtual_pairs.discard(pair.name)
         self._stereo_pairs[pair.name] = pair
         self._add_camera(pair.left)
@@ -83,6 +95,7 @@ class StreamManager(QObject):
 
     def add_virtual_stereo_pair(self, pair: StereoPairConfig):
         """Register an offline pair without creating stream grabber threads."""
+        logger.info("Register virtual stereo pair: name=%s", pair.name)
         self._stereo_pairs[pair.name] = pair
         self._virtual_pairs.add(pair.name)
 
@@ -94,6 +107,13 @@ class StreamManager(QObject):
             self._remove_camera(pair.right.camera_id)
 
     def set_auxiliary_camera(self, cfg: AuxiliaryCameraConfig):
+        logger.info(
+            "Register auxiliary camera: id=%s modality=%s url=%s board=%s",
+            cfg.camera_id,
+            cfg.modality,
+            cfg.url,
+            cfg.board_pattern,
+        )
         self._auxiliary_camera = cfg
         self._add_camera(
             CameraConfig(
@@ -107,11 +127,19 @@ class StreamManager(QObject):
 
     def clear_auxiliary_camera(self):
         cfg = self._auxiliary_camera
+        if cfg is not None:
+            logger.info("Clear auxiliary camera: id=%s", cfg.camera_id)
         self._auxiliary_camera = None
         if cfg is not None:
             self._remove_camera(cfg.camera_id)
 
     def start_all(self):
+        logger.info(
+            "Starting streams: pairs=%d aux=%s max_decode_fps=%.1f",
+            len(self._stereo_pairs),
+            bool(self._auxiliary_camera),
+            self._max_decode_fps,
+        )
         # Ensure grabber objects exist for every configured camera, then start.
         # After stop_all(), MJPEGGrabber QThreads are finished — they must be recreated
         # (Qt does not reliably allow restarting the same QThread instance).
@@ -132,9 +160,11 @@ class StreamManager(QObject):
             )
         for g in self._grabbers.values():
             if not g.isRunning():
+                logger.info("Starting grabber: camera=%s url=%s", g.camera_id, g.url)
                 g.start()
 
     def stop_all(self):
+        logger.info("Stopping all streams: grabbers=%d", len(self._grabbers))
         for g in list(self._grabbers.values()):
             g.stop()
         self._grabbers.clear()
@@ -198,6 +228,7 @@ class StreamManager(QObject):
         if existing is not None:
             if existing.isRunning() and getattr(existing, "url", "") == cfg.url:
                 return
+            logger.info("Restarting grabber for camera=%s url=%s", cfg.camera_id, cfg.url)
             existing.stop()
             existing.wait(3000)
             self._grabbers.pop(cfg.camera_id, None)
@@ -213,6 +244,14 @@ class StreamManager(QObject):
         grabber.connection_lost.connect(self.camera_disconnected)
         grabber.fps_updated.connect(self.fps_updated)
         self._grabbers[cfg.camera_id] = grabber
+        logger.info(
+            "Created grabber: camera=%s role=%s group=%s type=%s url=%s",
+            cfg.camera_id,
+            cfg.role,
+            cfg.group,
+            cfg.stream_type,
+            cfg.url,
+        )
 
     def _remove_camera(self, camera_id: str):
         grabber = self._grabbers.pop(camera_id, None)

@@ -3,12 +3,14 @@ import sys
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from multicamera.logging_config import setup_logging
 from multicamera.runtime_paths import logo_png_path
 from multicamera.ui.main_window import MainWindow
 from multicamera.ui.theme import app_stylesheet
 
 
 def main():
+    setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("MultiCamera Calibration")
     app.setOrganizationName("MultiCamera")

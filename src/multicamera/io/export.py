@@ -315,5 +315,8 @@ def _require_open3d():
     try:
         import open3d as o3d
     except ImportError as exc:
-        raise ImportError("open3d is required for point cloud export") from exc
+        raise ImportError(
+            "open3d is required for point cloud export. "
+            "Install the pointcloud extra or build Windows package with --pointcloud."
+        ) from exc
     return o3d

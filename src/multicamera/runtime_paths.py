@@ -31,6 +31,13 @@ def sessions_dir() -> Path:
     return d
 
 
+def logs_dir() -> Path:
+    """运行日志目录；打包后放在 exe 同级，便于排查现场网络问题。"""
+    d = exe_dir() / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def logo_png_path() -> Path | None:
     """应用图标；优先 exe 旁 assets，其次打包内嵌资源。"""
     candidates: list[Path] = []
