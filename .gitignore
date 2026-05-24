@@ -20,6 +20,7 @@ env/
 
 sessions/
 logs/
+offline/
 data/
 *.ply
 *.pcd

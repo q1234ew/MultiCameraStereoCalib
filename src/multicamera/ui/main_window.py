@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
         self._act_open_logs.triggered.connect(self._on_open_logs)
 
         self._calib_panel.calibration_finished.connect(self._on_calib_finished)
+        self._calib_panel.calibration_reset.connect(self._on_calib_reset)
         self._calib_panel.pointcloud_ready.connect(self._on_pointcloud)
         self._calib_panel.frame_captured.connect(self._stream_view.notify_capture)
         self._calib_panel.sequence_updated.connect(
@@ -197,7 +198,7 @@ class MainWindow(QMainWindow):
         )
         if dlg.exec():
             self._board = dlg.board
-            self._camera_model = dlg.camera_model
+            self._camera_model = CameraModel(dlg.camera_model)
             self._stream_view.update_board(self._board)
             self._calib_panel.update_board(self._board)
             self._calib_panel.set_camera_model(self._camera_model)
@@ -244,23 +245,33 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_export(self):
         if self._rig is None:
+            QMessageBox.information(
+                self,
+                "导出标定结果",
+                "当前没有可导出的标定结果。请先完成双目标定或多模态标定。",
+            )
             return
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出标定结果",
             "calibration_result.json",
-            "JSON (*.json);;OpenCV YAML (*.yml *.yaml);;Kalibr camchain YAML (*.yaml *.yml)",
+            "JSON (*.json);;OpenCV 完整 YAML (*.yml *.yaml);;"
+            "OpenCV 标准 Stereo YAML (*.yml *.yaml);;"
+            "Kalibr camchain YAML (*.yaml *.yml)",
         )
         if path:
             logger.info("Export calibration: path=%s filter=%s", path, selected_filter)
             from ..io.export import (
                 export_rig_json,
                 export_rig_kalibr_yaml,
+                export_rig_opencv_standard_yaml,
                 export_rig_opencv_yaml,
             )
 
             if "Kalibr" in selected_filter:
                 export_rig_kalibr_yaml(self._rig, path)
+            elif "OpenCV 标准" in selected_filter:
+                export_rig_opencv_standard_yaml(self._rig, path)
             elif "OpenCV" in selected_filter or path.endswith((".yml", ".yaml")):
                 export_rig_opencv_yaml(self._rig, path)
             else:
@@ -332,6 +343,13 @@ class MainWindow(QMainWindow):
         if self._current_session:
             self._current_session.save_rig(rig)
         self._statusbar.showMessage("✓  标定完成！可在 3D 点云 标签页查看结果")
+
+    @Slot()
+    def _on_calib_reset(self):
+        logger.info("Calibration state reset")
+        self._rig = None
+        self._act_export.setEnabled(False)
+        self._statusbar.showMessage("标定数据已重置，请重新标定后再导出")
 
     @Slot(object)
     def _on_pointcloud(self, pcd):

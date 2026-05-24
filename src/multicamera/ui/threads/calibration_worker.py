@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 
 from PySide6.QtCore import QThread, Signal
 
 from ...calibration.auxiliary import AuxIntrinsicCalibrator, CrossModalExtrinsicCalibrator
 from ...calibration.models import CameraIntrinsics, StereoPairCalibration
+
+logger = logging.getLogger(__name__)
 
 
 class PairCalibrationWorker(QThread):
@@ -27,6 +30,9 @@ class PairCalibrationWorker(QThread):
         stereo_calibrator,
         left_intrinsics: CameraIntrinsics | None = None,
         right_intrinsics: CameraIntrinsics | None = None,
+        intrinsic_flags: int = 0,
+        stereo_flags: int = 0,
+        strategy_name: str = "标准",
         parent=None,
     ):
         super().__init__(parent)
@@ -38,21 +44,40 @@ class PairCalibrationWorker(QThread):
         self.stereo_calibrator = stereo_calibrator
         self.left_intrinsics = left_intrinsics
         self.right_intrinsics = right_intrinsics
+        self.intrinsic_flags = intrinsic_flags
+        self.stereo_flags = stereo_flags
+        self.strategy_name = strategy_name
 
     def run(self):
         try:
+            logger.info(
+                "Pair calibration start: pair=%s left=%s right=%s strategy=%s "
+                "intrinsic_flags=%d stereo_flags=%d frames_left=%s frames_right=%s frames_stereo=%s",
+                self.pair_name,
+                self.left_id,
+                self.right_id,
+                self.strategy_name,
+                self.intrinsic_flags,
+                self.stereo_flags,
+                getattr(self.left_calibrator, "num_frames", "?"),
+                getattr(self.right_calibrator, "num_frames", "?"),
+                getattr(self.stereo_calibrator, "num_frames", "?"),
+            )
+            self.log.emit(f"标定策略: {self.strategy_name}")
             left_intr = self.left_intrinsics
             if left_intr is None:
                 self.log.emit(f"标定内参: {self.left_id}...")
-                left_intr = self.left_calibrator.calibrate()
+                left_intr = self.left_calibrator.calibrate(flags=self.intrinsic_flags)
 
             right_intr = self.right_intrinsics
             if right_intr is None:
                 self.log.emit(f"标定内参: {self.right_id}...")
-                right_intr = self.right_calibrator.calibrate()
+                right_intr = self.right_calibrator.calibrate(flags=self.intrinsic_flags)
 
             self.log.emit(f"标定外参: {self.pair_name}...")
-            stereo = self.stereo_calibrator.calibrate(left_intr, right_intr)
+            stereo = self.stereo_calibrator.calibrate(
+                left_intr, right_intr, flags=self.stereo_flags
+            )
             pair_calib = StereoPairCalibration(
                 pair_name=self.pair_name,
                 left_id=self.left_id,
@@ -69,7 +94,15 @@ class PairCalibrationWorker(QThread):
                 right_intr,
                 pair_calib,
             )
+            logger.info(
+                "Pair calibration finished: pair=%s left_rms=%.4f right_rms=%.4f stereo_rms=%.4f",
+                self.pair_name,
+                left_intr.rms_error,
+                right_intr.rms_error,
+                stereo.rms_error,
+            )
         except Exception as exc:
+            logger.exception("Pair calibration failed: pair=%s", self.pair_name)
             self.failed.emit(self.pair_name, f"{exc}\n{traceback.format_exc(limit=3)}")
 
 

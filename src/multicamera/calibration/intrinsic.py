@@ -46,6 +46,10 @@ class IntrinsicCalibrator:
         return len(self._all_corners)
 
     @property
+    def frame_corner_counts(self) -> List[int]:
+        return [int(len(ids)) for ids in self._all_ids]
+
+    @property
     def ready(self) -> bool:
         return self.num_frames >= self.min_frames
 
@@ -243,3 +247,15 @@ class IntrinsicCalibrator:
     @property
     def stored_images(self) -> List[np.ndarray]:
         return self._images
+
+    def copy_with_indices(self, indices: List[int]) -> "IntrinsicCalibrator":
+        clone = IntrinsicCalibrator(self.board, self.model, self.min_frames)
+        for idx in indices:
+            if idx < 0 or idx >= self.num_frames:
+                continue
+            clone._all_corners.append(self._all_corners[idx].copy())
+            clone._all_ids.append(self._all_ids[idx].copy())
+            if idx < len(self._images):
+                clone._images.append(self._images[idx].copy())
+        clone._image_size = self._image_size if clone._all_corners else None
+        return clone

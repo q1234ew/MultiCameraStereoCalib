@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 
-from ..calibration.models import CameraIntrinsics, CameraModel, MultiCameraRig
+from ..calibration.models import (
+    CameraIntrinsics,
+    CameraModel,
+    MultiCameraRig,
+    StereoPairCalibration,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def export_rig_json(rig: MultiCameraRig, path: str | Path) -> Path:
@@ -17,6 +25,13 @@ def export_rig_json(rig: MultiCameraRig, path: str | Path) -> Path:
     path.write_text(
         json.dumps(rig.to_dict(), indent=2, ensure_ascii=False),
         encoding="utf-8",
+    )
+    logger.info(
+        "Exported calibration JSON: path=%s pairs=%d cameras=%d aux=%d",
+        path,
+        len(rig.pairs),
+        len(_camera_intrinsics(rig)),
+        len(rig.aux_cameras),
     )
     return path
 
@@ -35,6 +50,10 @@ def export_rig_opencv_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
     fs.write("pair_count", len(rig.pairs))
     fs.write("aux_camera_count", len(rig.aux_cameras))
 
+    primary_pair = next(iter(rig.pairs.values()), None)
+    if primary_pair is not None:
+        _write_opencv_stereo_aliases(fs, primary_pair)
+
     for cam_id, intr in _camera_intrinsics(rig).items():
         prefix = f"camera_{_safe_key(cam_id)}"
         fs.write(f"{prefix}_id", cam_id)
@@ -50,6 +69,7 @@ def export_rig_opencv_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
         fs.write(f"{prefix}_name", pair_name)
         fs.write(f"{prefix}_left_id", pair.left_id)
         fs.write(f"{prefix}_right_id", pair.right_id)
+        _write_opencv_stereo_aliases(fs, pair, prefix=prefix)
         fs.write(f"{prefix}_R", pair.stereo.R)
         fs.write(f"{prefix}_T", pair.stereo.T)
         fs.write(f"{prefix}_E", pair.stereo.E)
@@ -82,7 +102,146 @@ def export_rig_opencv_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
         fs.write(f"{prefix}_t_rgb_left_aux", aux.t_rgb_left_aux)
 
     fs.release()
+    logger.info(
+        "Exported OpenCV full YAML: path=%s pairs=%d cameras=%d aux=%d",
+        path,
+        len(rig.pairs),
+        len(_camera_intrinsics(rig)),
+        len(rig.aux_cameras),
+    )
     return path
+
+
+def export_rig_opencv_standard_yaml(
+    rig: MultiCameraRig,
+    path: str | Path,
+    pair_name: str | None = None,
+) -> Path:
+    """Export one stereo pair using common OpenCV stereo calibration keys.
+
+    This format is intentionally small and third-party friendly. It writes the
+    matrix names used by many OpenCV examples: M1/D1/M2/D2/R/T/E/F/R1/R2/P1/P2/Q.
+    For rigs with multiple stereo pairs, the first pair is exported unless
+    ``pair_name`` is provided.
+    """
+    pair = _select_pair_for_standard_export(rig, pair_name)
+    path = Path(path)
+    fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_WRITE)
+
+    fs.write("calibration_type", "stereo")
+    fs.write("pair_name", pair.pair_name)
+    fs.write("left_camera_id", pair.left_id)
+    fs.write("right_camera_id", pair.right_id)
+    _write_opencv_standard_stereo_fields(fs, pair)
+
+    fs.release()
+    logger.info(
+        "Exported OpenCV standard stereo YAML: path=%s pair=%s left=%s right=%s",
+        path,
+        pair.pair_name,
+        pair.left_id,
+        pair.right_id,
+    )
+    return path
+
+
+def _write_opencv_stereo_aliases(
+    fs: cv2.FileStorage,
+    pair: StereoPairCalibration,
+    prefix: str = "",
+):
+    """Write common OpenCV stereo calibration aliases.
+
+    OpenCV examples often read M1/D1/M2/D2/R/T/E/F/R1/R2/P1/P2/Q directly.
+    The prefixed variant lets multi-pair rigs expose the same aliases without
+    losing the stable project-specific keys.
+    """
+    key = f"{prefix}_" if prefix else ""
+    fs.write(f"{key}calibration_type", "stereo")
+    fs.write(f"{key}pair_name", pair.pair_name)
+    fs.write(f"{key}left_camera_id", pair.left_id)
+    fs.write(f"{key}right_camera_id", pair.right_id)
+    fs.write(f"{key}image_width", int(pair.left_intrinsics.image_size[0]))
+    fs.write(f"{key}image_height", int(pair.left_intrinsics.image_size[1]))
+    fs.write(
+        f"{key}image_size",
+        np.array(
+            [[int(pair.left_intrinsics.image_size[0]), int(pair.left_intrinsics.image_size[1])]],
+            dtype=np.int32,
+        ),
+    )
+
+    fs.write(f"{key}camera_matrix", pair.left_intrinsics.camera_matrix)
+    fs.write(f"{key}distortion_coefficients", pair.left_intrinsics.dist_coeffs)
+    fs.write(f"{key}M1", pair.left_intrinsics.camera_matrix)
+    fs.write(f"{key}D1", pair.left_intrinsics.dist_coeffs)
+    fs.write(f"{key}M2", pair.right_intrinsics.camera_matrix)
+    fs.write(f"{key}D2", pair.right_intrinsics.dist_coeffs)
+    fs.write(f"{key}R", pair.stereo.R)
+    fs.write(f"{key}T", pair.stereo.T)
+    fs.write(f"{key}E", pair.stereo.E)
+    fs.write(f"{key}F", pair.stereo.F)
+    if pair.stereo.R1 is not None:
+        fs.write(f"{key}R1", pair.stereo.R1)
+        fs.write(f"{key}R2", pair.stereo.R2)
+        fs.write(f"{key}P1", pair.stereo.P1)
+        fs.write(f"{key}P2", pair.stereo.P2)
+    if pair.stereo.Q is not None:
+        fs.write(f"{key}Q", pair.stereo.Q)
+
+
+def _write_opencv_standard_stereo_fields(
+    fs: cv2.FileStorage,
+    pair: StereoPairCalibration,
+):
+    width = int(pair.left_intrinsics.image_size[0])
+    height = int(pair.left_intrinsics.image_size[1])
+    image_size = np.array([[width, height]], dtype=np.int32)
+
+    fs.write("image_width", width)
+    fs.write("image_height", height)
+    fs.write("image_size", image_size)
+    fs.write("imageSize", image_size)
+
+    fs.write("camera_matrix", pair.left_intrinsics.camera_matrix)
+    fs.write("distortion_coefficients", pair.left_intrinsics.dist_coeffs)
+    fs.write("M1", pair.left_intrinsics.camera_matrix)
+    fs.write("D1", pair.left_intrinsics.dist_coeffs)
+    fs.write("M2", pair.right_intrinsics.camera_matrix)
+    fs.write("D2", pair.right_intrinsics.dist_coeffs)
+    fs.write("K1", pair.left_intrinsics.camera_matrix)
+    fs.write("K2", pair.right_intrinsics.camera_matrix)
+    fs.write("cameraMatrix1", pair.left_intrinsics.camera_matrix)
+    fs.write("distCoeffs1", pair.left_intrinsics.dist_coeffs)
+    fs.write("cameraMatrix2", pair.right_intrinsics.camera_matrix)
+    fs.write("distCoeffs2", pair.right_intrinsics.dist_coeffs)
+
+    fs.write("R", pair.stereo.R)
+    fs.write("T", pair.stereo.T)
+    fs.write("E", pair.stereo.E)
+    fs.write("F", pair.stereo.F)
+    if pair.stereo.R1 is not None:
+        fs.write("R1", pair.stereo.R1)
+        fs.write("R2", pair.stereo.R2)
+        fs.write("P1", pair.stereo.P1)
+        fs.write("P2", pair.stereo.P2)
+    if pair.stereo.Q is not None:
+        fs.write("Q", pair.stereo.Q)
+
+
+def _select_pair_for_standard_export(
+    rig: MultiCameraRig,
+    pair_name: str | None,
+) -> StereoPairCalibration:
+    if pair_name is not None:
+        try:
+            return rig.pairs[pair_name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown stereo pair: {pair_name}") from exc
+    try:
+        return next(iter(rig.pairs.values()))
+    except StopIteration as exc:
+        raise ValueError("OpenCV standard export requires at least one stereo pair") from exc
 
 
 def export_rig_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
@@ -116,6 +275,13 @@ def export_rig_kalibr_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
             lines.append("  T_cn_cnm1:")
             lines.extend(_yaml_matrix(_relative_transform(rig, camera_ids[idx - 1], cam_id), 4))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logger.info(
+        "Exported Kalibr camchain YAML: path=%s cameras=%d pairs=%d aux=%d",
+        path,
+        len(camera_ids),
+        len(rig.pairs),
+        len(rig.aux_cameras),
+    )
     return path
 
 
@@ -130,6 +296,7 @@ def export_rig_calibration_bundle(
     return [
         export_rig_json(rig, base / f"{stem}.json"),
         export_rig_opencv_yaml(rig, base / f"{stem}_opencv.yml"),
+        export_rig_opencv_standard_yaml(rig, base / f"{stem}_opencv_standard.yml"),
         export_rig_kalibr_yaml(rig, base / f"{stem}_kalibr.yaml"),
     ]
 

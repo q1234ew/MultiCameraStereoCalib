@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,6 +39,8 @@ from ...streaming.stream_manager import (
     StereoPairConfig,
     StreamManager,
 )
+
+logger = logging.getLogger(__name__)
 
 _SOURCE_LABELS = {"mdns": "mDNS", "probe": "扫描"}
 _STREAM_TYPE_LABELS = {
@@ -321,6 +325,14 @@ class ConfigDialog(QDialog):
         self._btn_remove = QPushButton("删除选中")
         self._btn_remove.clicked.connect(self._remove_row)
         btn_layout.addWidget(self._btn_remove)
+
+        self._btn_swap_sources = QPushButton("交换左右图像源")
+        self._btn_swap_sources.setToolTip(
+            "选中相机组后仅交换左右 URL，保留左/右相机 ID；"
+            "用于设备服务把左右画面输出反了的情况"
+        )
+        self._btn_swap_sources.clicked.connect(self._swap_selected_pair_sources)
+        btn_layout.addWidget(self._btn_swap_sources)
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
@@ -663,6 +675,30 @@ class ConfigDialog(QDialog):
         for row in sorted(rows, reverse=True):
             self._table.removeRow(row)
 
+    def _swap_selected_pair_sources(self):
+        rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
+        if not rows and self._table.currentRow() >= 0:
+            rows = [self._table.currentRow()]
+        if not rows:
+            self._lbl_scan_status.setText("请先选中需要交换左右图像源的相机组")
+            self._lbl_scan_status.setStyleSheet("font-size:11px; color:#e09f3e;")
+            return
+
+        for row in rows:
+            left_url = self._item_text(row, 3)
+            right_url = self._item_text(row, 5)
+            logger.info(
+                "Swap stereo pair sources in config row=%d left_url=%s right_url=%s",
+                row,
+                left_url,
+                right_url,
+            )
+            self._table.setItem(row, 3, QTableWidgetItem(right_url))
+            self._table.setItem(row, 5, QTableWidgetItem(left_url))
+
+        self._lbl_scan_status.setText(f"已交换 {len(rows)} 组左右图像源")
+        self._lbl_scan_status.setStyleSheet("font-size:11px; color:#52b788;")
+
     def _on_accept(self):
         self._stop_discovery()
         self._camera_model = self._combo_model.currentData()
@@ -710,6 +746,15 @@ class ConfigDialog(QDialog):
                 ),
             )
             self._stream_manager.add_stereo_pair(pair)
+            logger.info(
+                "Configured stereo pair: name=%s type=%s left=%s url=%s right=%s url=%s",
+                name,
+                stream_type,
+                left_id,
+                left_url,
+                right_id,
+                right_url,
+            )
 
         modality = self._combo_fusion_mode.currentData() or ""
         aux_id = self._edit_aux_id.text().strip() or "aux_cam"

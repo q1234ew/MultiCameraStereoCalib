@@ -140,6 +140,22 @@ sessions/<session_name>/
 - 预览检测为轻量路径，限频并可缩小图像。
 - 采集/标定检测使用原始帧，确保标定精度不受预览优化影响。
 
+离线双目导入支持递归扫描所选目录，可直接选择数据集父目录。支持常见命名：
+
+- `0001_left.png` / `0001_right.png`
+- `left_0001.png` / `right_0001.png`
+- `0001_L.png` / `0001_R.png`
+- `left/0001.png` / `right/0001.png`
+
+重复导入会重置 `offline` 虚拟相机组和旧的离线标定缓冲，避免把不同数据集追加混在一起。
+
+左右图像源校正：
+
+- 设备服务可能出现 metadata 标记为 left/right，但实际 MJPEG 图像内容相反的情况。
+- 配置窗口的相机组表格提供“交换左右图像源”，仅对调左右 URL，保留 `*_L/*_R` 相机 ID。
+- 使用该按钮后重新确认配置、连接、采集和标定，导出的 `M1/D1` 会对应修正后的左目图像源。
+- 离线导入后，标定面板提供“交换离线左右图”。该操作会重建 `offline_L/offline_R` 的检测和标定缓冲，保留相机 ID 不变，但让 `offline_L` 使用原右图、`offline_R` 使用原左图；交换后需重新执行双目标定和导出。
+
 撤销上一帧：
 
 - 标定缓冲立即回退。
@@ -194,6 +210,21 @@ UI 主线程负责：
 - 刷新按钮状态和步骤状态。
 
 “一键标定全部”使用串行队列，不并行跑多个 pair。这样可以避免 OpenCV 标定同时抢 CPU，也能让 UI 日志和状态更可预测。
+
+标定质量评估和优化策略：
+
+- 采集阶段持续评估角点覆盖率、分布均匀性、可用帧数、清晰度和亮度，并在界面给出补采建议。
+- 双目标定面板提供“标准”“稳健”“联合精修”三种优化策略。
+- 标准策略：分别求左右内参后固定内参求双目外参，适合大多数数据集。
+- 稳健策略：固定切向畸变和高阶径向畸变，降低自由度，适合样本较少、画面噪声较大或结果抖动的数据。
+- 联合精修策略：双目阶段允许基于已有内参初值微调内参，适合数据量充足后做最终对比。
+- 双目标定面板提供“全部使用”“自动质量筛选”“角点丰富优先”三种数据筛选策略。
+- 全部使用：所有已通过检测并进入缓冲的图像都参与标定。
+- 自动质量筛选：按角点数量、清晰度和亮度综合评分保留较优帧，默认保留约 80%，且不少于最少帧数。
+- 角点丰富优先：按 ChArUco 角点数量/双目共视角点数量保留较优帧，适合离线数据中有遮挡或边缘丢角点的情况。
+- 数据筛选只作用于本次标定计算，使用临时 calibrator，不删除原始采集或导入图片。
+- 切换策略会清空已有标定结果和导出状态，但保留已采集/导入的检测数据，可直接用同一批图重新标定。
+- 标定完成后显示左目内参、右目内参、双目外参的 RMS、等级、分数、关键指标和优化建议。
 
 图片导入由 `StereoImageImportWorker` 和 `AuxImageImportWorker` 在后台 QThread 中执行：
 
@@ -274,9 +305,19 @@ GitHub Actions 打包策略：
 
 - OpenCV YAML
   - 由 `cv2.FileStorage` 写出。
-  - 矩阵节点采用稳定扁平 key，便于 OpenCV C++/Python 读取。
+  - 顶层写出通用双目标定字段：`M1`、`D1`、`M2`、`D2`、`R`、`T`、`E`、`F`、`R1`、`R2`、`P1`、`P2`、`Q`、`image_width`、`image_height`。
+  - `camera_matrix` 和 `distortion_coefficients` 作为左相机单目标定别名，兼容常见 OpenCV 单目标定读取代码。
+  - 多组双目时，顶层通用字段指向第一组 pair；每组 pair 还会写 `pair_<name>_M1`、`pair_<name>_D1`、`pair_<name>_M2`、`pair_<name>_D2` 等别名。
+  - 继续保留稳定扁平 key，例如 `camera_<id>_camera_matrix`、`pair_<name>_R`、`extrinsic_<id>_T_world_cam`，便于程序完整恢复多相机结构。
   - 包含 camera matrix、distortion、pair R/T/E/F/Q、rectification 矩阵和全局外参。
   - 启用辅助单目时额外包含 AUX 内参、模态、板型、`T_rgb_left_aux`、`R_rgb_left_aux`、`t_rgb_left_aux`、帧数和 RMS。
+
+- OpenCV 标准 Stereo YAML
+  - 作为独立导出选项，面向第三方 OpenCV C++/Python 程序和工具。
+  - 只导出一组双目的通用顶层字段，避免项目自定义多相机字段干扰外部读取。
+  - 字段包含 `M1`、`D1`、`M2`、`D2`、`R`、`T`、`E`、`F`、`R1`、`R2`、`P1`、`P2`、`Q`。
+  - 同时写 `cameraMatrix1`、`distCoeffs1`、`cameraMatrix2`、`distCoeffs2`、`K1`、`K2` 等常见别名。
+  - 多组双目时默认导出第一组 pair；完整多相机结构仍使用 OpenCV 完整 YAML 或 JSON。
 
 - Kalibr camchain YAML
   - 生成 `cam0/cam1/...`。
@@ -411,7 +452,9 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -c "import sys; from PySide6.QtCore i
 
 离线导入：
 
-- 导入 `*_left.png/jpg` 与 `*_right.png/jpg` 后出现 `offline` 虚拟相机组。
+- 导入左右图后出现 `offline` 虚拟相机组。
+- 可选择数据集父目录，程序递归识别 `*_left/*_right`、`left_*/right_*`、`*_L/*_R`、`left/right` 子目录。
+- 再次导入会清空旧的 `offline` 缓冲并替换为新数据集。
 - 离线帧可前后浏览。
 - 离线标定完成后可生成 rectification preview。
 

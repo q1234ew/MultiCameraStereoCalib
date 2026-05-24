@@ -46,6 +46,10 @@ class StereoCalibrator:
         return len(self._obj_points)
 
     @property
+    def frame_common_corner_counts(self) -> List[int]:
+        return [int(len(obj)) for obj in self._obj_points]
+
+    @property
     def ready(self) -> bool:
         return self.num_frames >= self.min_frames
 
@@ -84,6 +88,17 @@ class StereoCalibrator:
         if not self._obj_points:
             self._image_size = None
         return True
+
+    def copy_with_indices(self, indices: List[int]) -> "StereoCalibrator":
+        clone = StereoCalibrator(self.board, self.model, self.min_frames)
+        for idx in indices:
+            if idx < 0 or idx >= self.num_frames:
+                continue
+            clone._obj_points.append(self._obj_points[idx].copy())
+            clone._img_points_left.append(self._img_points_left[idx].copy())
+            clone._img_points_right.append(self._img_points_right[idx].copy())
+        clone._image_size = self._image_size if clone._obj_points else None
+        return clone
 
     def calibrate(
         self,
