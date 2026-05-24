@@ -498,6 +498,8 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -c "import sys; from PySide6.QtCore i
 
 每条记录应包含变更摘要、兼容性影响、验证方式和后续注意事项。提交代码前应检查修改记录是否需要同步更新。
 
+`docs/CHANGELOG.md` 必须追加式维护。新增记录应插入为新的日期条目，或仅补充尚未提交的最新条目；不得覆盖、删除、合并或重写已有历史记录。
+
 ## 16. 当前边界与后续方向
 
 当前边界：
