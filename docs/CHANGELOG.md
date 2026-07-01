@@ -4,6 +4,26 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-01 - 修复连接相机时多余空状态界面
+
+提交：随 `Avoid empty preview flash on connect` 修复提交维护。
+
+### 修复
+
+- 修复点击“连接相机”时，预览区先显示“尚未连接相机”空状态、再切换到“连接中”相机卡片的多余界面闪现问题。
+- 连接流程改为直接刷新为已配置相机的“连接中”卡片，同时清空旧 FPS、检测、渲染和覆盖率缓存。
+
+### 兼容性
+
+- 不改变相机连接、采集、标定和导出数据结构。
+- 停止相机或确实没有相机卡片时仍会显示“尚未连接相机”空状态。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-01 - 降低 Windows 视频预览流延迟
 
 提交：随 `Reduce live preview latency` 性能优化提交维护。

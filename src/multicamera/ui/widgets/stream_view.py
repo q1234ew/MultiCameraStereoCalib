@@ -455,6 +455,13 @@ class MultiStreamView(QWidget):
     def show_connecting(self, camera_urls: Dict[str, str]):
         """Create placeholder tiles for configured cameras before frames arrive."""
         visible_ids = set(camera_urls.keys())
+        self._fps.clear()
+        self._trackers.clear()
+        self._last_render_ts.clear()
+        self._last_detect_ts.clear()
+        self._last_detection.clear()
+        self._expanded_id = None
+
         for camera_id in list(self._views.keys()):
             if camera_id not in visible_ids:
                 self._remove_view(camera_id, relayout=False)

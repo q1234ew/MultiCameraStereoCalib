@@ -324,7 +324,6 @@ class MainWindow(QMainWindow):
         self._connection_expected = set(camera_urls.keys())
         self._connection_connected.clear()
         self._connection_failures_shown.clear()
-        self._stream_view.clear_all()
         self._stream_view.show_connecting(camera_urls)
         self._stream_manager.start_all()
         self._act_start_streams.setEnabled(False)
