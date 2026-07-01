@@ -254,6 +254,14 @@ class CameraView(QFrame):
         self._last_label_size = None
         self._render_cached_frame()
 
+    def clear_frame(self, info: str = "等待连接..."):
+        """Drop cached image data so stale camera frames cannot remain visible."""
+        self._last_frame = None
+        self._last_label_size = None
+        self._last_pixmap = None
+        self._image_label.clear()
+        self.update_info(info)
+
     def _render_cached_frame(self):
         if self._last_frame is None:
             return
@@ -404,6 +412,11 @@ class MultiStreamView(QWidget):
 
     def show_static_images(self, images: Dict[str, np.ndarray]):
         """Display a set of static images (e.g. from offline import)."""
+        visible_ids = set(images.keys())
+        for camera_id in list(self._views.keys()):
+            if camera_id not in visible_ids:
+                self._remove_view(camera_id, relayout=False)
+
         for camera_id, frame in images.items():
             view = self._get_or_create_view(camera_id)
             view.set_connected(True)
@@ -425,6 +438,19 @@ class MultiStreamView(QWidget):
 
             view.update_frame(display)
             view.update_info(f"{w}x{h} | 静态")
+        self._relayout()
+
+    def clear_all(self):
+        """Remove all preview tiles and cached detections."""
+        for camera_id in list(self._views.keys()):
+            self._remove_view(camera_id, relayout=False)
+        self._fps.clear()
+        self._trackers.clear()
+        self._last_render_ts.clear()
+        self._last_detect_ts.clear()
+        self._last_detection.clear()
+        self._expanded_id = None
+        self._relayout()
 
     def reset_trackers(self):
         self._trackers.clear()
@@ -503,13 +529,14 @@ class MultiStreamView(QWidget):
     def _on_connected(self, camera_id: str):
         view = self._get_or_create_view(camera_id)
         view.set_connected(True)
+        view.clear_frame("连接中...")
 
     @Slot(str, str)
     def _on_disconnected(self, camera_id: str, reason: str):
         view = self._views.get(camera_id)
         if view:
             view.set_connected(False)
-            view.update_info(f"断开: {reason}")
+            view.clear_frame(f"断开: {reason}")
 
     @Slot(str, float)
     def _on_fps(self, camera_id: str, fps: float):
@@ -539,6 +566,22 @@ class MultiStreamView(QWidget):
             self._views[camera_id] = view
             self._relayout()
         return self._views[camera_id]
+
+    def _remove_view(self, camera_id: str, relayout: bool = True):
+        view = self._views.pop(camera_id, None)
+        if view is not None:
+            view.clear_frame()
+            view.setParent(None)
+            view.deleteLater()
+        self._fps.pop(camera_id, None)
+        self._trackers.pop(camera_id, None)
+        self._last_render_ts.pop(camera_id, None)
+        self._last_detect_ts.pop(camera_id, None)
+        self._last_detection.pop(camera_id, None)
+        if self._expanded_id == camera_id:
+            self._expanded_id = None
+        if relayout:
+            self._relayout()
 
     def _relayout(self):
         for i in reversed(range(self._layout.count())):

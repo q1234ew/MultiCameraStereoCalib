@@ -165,10 +165,14 @@ class StreamManager(QObject):
 
     def stop_all(self):
         logger.info("Stopping all streams: grabbers=%d", len(self._grabbers))
+        camera_ids = list(self._grabbers.keys())
         for g in list(self._grabbers.values()):
             g.stop()
         self._grabbers.clear()
-        self._latest_frames.clear()
+        with self._lock:
+            self._latest_frames.clear()
+        for camera_id in camera_ids:
+            self.camera_disconnected.emit(camera_id, "已断开")
 
     def get_latest_frame(self, camera_id: str) -> Optional[Tuple[np.ndarray, float]]:
         with self._lock:
@@ -232,6 +236,9 @@ class StreamManager(QObject):
             existing.stop()
             existing.wait(3000)
             self._grabbers.pop(cfg.camera_id, None)
+            with self._lock:
+                self._latest_frames.pop(cfg.camera_id, None)
+            self.camera_disconnected.emit(cfg.camera_id, "重新连接")
 
         grabber = MJPEGGrabber(
             cfg.camera_id,
@@ -257,10 +264,17 @@ class StreamManager(QObject):
         grabber = self._grabbers.pop(camera_id, None)
         if grabber:
             grabber.stop()
+        had_frame = False
         with self._lock:
+            had_frame = camera_id in self._latest_frames
             self._latest_frames.pop(camera_id, None)
+        if grabber or had_frame:
+            self.camera_disconnected.emit(camera_id, "已移除")
 
     def _on_frame(self, camera_id: str, frame: np.ndarray, ts: float):
+        if camera_id not in self._grabbers:
+            logger.debug("Ignore stale frame from inactive camera: %s", camera_id)
+            return
         with self._lock:
             self._latest_frames[camera_id] = FrameEntry(frame, ts)
 

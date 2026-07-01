@@ -199,6 +199,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._board = dlg.board
             self._camera_model = CameraModel(dlg.camera_model)
+            self._stream_view.clear_all()
             self._stream_view.update_board(self._board)
             self._calib_panel.update_board(self._board)
             self._calib_panel.set_camera_model(self._camera_model)
@@ -292,6 +293,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_start_streams(self):
         logger.info("User requested start streams")
+        self._stream_view.clear_all()
         self._stream_manager.start_all()
         self._act_start_streams.setEnabled(False)
         self._act_stop_streams.setEnabled(True)
@@ -302,6 +304,7 @@ class MainWindow(QMainWindow):
     def _on_stop_streams(self):
         logger.info("User requested stop streams")
         self._stream_manager.stop_all()
+        self._stream_view.clear_all()
         self._act_start_streams.setEnabled(True)
         self._act_stop_streams.setEnabled(False)
         self._statusbar.showMessage("相机已断开")

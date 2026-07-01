@@ -4,6 +4,29 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-01 - 清理历史相机残留预览画面
+
+提交：随 `Clear stale camera previews` 修复提交维护。
+
+### 修复
+
+- 修复停止相机、重新配置相机或导入较少离线图片后，历史相机 tile 仍显示最后一帧的问题。
+- 相机断开时清空 `CameraView` 的帧缓存、缩放 pixmap 缓存和预览 QLabel，避免残留旧画面。
+- 启动实时流前、停止实时流后、配置变更完成后主动清空预览网格。
+- 离线静态图片刷新时移除本次导入数据中不存在的旧相机 tile。
+- `StreamManager` 停止、移除或重启相机时发出断开事件，并忽略停止后迟到的旧帧。
+
+### 兼容性
+
+- 不改变相机配置、采集、标定和导出数据结构。
+- 断开或重新配置后预览区会回到空状态，不再保留旧相机最后一帧。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-05-24 - 增加 Changelog 追加式维护约束
 
 提交：随 `Require append-only changelog updates` 文档提交维护。
