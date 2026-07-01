@@ -4,6 +4,28 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-01 - 降低 Windows 视频预览流延迟
+
+提交：随 `Reduce live preview latency` 性能优化提交维护。
+
+### 优化
+
+- MJPEG 读取端改为“最新帧优先”：当网络 buffer 中已经累积多张完整 JPEG 时，只解码最新一张，丢弃更旧完整帧，避免 Windows 端解码或 UI 短时卡顿后继续追旧帧。
+- 增加 MJPEG buffer 上限保护，异常堆积时保留最近 SOI 后的数据，防止旧数据持续扩大延迟和内存占用。
+- UI 预览端丢弃超过 `350ms` 的过期帧，避免 Qt 事件队列积压时把旧画面慢慢播放出来。
+
+### 兼容性
+
+- 不改变采集和标定使用的最新帧缓存逻辑。
+- 不改变相机配置、导出格式和会话数据结构。
+- 预览更偏向低延迟，极端卡顿时可能跳帧，但不会按旧帧顺序补播放。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-01 - 增强相机连接状态与失败提醒
 
 提交：随 `Improve camera connection failure prompts` 功能提交维护。

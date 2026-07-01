@@ -33,6 +33,7 @@ class MJPEGGrabber(QThread):
     READ_TIMEOUT = 10.0
     FPS_UPDATE_INTERVAL = 1.0
     DEFAULT_MAX_DECODE_FPS = 20.0
+    MAX_BUFFER_BYTES = 8 * 1024 * 1024
 
     def __init__(
         self,
@@ -122,6 +123,9 @@ class MJPEGGrabber(QThread):
                 break
 
             buffer += chunk
+            buffer = self._trim_oversized_buffer(buffer)
+            latest_jpeg = None
+            dropped = 0
             while True:
                 start = buffer.find(b"\xff\xd8")
                 if start == -1:
@@ -134,11 +138,23 @@ class MJPEGGrabber(QThread):
 
                 end = buffer.find(b"\xff\xd9", start + 2)
                 if end == -1:
+                    if start > 0:
+                        buffer = buffer[start:]
                     break
 
-                jpeg_data = buffer[start : end + 2]
+                if latest_jpeg is not None:
+                    dropped += 1
+                latest_jpeg = buffer[start : end + 2]
                 buffer = buffer[end + 2 :]
-                self._decode_and_emit(jpeg_data)
+
+            if latest_jpeg is not None:
+                if dropped:
+                    logger.debug(
+                        "Dropped stale MJPEG frames: camera=%s count=%d",
+                        self.camera_id,
+                        dropped,
+                    )
+                self._decode_and_emit(latest_jpeg)
 
     async def _read_single_jpeg(self, resp: aiohttp.ClientResponse):
         """Fallback for snapshot or raw JPEG streams.
@@ -157,6 +173,9 @@ class MJPEGGrabber(QThread):
             if not self._running:
                 break
             buffer += chunk
+            buffer = self._trim_oversized_buffer(buffer)
+            latest_jpeg = None
+            dropped = 0
             while True:
                 start = buffer.find(b"\xff\xd8")
                 if start == -1:
@@ -169,9 +188,19 @@ class MJPEGGrabber(QThread):
                         buffer = buffer[start:]
                     break
 
-                jpeg_data = buffer[start : end + 2]
+                if latest_jpeg is not None:
+                    dropped += 1
+                latest_jpeg = buffer[start : end + 2]
                 buffer = buffer[end + 2 :]
-                self._decode_and_emit(jpeg_data)
+
+            if latest_jpeg is not None:
+                if dropped:
+                    logger.debug(
+                        "Dropped stale raw-JPEG frames: camera=%s count=%d",
+                        self.camera_id,
+                        dropped,
+                    )
+                self._decode_and_emit(latest_jpeg)
 
     def _decode_and_emit(self, jpeg_data: bytes):
         now = time.monotonic()
@@ -212,3 +241,16 @@ class MJPEGGrabber(QThread):
             if part.startswith("boundary="):
                 return part[len("boundary=") :]
         return ""
+
+    def _trim_oversized_buffer(self, buffer: bytes) -> bytes:
+        if len(buffer) <= self.MAX_BUFFER_BYTES:
+            return buffer
+        soi = buffer.rfind(b"\xff\xd8")
+        logger.warning(
+            "MJPEG buffer exceeded limit; trimming stale bytes: camera=%s bytes=%d",
+            self.camera_id,
+            len(buffer),
+        )
+        if soi >= 0:
+            return buffer[soi:]
+        return buffer[-2:]

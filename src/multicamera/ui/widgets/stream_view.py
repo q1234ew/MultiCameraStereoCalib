@@ -365,6 +365,7 @@ class MultiStreamView(QWidget):
     UI_FPS_CAP = 15
     DETECT_FPS_CAP = 2.0
     DETECT_MAX_WIDTH = 960
+    MAX_PREVIEW_FRAME_AGE_SEC = 0.35
 
     def __init__(
         self,
@@ -490,6 +491,9 @@ class MultiStreamView(QWidget):
     @Slot(str, np.ndarray, float)
     def _on_frame(self, camera_id: str, frame: np.ndarray, ts: float):
         now = time.monotonic()
+        frame_age = time.time() - ts
+        if frame_age > self.MAX_PREVIEW_FRAME_AGE_SEC:
+            return
         last = self._last_render_ts.get(camera_id, 0.0)
         if now - last < self._min_interval:
             return
