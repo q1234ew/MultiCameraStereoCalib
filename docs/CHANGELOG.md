@@ -4,6 +4,27 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-01 - 优化低分辨率传感器预览叠加层
+
+提交：随 `Compact overlays for low-resolution previews` 修复提交维护。
+
+### 修复
+
+- 修复红外等低分辨率视频流在预览区被采图引导文字、右下示意窗和 OSD 大面积遮挡的问题。
+- 当预览帧小于 `480x320` 时启用紧凑叠加层，只保留检测边框、目标区域和倾角轮廓，不再向原始小图写入大段中文标签。
+- 低分辨率帧仍保留下方信息栏中的分辨率和 FPS，不影响连接、采集、检测和标定流程。
+
+### 兼容性
+
+- 不改变相机流、采集图片、标定输入和导出格式。
+- RGB 高清预览仍使用完整采图引导文字和 OSD。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-01 - 清理历史相机残留预览画面
 
 提交：随 `Clear stale camera previews` 修复提交维护。

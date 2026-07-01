@@ -411,9 +411,11 @@ def paint_board_pose_schematic(
     p.restore()
 
 
-def _draw_opencv_pose_inset(vis: np.ndarray, tilt: BoardTilt) -> None:
+def _draw_opencv_pose_inset(vis: np.ndarray, tilt: BoardTilt, *, compact: bool = False) -> None:
     """画面右下小窗：大比例板面 + 与参考姿态对比，避免遮挡顶步号与角点 OSD。"""
     h, w = vis.shape[:2]
+    if compact or w < 480 or h < 320:
+        return
     ih = min(150, max(100, h // 5))
     iw = min(210, max(150, w // 4))
     x0 = w - iw - 8
@@ -454,6 +456,8 @@ def draw_target_overlay(
     target: CaptureTarget,
     step_num: int,
     total_steps: int,
+    *,
+    compact: bool = False,
 ) -> np.ndarray:
     """Draw the target zone rectangle + tilt arrow + step label on frame."""
     vis = frame.copy()
@@ -479,7 +483,10 @@ def draw_target_overlay(
     cy = (y1 + y2) // 2
 
     _draw_tilt_indicator(vis, cx, cy, zone_w, zone_h, target.tilt)
-    _draw_opencv_pose_inset(vis, target.tilt)
+    _draw_opencv_pose_inset(vis, target.tilt, compact=compact)
+
+    if compact:
+        return vis
 
     step_text = f"[{step_num}/{total_steps}]"
     with TextPainter(vis) as tp:

@@ -78,6 +78,7 @@ def draw_guide_overlay(
     capture_target: Optional[CaptureTarget] = None,
     step_num: int = 0,
     total_steps: int = 0,
+    compact_text: bool = False,
 ) -> np.ndarray:
     """Draw coverage heatmap, target zone, status indicators and OSD."""
     vis = frame.copy()
@@ -90,7 +91,13 @@ def draw_guide_overlay(
 
     # 2) Target zone overlay from capture sequence
     if capture_target is not None:
-        vis = draw_target_overlay(vis, capture_target, step_num, total_steps)
+        vis = draw_target_overlay(
+            vis,
+            capture_target,
+            step_num,
+            total_steps,
+            compact=compact_text,
+        )
 
     # 3) Detection status border
     if result.valid:
@@ -103,6 +110,9 @@ def draw_guide_overlay(
         border_color = (0, 0, 200)
 
     cv2.rectangle(vis, (0, 0), (w - 1, h - 1), border_color, 3)
+
+    if compact_text:
+        return vis
 
     # 4) Top-left OSD + 5) Bottom guidance — batch in one conversion
     n = result.num_corners
@@ -432,6 +442,7 @@ class MultiStreamView(QWidget):
                     display, result,
                     self._trackers[camera_id],
                     self._board.num_corners,
+                    compact_text=self._use_compact_overlay(frame),
                 )
             else:
                 display = frame
@@ -499,6 +510,7 @@ class MultiStreamView(QWidget):
                 capture_target=cur_target,
                 step_num=step_num,
                 total_steps=total_steps,
+                compact_text=self._use_compact_overlay(frame),
             )
         else:
             display = frame
@@ -524,6 +536,12 @@ class MultiStreamView(QWidget):
         if scale == 1.0:
             return result
         return _scale_detection_result(result, 1.0 / scale, (w, h))
+
+    @staticmethod
+    def _use_compact_overlay(frame: np.ndarray) -> bool:
+        """Low-resolution sensors should not receive large in-frame text overlays."""
+        h, w = frame.shape[:2]
+        return w < 480 or h < 320
 
     @Slot(str)
     def _on_connected(self, camera_id: str):
