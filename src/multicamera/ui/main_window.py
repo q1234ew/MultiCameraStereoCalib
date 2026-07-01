@@ -49,6 +49,9 @@ class MainWindow(QMainWindow):
         self._session_manager = SessionManager(sessions_dir())
         self._current_session: CalibrationSession | None = None
         self._rig: MultiCameraRig | None = None
+        self._connection_expected: set[str] = set()
+        self._connection_connected: set[str] = set()
+        self._connection_failures_shown: set[str] = set()
 
         self._init_widgets()
         self._init_menus()
@@ -282,23 +285,55 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_camera_connected(self, cid: str):
         logger.info("Camera connected: %s", cid)
-        self._statusbar.showMessage(f"✓  相机 {cid} 已连接")
+        self._connection_connected.add(cid)
+        total = len(self._connection_expected)
+        connected = len(self._connection_connected)
+        suffix = f"（{connected}/{total}）" if total else ""
+        self._statusbar.showMessage(f"✓  相机 {cid} 已连接{suffix}")
+        url = self._stream_manager.camera_url(cid)
+        self._calib_panel.append_log(f"相机已连接: {cid}  {url}")
         self._calib_panel.refresh_pairs()
 
     @Slot(str, str)
     def _on_camera_disconnected(self, cid: str, reason: str):
-        logger.warning("Camera disconnected: %s reason=%s", cid, reason)
-        self._statusbar.showMessage(f"✗  相机 {cid} 断开: {reason}")
+        url = self._stream_manager.camera_url(cid)
+        logger.warning("Camera disconnected: %s url=%s reason=%s", cid, url, reason)
+        lifecycle_reasons = {"已断开", "已移除", "重新连接"}
+        if reason in lifecycle_reasons:
+            self._statusbar.showMessage(f"相机 {cid} 已断开")
+            return
+
+        short_reason = reason.splitlines()[0]
+        self._statusbar.showMessage(f"✗  相机 {cid} 无法连接: {short_reason}")
+        message = self._format_connection_failure(cid, url, short_reason)
+        first_failure = cid not in self._connection_failures_shown
+        if first_failure:
+            self._connection_failures_shown.add(cid)
+            self._calib_panel.append_log(message)
+            QMessageBox.warning(self, "相机连接失败", message)
 
     @Slot()
     def _on_start_streams(self):
         logger.info("User requested start streams")
+        camera_urls = self._stream_manager.configured_camera_urls()
+        if not camera_urls:
+            QMessageBox.warning(self, "连接相机", "请先通过“相机配置”添加至少一路实时相机。")
+            self._statusbar.showMessage("未配置实时相机")
+            return
+
+        self._connection_expected = set(camera_urls.keys())
+        self._connection_connected.clear()
+        self._connection_failures_shown.clear()
         self._stream_view.clear_all()
+        self._stream_view.show_connecting(camera_urls)
         self._stream_manager.start_all()
         self._act_start_streams.setEnabled(False)
         self._act_stop_streams.setEnabled(True)
         self._calib_panel.refresh_pairs()
-        self._statusbar.showMessage("相机连接中...")
+        self._statusbar.showMessage(f"相机连接中... 共 {len(camera_urls)} 路")
+        self._calib_panel.append_log(
+            "开始连接相机: " + ", ".join(f"{cid}={url}" for cid, url in camera_urls.items())
+        )
 
     @Slot()
     def _on_stop_streams(self):
@@ -307,6 +342,9 @@ class MainWindow(QMainWindow):
         self._stream_view.clear_all()
         self._act_start_streams.setEnabled(True)
         self._act_stop_streams.setEnabled(False)
+        self._connection_expected.clear()
+        self._connection_connected.clear()
+        self._connection_failures_shown.clear()
         self._statusbar.showMessage("相机已断开")
 
     @Slot()
@@ -370,3 +408,28 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._stream_manager.stop_all()
         super().closeEvent(event)
+
+    @staticmethod
+    def _format_connection_failure(camera_id: str, url: str, reason: str) -> str:
+        hints = [
+            "确认设备已上电并与本机在同一网络",
+            "确认相机服务地址、端口和 /stream 路径正确",
+            "如果是 Windows 打包程序，请检查防火墙是否允许访问局域网",
+        ]
+        lower = reason.lower()
+        if "http " in lower:
+            hints.insert(1, "服务已有响应，但 HTTP 状态异常，请检查推流服务是否正常")
+        elif "timeout" in lower or "timed out" in lower or "超时" in reason:
+            hints.insert(1, "连接超时，优先检查 IP 是否可达和网络延迟")
+        elif "cannot connect" in lower or "connect call failed" in lower or "refused" in lower:
+            hints.insert(1, "主机或端口不可达，请检查 IP、端口和相机服务是否启动")
+
+        lines = [
+            f"相机无法连接: {camera_id}",
+            f"视频流: {url or '未知'}",
+            f"原因: {reason}",
+            "建议:",
+        ]
+        lines.extend(f"- {hint}" for hint in hints)
+        lines.append(f"详细日志: {logs_dir() / 'multicamera.log'}")
+        return "\n".join(lines)

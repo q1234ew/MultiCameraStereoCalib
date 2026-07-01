@@ -2052,3 +2052,6 @@ class CalibrationPanel(QWidget):
     def _log(self, msg: str):
         logger.info(msg)
         self._log_text.append(msg)
+
+    def append_log(self, msg: str):
+        self._log(msg)

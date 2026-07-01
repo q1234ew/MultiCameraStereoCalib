@@ -225,6 +225,25 @@ class StreamManager(QObject):
     def camera_ids(self) -> List[str]:
         return list(self._grabbers.keys())
 
+    def configured_camera_urls(self) -> Dict[str, str]:
+        """Return configured live camera IDs and stream URLs, excluding offline pairs."""
+        urls: Dict[str, str] = {}
+        for name, pair in self._stereo_pairs.items():
+            if name in self._virtual_pairs:
+                continue
+            urls[pair.left.camera_id] = pair.left.url
+            urls[pair.right.camera_id] = pair.right.url
+        if self._auxiliary_camera is not None:
+            urls[self._auxiliary_camera.camera_id] = self._auxiliary_camera.url
+        return urls
+
+    def camera_url(self, camera_id: str) -> str:
+        urls = self.configured_camera_urls()
+        if camera_id in urls:
+            return urls[camera_id]
+        grabber = self._grabbers.get(camera_id)
+        return getattr(grabber, "url", "")
+
     # ── Internal ──────────────────────────────────────────────
 
     def _add_camera(self, cfg: CameraConfig):

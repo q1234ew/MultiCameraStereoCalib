@@ -451,6 +451,22 @@ class MultiStreamView(QWidget):
             view.update_info(f"{w}x{h} | 静态")
         self._relayout()
 
+    def show_connecting(self, camera_urls: Dict[str, str]):
+        """Create placeholder tiles for configured cameras before frames arrive."""
+        visible_ids = set(camera_urls.keys())
+        for camera_id in list(self._views.keys()):
+            if camera_id not in visible_ids:
+                self._remove_view(camera_id, relayout=False)
+
+        for camera_id, url in camera_urls.items():
+            view = self._get_or_create_view(camera_id)
+            view.set_connected(False)
+            view.clear_frame("连接中...")
+            view.setToolTip(
+                f"相机: {camera_id}\n视频流: {url}\n状态: 正在连接，等待首帧"
+            )
+        self._relayout()
+
     def clear_all(self):
         """Remove all preview tiles and cached detections."""
         for camera_id in list(self._views.keys()):
@@ -547,14 +563,17 @@ class MultiStreamView(QWidget):
     def _on_connected(self, camera_id: str):
         view = self._get_or_create_view(camera_id)
         view.set_connected(True)
-        view.clear_frame("连接中...")
+        view.clear_frame("已连接，等待视频帧...")
+        view.setToolTip(f"相机: {camera_id}\n状态: 已连接")
 
     @Slot(str, str)
     def _on_disconnected(self, camera_id: str, reason: str):
         view = self._views.get(camera_id)
         if view:
             view.set_connected(False)
-            view.clear_frame(f"断开: {reason}")
+            prefix = "无法连接" if reason not in {"已断开", "已移除", "重新连接"} else "断开"
+            view.clear_frame(f"{prefix}: {reason}")
+            view.setToolTip(f"相机: {camera_id}\n状态: {prefix}\n原因: {reason}")
 
     @Slot(str, float)
     def _on_fps(self, camera_id: str, fps: float):
