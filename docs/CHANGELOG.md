@@ -4,6 +4,30 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-07 - 增加 RGB 参数设置功能
+
+提交：随 `Add RGB settings dialog` 功能提交维护。
+
+### 新增
+
+- 新增“RGB 参数 / RGB Settings”对话框，通过 `GET/POST /api/rgb/config` 读取和应用 FusionSensor RGB 相机参数。
+- 默认目标相机为 `http://192.168.31.55:8080/`；如果当前项目已配置 RGB 双目相机，则优先使用 RGB 左目 URL。
+- 支持曝光模式、曝光时间、亮度、增益、白平衡、防闪烁、对比度、饱和度、伽马、锐度、色调、背光和动态帧率等接口返回的控制项。
+- 菜单 `工具 -> RGB 参数` 和主工具栏增加入口。
+- 参数读取/应用在后台线程中执行，避免阻塞 UI。
+
+### 兼容性
+
+- 不改变相机连接、采集、标定和导出数据结构。
+- 仅在目标相机服务支持 `/api/rgb/config` 时可用；不支持时会提示接口不可用。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+- 已通过 RGB Settings URL 规范化导入检查。
+
 ## 2026-07-01 - 修复连接相机时多余空状态界面
 
 提交：随 `Avoid empty preview flash on connect` 修复提交维护。

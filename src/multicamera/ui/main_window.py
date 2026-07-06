@@ -28,6 +28,7 @@ from ..runtime_paths import logo_png_path, logs_dir, sessions_dir
 from ..streaming.stream_manager import StreamManager
 from .widgets.calib_panel import CalibrationPanel
 from .widgets.config_dialog import ConfigDialog
+from .widgets.rgb_settings_dialog import DEFAULT_RGB_SETTINGS_URL, RgbSettingsDialog
 from .widgets.stream_view import MultiStreamView
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,8 @@ class MainWindow(QMainWindow):
         tools_menu = menubar.addMenu("工具(&T)")
         self._act_gen_board = QAction("生成标定板图像(&G)...", self)
         tools_menu.addAction(self._act_gen_board)
+        self._act_rgb_settings = QAction("RGB 参数(&R)...", self)
+        tools_menu.addAction(self._act_rgb_settings)
         tools_menu.addSeparator()
         self._act_open_logs = QAction("打开日志目录(&L)", self)
         tools_menu.addAction(self._act_open_logs)
@@ -159,6 +162,9 @@ class MainWindow(QMainWindow):
         self._act_gen_board_tb = QAction("🖨  生成标定板", self)
         toolbar.addAction(self._act_gen_board_tb)
 
+        self._act_rgb_settings_tb = QAction("RGB 参数", self)
+        toolbar.addAction(self._act_rgb_settings_tb)
+
     def _init_statusbar(self):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
@@ -175,6 +181,8 @@ class MainWindow(QMainWindow):
         self._act_stop_streams.triggered.connect(self._on_stop_streams)
         self._act_gen_board.triggered.connect(self._on_gen_board)
         self._act_gen_board_tb.triggered.connect(self._on_gen_board)
+        self._act_rgb_settings.triggered.connect(self._on_rgb_settings)
+        self._act_rgb_settings_tb.triggered.connect(self._on_rgb_settings)
         self._act_open_logs.triggered.connect(self._on_open_logs)
 
         self._calib_panel.calibration_finished.connect(self._on_calib_finished)
@@ -360,6 +368,13 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage(f"✓  标定板已保存: {path}")
 
     @Slot()
+    def _on_rgb_settings(self):
+        url = self._default_rgb_settings_url()
+        logger.info("Open RGB settings dialog: url=%s", url)
+        dlg = RgbSettingsDialog(url, self)
+        dlg.exec()
+
+    @Slot()
     def _on_open_logs(self):
         path = logs_dir()
         logger.info("Open logs directory: %s", path)
@@ -407,6 +422,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._stream_manager.stop_all()
         super().closeEvent(event)
+
+    def _default_rgb_settings_url(self) -> str:
+        for pair in self._stream_manager.stereo_pairs.values():
+            if pair.left.stream_type == "rgb" and pair.left.url:
+                return pair.left.url
+        for pair in self._stream_manager.stereo_pairs.values():
+            if pair.right.stream_type == "rgb" and pair.right.url:
+                return pair.right.url
+        return DEFAULT_RGB_SETTINGS_URL
 
     @staticmethod
     def _format_connection_failure(camera_id: str, url: str, reason: str) -> str:
