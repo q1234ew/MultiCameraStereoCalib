@@ -94,6 +94,8 @@ class _RgbConfigWorker(QThread):
 class RgbSettingsDialog(QDialog):
     """Edit RGB camera controls exposed by /api/rgb/config."""
 
+    settings_applied = Signal(str)
+
     def __init__(self, base_url: str = DEFAULT_RGB_SETTINGS_URL, parent=None):
         super().__init__(parent)
         self.setWindowTitle("RGB 参数 / RGB Settings")
@@ -184,6 +186,8 @@ class RgbSettingsDialog(QDialog):
         self._rebuild_controls()
         self._btn_apply.setEnabled(bool(self._controls_meta))
         self._set_status("RGB 参数已就绪", ok=True)
+        if self._worker is not None and self._worker.payload is not None:
+            self.settings_applied.emit(self._edit_url.text())
         logger.info("RGB settings loaded: url=%s device=%s", self._edit_url.text(), data.get("device"))
 
     def _on_failed(self, reason: str):

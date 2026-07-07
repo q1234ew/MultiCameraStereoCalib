@@ -4,6 +4,28 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-07 - RGB 参数应用后采集使用新帧
+
+提交：随 `Discard stale frames after RGB settings apply` 修复提交维护。
+
+### 修复
+
+- 修复应用 RGB 参数后立即采集时，可能从 `StreamManager` 最新帧缓存中取到参数变更前旧图像的问题。
+- RGB 参数 POST 成功后，对匹配 URL 的实时相机清空旧最新帧，并在约 `0.8s` 过渡期内忽略新到达的过渡帧。
+- 状态栏和操作日志提示“已丢弃旧帧，等待新画面后再采集”。
+
+### 兼容性
+
+- 不改变相机连接、采集保存、标定和导出数据结构。
+- 仅影响 RGB 参数应用后的短时间采集行为；正常实时预览和离线标定流程不受影响。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+- 已通过 RGB Settings URL 匹配和 `discard_frames_for_url()` 最小检查。
+
 ## 2026-07-07 - 增加 RGB 参数设置功能
 
 提交：随 `Add RGB settings dialog` 功能提交维护。

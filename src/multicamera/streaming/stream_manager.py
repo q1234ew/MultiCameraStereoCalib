@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
@@ -71,6 +73,7 @@ class StreamManager(QObject):
         self._max_decode_fps = max_decode_fps
         self._grabbers: Dict[str, MJPEGGrabber] = {}
         self._latest_frames: Dict[str, FrameEntry] = {}
+        self._ignore_frames_until: Dict[str, float] = {}
         self._stereo_pairs: Dict[str, StereoPairConfig] = {}
         self._auxiliary_camera: Optional[AuxiliaryCameraConfig] = None
         self._virtual_pairs: set[str] = set()
@@ -171,6 +174,7 @@ class StreamManager(QObject):
         self._grabbers.clear()
         with self._lock:
             self._latest_frames.clear()
+            self._ignore_frames_until.clear()
         for camera_id in camera_ids:
             self.camera_disconnected.emit(camera_id, "已断开")
 
@@ -244,6 +248,30 @@ class StreamManager(QObject):
         grabber = self._grabbers.get(camera_id)
         return getattr(grabber, "url", "")
 
+    def discard_frames_for_url(self, url: str, settle_seconds: float = 0.8) -> List[str]:
+        """Drop cached frames for cameras matching ``url`` until settings settle."""
+        target = _normalise_camera_base_url(url)
+        configured = self.configured_camera_urls()
+        matched: List[str] = []
+        deadline = time.monotonic() + max(0.0, settle_seconds)
+        with self._lock:
+            for camera_id, camera_url in configured.items():
+                if _normalise_camera_base_url(camera_url) != target:
+                    continue
+                self._latest_frames.pop(camera_id, None)
+                self._ignore_frames_until[camera_id] = deadline
+                matched.append(camera_id)
+        if matched:
+            logger.info(
+                "Discard cached frames after camera settings change: url=%s cameras=%s settle=%.2fs",
+                url,
+                ",".join(matched),
+                settle_seconds,
+            )
+        else:
+            logger.info("No configured camera matched RGB settings URL: %s", url)
+        return matched
+
     # ── Internal ──────────────────────────────────────────────
 
     def _add_camera(self, cfg: CameraConfig):
@@ -257,6 +285,7 @@ class StreamManager(QObject):
             self._grabbers.pop(cfg.camera_id, None)
             with self._lock:
                 self._latest_frames.pop(cfg.camera_id, None)
+                self._ignore_frames_until.pop(cfg.camera_id, None)
             self.camera_disconnected.emit(cfg.camera_id, "重新连接")
 
         grabber = MJPEGGrabber(
@@ -287,6 +316,7 @@ class StreamManager(QObject):
         with self._lock:
             had_frame = camera_id in self._latest_frames
             self._latest_frames.pop(camera_id, None)
+            self._ignore_frames_until.pop(camera_id, None)
         if grabber or had_frame:
             self.camera_disconnected.emit(camera_id, "已移除")
 
@@ -294,7 +324,13 @@ class StreamManager(QObject):
         if camera_id not in self._grabbers:
             logger.debug("Ignore stale frame from inactive camera: %s", camera_id)
             return
+        now = time.monotonic()
         with self._lock:
+            ignore_until = self._ignore_frames_until.get(camera_id, 0.0)
+            if ignore_until > now:
+                return
+            if ignore_until:
+                self._ignore_frames_until.pop(camera_id, None)
             self._latest_frames[camera_id] = FrameEntry(frame, ts)
 
         self.frame_received.emit(camera_id, frame, ts)
@@ -315,3 +351,13 @@ class StreamManager(QObject):
                 self.sync_pair_ready.emit(
                     name, left_entry.frame, right_entry.frame, ts
                 )
+
+
+def _normalise_camera_base_url(url: str) -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        text = "http://" + text
+    split = urlsplit(text)
+    return urlunsplit((split.scheme, split.netloc, "", "", "")).rstrip("/")

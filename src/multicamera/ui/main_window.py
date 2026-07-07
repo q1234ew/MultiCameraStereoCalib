@@ -372,7 +372,22 @@ class MainWindow(QMainWindow):
         url = self._default_rgb_settings_url()
         logger.info("Open RGB settings dialog: url=%s", url)
         dlg = RgbSettingsDialog(url, self)
+        dlg.settings_applied.connect(self._on_rgb_settings_applied)
         dlg.exec()
+
+    @Slot(str)
+    def _on_rgb_settings_applied(self, url: str):
+        matched = self._stream_manager.discard_frames_for_url(url, settle_seconds=0.8)
+        if matched:
+            text = "RGB 参数已应用，已丢弃旧帧，等待新画面后再采集: " + ", ".join(matched)
+            logger.info(text)
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
+        else:
+            text = "RGB 参数已应用；未匹配当前实时相机缓存，拍照前请等待预览刷新"
+            logger.info("%s url=%s", text, url)
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
 
     @Slot()
     def _on_open_logs(self):
