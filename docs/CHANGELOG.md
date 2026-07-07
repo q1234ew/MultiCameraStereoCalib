@@ -4,6 +4,26 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-07 - RGB 参数应用后刷新标定预览
+
+提交：随 `Refresh preview after RGB settings apply` 修复提交维护。
+
+### 修复
+
+- 修复 RGB 参数应用成功后，采集缓存已清理但标定预览 tile 仍显示旧 pixmap，导致界面看起来没有刷新的问题。
+- RGB 参数应用成功并匹配到实时相机后，立即清空对应相机预览缓存、FPS、检测缓存和渲染节流时间戳，预览区显示“等待新画面”。
+
+### 兼容性
+
+- 不改变相机连接、采集保存、标定和导出数据结构。
+- 仅影响 RGB 参数应用后的预览显示刷新。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-07 - 修复 RGB Settings 接口读取超时
 
 提交：随 `Use aiohttp for RGB settings requests` 修复提交维护。

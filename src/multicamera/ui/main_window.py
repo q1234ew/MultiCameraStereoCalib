@@ -379,6 +379,7 @@ class MainWindow(QMainWindow):
     def _on_rgb_settings_applied(self, url: str):
         matched = self._stream_manager.discard_frames_for_url(url, settle_seconds=0.8)
         if matched:
+            self._stream_view.clear_camera_frames(matched, "RGB 参数已应用，等待新画面...")
             text = "RGB 参数已应用，已丢弃旧帧，等待新画面后再采集: " + ", ".join(matched)
             logger.info(text)
             self._statusbar.showMessage(text)

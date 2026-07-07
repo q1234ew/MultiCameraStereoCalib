@@ -487,6 +487,18 @@ class MultiStreamView(QWidget):
         self._expanded_id = None
         self._relayout()
 
+    def clear_camera_frames(self, camera_ids: list[str], info: str = "等待新画面..."):
+        """Clear cached preview images for specific cameras without removing tiles."""
+        for camera_id in camera_ids:
+            view = self._views.get(camera_id)
+            if view is not None:
+                view.clear_frame(info)
+                view.set_connected(True)
+            self._fps.pop(camera_id, None)
+            self._last_render_ts.pop(camera_id, None)
+            self._last_detect_ts.pop(camera_id, None)
+            self._last_detection.pop(camera_id, None)
+
     def reset_trackers(self):
         self._trackers.clear()
 
