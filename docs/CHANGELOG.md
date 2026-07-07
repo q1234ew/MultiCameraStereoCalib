@@ -4,6 +4,27 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-07 - 修复 RGB Settings 接口读取超时
+
+提交：随 `Use aiohttp for RGB settings requests` 修复提交维护。
+
+### 修复
+
+- 修复 `http://192.168.31.55:8080/` 在浏览器和 `curl` 可访问，但应用内 RGB Settings 显示接口不可用的问题。
+- RGB Settings HTTP 客户端由 `urllib` 切换为项目已有的 `aiohttp`，与 MJPEG 流连接栈保持一致，避免相机服务与 Python `http.client` 兼容性导致读取状态行超时。
+
+### 兼容性
+
+- 不新增依赖，`aiohttp` 已是项目运行依赖。
+- 不改变 RGB 参数接口、采集、标定和导出数据结构。
+
+### 验证
+
+- 已通过目标相机 `GET /api/rgb/config` 读取检查。
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-07 - RGB 参数应用后采集使用新帧
 
 提交：随 `Discard stale frames after RGB settings apply` 修复提交维护。

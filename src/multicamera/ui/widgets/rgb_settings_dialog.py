@@ -6,8 +6,8 @@ import json
 import logging
 from typing import Any
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
 
+import aiohttp
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -70,25 +70,34 @@ class _RgbConfigWorker(QThread):
 
     def run(self):
         try:
-            endpoint = urljoin(_normalise_base_url(self.base_url), "api/rgb/config")
-            if self.payload is None:
-                req = Request(endpoint, method="GET")
-            else:
-                data = json.dumps(self.payload).encode("utf-8")
-                req = Request(
-                    endpoint,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            with urlopen(req, timeout=5) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(body)
+            data = self._request_config()
             if not data.get("ok"):
                 raise RuntimeError(data.get("error") or "RGB settings API returned ok=false")
             self.loaded.emit(data)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def _request_config(self) -> dict[str, Any]:
+        import asyncio
+
+        return asyncio.run(self._request_config_async())
+
+    async def _request_config_async(self) -> dict[str, Any]:
+        endpoint = urljoin(_normalise_base_url(self.base_url), "api/rgb/config")
+        timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0, sock_connect=3.0, sock_read=5.0)
+        connector = aiohttp.TCPConnector(family=0, force_close=True)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            if self.payload is None:
+                async with session.get(endpoint) as resp:
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}")
+            else:
+                async with session.post(endpoint, json=self.payload) as resp:
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
+        return json.loads(body)
 
 
 class RgbSettingsDialog(QDialog):
