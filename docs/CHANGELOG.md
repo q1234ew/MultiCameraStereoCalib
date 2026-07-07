@@ -4,6 +4,32 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-07-07 - RGB 参数同步应用到左右路
+
+提交：随 `Sync RGB settings across stereo cameras` 功能提交维护。
+
+### 新增
+
+- RGB 参数窗口会从当前配置中收集所有 RGB 左/右相机 URL，默认勾选“同步应用到已配置 RGB 左/右”。
+- 点击应用时，同一组 RGB 参数会按目标 URL 逐路下发到 `/api/rgb/config`，用于保持左右路图像参数一致。
+- 应用成功后，主窗口会按所有成功下发的 URL 清理实时帧缓存和预览缓存，避免后续采集保存混入参数变更前旧帧。
+
+### 修复
+
+- 加固 RGB 参数 URL 归一化，支持从 `/stream`、`/snapshot`、`/api/rgb/config` 以及带 query 的流地址回到同端口 API 根路径。
+
+### 兼容性
+
+- 不改变相机配置、采集图片、标定结果和导出文件结构。
+- 未配置多路 RGB 相机时仍保持单目标应用行为。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m compileall -q src scripts`。
+- 已通过 `.venv/bin/python -m ruff check src scripts`。
+- 已通过 RGB 参数 URL 归一化最小检查。
+- 已通过 `QT_QPA_PLATFORM=offscreen .venv/bin/python -c "... MainWindow ..."` 启动检查。
+
 ## 2026-07-07 - RGB 参数应用后刷新标定预览
 
 提交：随 `Refresh preview after RGB settings apply` 修复提交维护。

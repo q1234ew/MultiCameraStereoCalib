@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QGroupBox,
@@ -63,10 +64,17 @@ class _RgbConfigWorker(QThread):
     loaded = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, base_url: str, payload: dict[str, int] | None = None, parent=None):
+    def __init__(
+        self,
+        base_url: str,
+        payload: dict[str, int] | None = None,
+        apply_urls: list[str] | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.base_url = base_url
         self.payload = payload
+        self.apply_urls = apply_urls or [base_url]
 
     def run(self):
         try:
@@ -83,32 +91,52 @@ class _RgbConfigWorker(QThread):
         return asyncio.run(self._request_config_async())
 
     async def _request_config_async(self) -> dict[str, Any]:
-        endpoint = urljoin(_normalise_base_url(self.base_url), "api/rgb/config")
         timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0, sock_connect=3.0, sock_read=5.0)
         connector = aiohttp.TCPConnector(family=0, force_close=True)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             if self.payload is None:
+                endpoint = urljoin(_normalise_base_url(self.base_url), "api/rgb/config")
                 async with session.get(endpoint) as resp:
                     body = await resp.text()
                     if resp.status >= 400:
                         raise RuntimeError(f"HTTP {resp.status}")
+                return json.loads(body)
             else:
-                async with session.post(endpoint, json=self.payload) as resp:
-                    body = await resp.text()
-                    if resp.status >= 400:
-                        raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
-        return json.loads(body)
+                results: list[dict[str, Any]] = []
+                targets = _unique_urls(self.apply_urls)
+                for url in targets:
+                    endpoint = urljoin(_normalise_base_url(url), "api/rgb/config")
+                    async with session.post(endpoint, json=self.payload) as resp:
+                        body = await resp.text()
+                        if resp.status >= 400:
+                            raise RuntimeError(f"{_normalise_base_url(url)} HTTP {resp.status}: {body[:200]}")
+                    data = json.loads(body)
+                    if not data.get("ok"):
+                        raise RuntimeError(
+                            f"{_normalise_base_url(url)}: {data.get('error') or 'ok=false'}"
+                        )
+                    results.append(data)
+                data = dict(results[0]) if results else {"ok": True}
+                data["applied_urls"] = targets
+                return data
 
 
 class RgbSettingsDialog(QDialog):
     """Edit RGB camera controls exposed by /api/rgb/config."""
 
-    settings_applied = Signal(str)
+    settings_applied = Signal(list)
 
-    def __init__(self, base_url: str = DEFAULT_RGB_SETTINGS_URL, parent=None):
+    def __init__(
+        self,
+        base_url: str = DEFAULT_RGB_SETTINGS_URL,
+        sync_urls: list[str] | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("RGB 参数 / RGB Settings")
         self.resize(620, 760)
+        self._sync_urls = _unique_urls([base_url, *(sync_urls or [])])
+        self._last_applied_urls: list[str] = []
         self._controls_meta: dict[str, dict[str, Any]] = {}
         self._control_widgets: dict[str, dict[str, Any]] = {}
         self._worker: _RgbConfigWorker | None = None
@@ -126,6 +154,17 @@ class RgbSettingsDialog(QDialog):
         self._btn_refresh.clicked.connect(self.refresh_config)
         url_row.addWidget(self._btn_refresh)
         layout.addLayout(url_row)
+
+        self._chk_sync = QCheckBox("同步应用到已配置 RGB 左/右")
+        self._chk_sync.setChecked(len(self._sync_urls) > 1)
+        self._chk_sync.setVisible(len(self._sync_urls) > 1)
+        layout.addWidget(self._chk_sync)
+
+        self._lbl_targets = QLabel(self._format_targets())
+        self._lbl_targets.setWordWrap(True)
+        self._lbl_targets.setStyleSheet(f"color: {TEXT_DIM};")
+        self._lbl_targets.setVisible(len(self._sync_urls) > 1)
+        layout.addWidget(self._lbl_targets)
 
         self._lbl_device = QLabel("设备: --")
         self._lbl_device.setStyleSheet(f"color: {TEXT_DIM};")
@@ -163,7 +202,11 @@ class RgbSettingsDialog(QDialog):
         if not payload:
             self._set_status("没有可应用的参数", ok=False)
             return
-        self._start_worker(payload, "应用 RGB 参数...")
+        urls = self._apply_urls()
+        if len(urls) > 1:
+            self._start_worker(payload, f"同步应用 RGB 参数到 {len(urls)} 路...", urls)
+        else:
+            self._start_worker(payload, "应用 RGB 参数...", urls)
 
     def accept(self):
         self._wait_for_worker()
@@ -177,12 +220,22 @@ class RgbSettingsDialog(QDialog):
         self._wait_for_worker()
         super().closeEvent(event)
 
-    def _start_worker(self, payload: dict[str, int] | None, status: str):
+    def _start_worker(
+        self,
+        payload: dict[str, int] | None,
+        status: str,
+        apply_urls: list[str] | None = None,
+    ):
         if self._worker is not None and self._worker.isRunning():
             return
         self._set_status(status)
         self._set_busy(True)
-        self._worker = _RgbConfigWorker(self._edit_url.text().strip(), payload, self)
+        self._worker = _RgbConfigWorker(
+            self._edit_url.text().strip(),
+            payload,
+            apply_urls=apply_urls,
+            parent=self,
+        )
         self._worker.loaded.connect(self._on_loaded)
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._on_worker_finished)
@@ -194,10 +247,20 @@ class RgbSettingsDialog(QDialog):
         self._controls_meta = data.get("controls") or {}
         self._rebuild_controls()
         self._btn_apply.setEnabled(bool(self._controls_meta))
-        self._set_status("RGB 参数已就绪", ok=True)
+        applied_urls = data.get("applied_urls") or []
+        if applied_urls:
+            self._last_applied_urls = [_normalise_base_url(u) for u in applied_urls]
+            self._set_status(f"RGB 参数已同步应用到 {len(self._last_applied_urls)} 路", ok=True)
+        else:
+            self._set_status("RGB 参数已就绪", ok=True)
         if self._worker is not None and self._worker.payload is not None:
-            self.settings_applied.emit(self._edit_url.text())
-        logger.info("RGB settings loaded: url=%s device=%s", self._edit_url.text(), data.get("device"))
+            self.settings_applied.emit(self._last_applied_urls or [self._edit_url.text()])
+        logger.info(
+            "RGB settings loaded: url=%s device=%s applied_urls=%s",
+            self._edit_url.text(),
+            data.get("device"),
+            ",".join(self._last_applied_urls),
+        )
 
     def _on_failed(self, reason: str):
         self._set_status(f"RGB 参数接口不可用: {reason}", ok=False)
@@ -341,6 +404,7 @@ class RgbSettingsDialog(QDialog):
         self._btn_refresh.setDisabled(busy)
         self._btn_apply.setDisabled(busy or not bool(self._controls_meta))
         self._edit_url.setDisabled(busy)
+        self._chk_sync.setDisabled(busy)
 
     def _set_status(self, text: str, ok: bool | None = None):
         color = SUCCESS if ok is True else DANGER if ok is False else ACCENT
@@ -351,15 +415,41 @@ class RgbSettingsDialog(QDialog):
         if self._worker is not None and self._worker.isRunning():
             self._worker.wait(6000)
 
+    def _apply_urls(self) -> list[str]:
+        edited = _normalise_base_url(self._edit_url.text())
+        if self._chk_sync.isVisible() and self._chk_sync.isChecked():
+            return _unique_urls([edited, *self._sync_urls])
+        return [edited]
+
+    def _format_targets(self) -> str:
+        if len(self._sync_urls) <= 1:
+            return ""
+        return "同步目标: " + "，".join(self._sync_urls)
+
 
 def _normalise_base_url(url: str) -> str:
     text = (url or DEFAULT_RGB_SETTINGS_URL).strip()
     if not text.startswith(("http://", "https://")):
         text = "http://" + text
+    parts = urlsplit(text)
+    path = parts.path.rstrip("/")
     for suffix in ("/stream", "/snapshot", "/api/rgb/config"):
-        if text.endswith(suffix):
-            text = text[: -len(suffix)]
-    return text.rstrip("/") + "/"
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parts.scheme, parts.netloc, path.rstrip("/") + "/", "", ""))
+
+
+def _unique_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        normalised = _normalise_base_url(url)
+        if normalised in seen:
+            continue
+        seen.add(normalised)
+        result.append(normalised)
+    return result
 
 
 def _control_label(key: str, ctl: dict[str, Any]) -> str:
