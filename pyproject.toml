@@ -9,7 +9,7 @@ description = "Multi stereo camera joint calibration and point cloud fusion"
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6",
-    "opencv-contrib-python>=4.9",
+    "opencv-contrib-python>=4.9,<5",
     "numpy>=1.24",
     "aiohttp>=3.9",
     "scipy>=1.11",

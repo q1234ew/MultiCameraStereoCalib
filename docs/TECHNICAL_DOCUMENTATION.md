@@ -312,7 +312,7 @@ PyInstaller 优化原则：
 - 默认排除 `open3d`、`torch`、`tensorflow`、`matplotlib`、`notebook` 等大依赖。
 - `aiohttp`、`zeroconf` 仅收集子模块，避免把无关数据文件打进去。
 - `scipy` 只补充 `optimize/spatial` 相关子模块，不全量复制 data files。
-- OpenCV 动态库和数据仍显式收集，保证 ChArUco/aruco 能正常工作。
+- OpenCV 动态库、数据及发行包版本 metadata 显式收集；是否可用由最终 EXE 自检确认，而非仅以文件存在判断。
 
 GitHub Actions 打包策略：
 
@@ -321,6 +321,11 @@ GitHub Actions 打包策略：
 - 使用 Windows runner 预装的 GitHub CLI，将 `MultiCamera_portable_x64.zip`、可选的 `MultiCamera_Setup_*_x64.exe` 和 `SHA256SUMS.txt` 上传到 GitHub Release 附件，不再调用 `actions/upload-artifact`，不占用 Actions Artifact 存储额度。
 - 手动勾选 `pointcloud` 时才把 Open3D 纳入 CI 包。
 - PyInstaller 打包前安装测试依赖并以离屏 Qt 执行 `python -m pytest -q tests`；测试失败会阻止构建和发布。
+- 项目依赖限制 OpenCV 为 `>=4.9,<5`，Windows CI 和本地构建脚本另使用 `packaging/windows/constraints.txt` 固定为已验证的 `opencv-contrib-python==4.13.0.92`。升级该约束时必须重新通过源码和 EXE 自检；不要混装四种共享 `cv2` 命名空间的 OpenCV 发行包。
+- 构建前生成 `calibration_source_test.json`，PyInstaller 完成后执行真实 `MultiCamera.exe --self-test-calibration`，生成 `calibration_self_test.json`。后者使用临时工作目录、不依赖相机，不创建 Qt 界面或加载 Open3D。
+- 两份报告必须均通过，且 OpenCV 版本、原生库 SHA256、API 清单及 contrib 发行版本一致；EXE 还必须从 `_MEIPASS` 包内加载 OpenCV。缺报告、非零退出、120 秒超时、接口或数值检查失败均阻止压缩和发布。
+- 自检报告随 Release 附件发布并纳入 SHA256 清单；失败时尽可能写入报告和 Actions job summary，不依赖 windowed EXE 的标准输出。若进程在 Python 入口前因 DLL 缺失而退出，则无 JSON，CI 仍按退出码/缺报告判失败。
+- 手动构建可填写 `audit_release`（例如 `v0.1.0-build.20261020.2`），下载旧 ZIP、核对其校验清单，并在独立 Windows Python 进程加载旧包中的 `cv2.pyd`，输出 `previous_opencv_audit.json`。此报告检查旧原生绑定，不代表直接运行了旧 GUI EXE；探针环境的 Python 包 metadata 与归档二进制版本分开记录。
 - 发布 job 使用仓库自带的 `GITHUB_TOKEN` 和 `contents: write` 权限，不需要新增 PAT。相同 ref 的构建串行运行，避免同时修改同一个 Release。
 - tag 构建以当前标签创建 Release；手动构建自动使用 `windows-build-<run_id>` 标签，指向本次构建的精确 commit。带 `-` 的标签和手动构建标记为预发布，不覆盖正式 Latest。
 - 新 Release 先创建草稿，附件上传成功后再发布。重跑复用原标签并更新同名附件；启用不可变 Release 的仓库应使用新标签重新发布。
@@ -405,7 +410,7 @@ UI 和线程模型：
 
 `multicamera.perf.perf_timer()` 用于记录慢操作。
 
-应用启动时会写入运行环境信息，包括 frozen 状态、exe 路径、Python 版本、平台、工作目录和进程 ID。日志同时捕获：
+应用启动时会写入运行环境信息，包括 frozen 状态、exe 路径、Python 版本、平台、工作目录和进程 ID，以及 OpenCV 版本、加载路径、发行包版本和关键接口是否存在。普通启动不计算大体积原生库哈希；哈希与完整 OpenCV build information 仅在显式自检时生成。日志同时捕获：
 
 - 未处理 Python 异常和线程异常。
 - Qt warning/critical/fatal 消息。
@@ -451,6 +456,32 @@ OpenCV ChArUco 内参接口兼容性回归：
 ```bash
 .venv/bin/python -m compileall -q src scripts
 ```
+
+### 13.1 最终 EXE 标定自检与 OpenCV 版本排查
+
+源码环境执行同一套自检：
+
+```bash
+.venv/bin/python -m multicamera --self-test-calibration --report /tmp/calibration_source_test.json
+```
+
+在 Windows 便携包目录手动执行（也适用于安装后的 EXE）：
+
+```powershell
+$exe = (Resolve-Path .\MultiCamera.exe).Path
+$report = Join-Path $env:TEMP "multicamera_calibration_self_test.json"
+$p = Start-Process -FilePath $exe -ArgumentList @("--self-test-calibration", "--report", "`"$report`"") -PassThru -Wait
+$p.ExitCode
+Get-Content $report -Raw
+```
+
+不传 `--report` 时写入当前工作目录的 `calibration_self_test.json`，现场排查建议显式指定可写路径。退出码 `0` 表示通过，`1` 表示运行/接口/标定失败，`2` 表示报告无法写入。必须等待 windowed EXE 结束，不能只依据进程启动成功。
+
+自检生成 ChArUco 图案并检测 126 个角点；使用 24 帧部分、乱序且左右不完全相同的角点观测，调用真实内参、双目和校正代码，检查 RMS、已知内参、0.12 米基线与有限校正矩阵；导出四类文件并回读 JSON/OpenCV 矩阵和左右 ID，检查 Kalibr 链字段。所有模拟数据保存在临时目录，不修改用户会话。该烟测不替代真实图片质量评估，不覆盖鱼眼数值标定、点云、视频连接或安装器安装过程。
+
+本次问题排查的已知证据：旧 Windows 构建 #10 的依赖日志明确安装 `opencv-contrib-python 5.0.0.93`，而本地验证使用 `4.13.0.92`；原 `>=4.9` 未限制主版本。用户错误证明旧运行时缺少 `aruco.calibrateCameraCharuco`，并非整个 OpenCV 未打包。归档原生接口的进一步证据以 `previous_opencv_audit.json` 为准，不把本地 4.x 的接口存在性视为 Windows 5.x 的证明。
+
+升级 OpenCV 时应保留源码基线、EXE 报告和构建链接，确认产物版本与实际使用接口；只重跑源码测试或检查 EXE 是否存在不足以验收打包兼容性。
 
 离线标定验证：
 

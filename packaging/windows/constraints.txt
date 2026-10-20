@@ -1,0 +1,2 @@
+# Upgrade deliberately, with source and frozen EXE calibration tests.
+opencv-contrib-python==4.13.0.92

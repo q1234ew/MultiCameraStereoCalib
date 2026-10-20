@@ -17,6 +17,7 @@ from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
     collect_submodules,
+    copy_metadata,
 )
 
 # PyInstaller sets SPECPATH to the directory containing this .spec file.
@@ -27,6 +28,7 @@ ENTRY = SRC / "multicamera" / "__main__.py"
 datas: list = []
 binaries: list = []
 hiddenimports: list = collect_submodules("multicamera")
+datas += copy_metadata("opencv-contrib-python")
 include_open3d = os.environ.get("MULTICAMERA_WITH_OPEN3D", "").lower() in {
     "1",
     "true",

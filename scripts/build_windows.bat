@@ -19,15 +19,25 @@ call .venv\Scripts\activate.bat
 python -m pip install -U pip
 if "%WITH_POINTCLOUD%"=="1" (
     echo 构建点云完整包，将安装并打包 Open3D...
-    pip install -e ".[build-win,pointcloud]"
+    pip install -c packaging\windows\constraints.txt -e ".[build-win,pointcloud]"
+    if errorlevel 1 exit /b 1
     set "MULTICAMERA_WITH_OPEN3D=1"
 ) else (
     echo 构建轻量包，不打包 Open3D；点云功能在此包中不可用。
-    pip install -e ".[build-win]"
+    pip install -c packaging\windows\constraints.txt -e ".[build-win]"
+    if errorlevel 1 exit /b 1
     set "MULTICAMERA_WITH_OPEN3D="
 )
 
+python -m pip check
+if errorlevel 1 exit /b 1
+python -m multicamera --self-test-calibration --report installer_output\calibration_source_test.json
+if errorlevel 1 exit /b 1
+
 pyinstaller --noconfirm MultiCamera.spec
+if errorlevel 1 exit /b 1
+
+powershell -NoProfile -File scripts\test_packaged_calibration.ps1
 if errorlevel 1 exit /b 1
 
 echo.

@@ -110,3 +110,10 @@ def _log_startup_context(log_path: Path) -> None:
     logger.info("platform=%s", platform.platform())
     logger.info("cwd=%s", Path.cwd())
     logger.info("pid=%s", os.getpid())
+    try:
+        from .diagnostics import opencv_runtime_info
+
+        info = opencv_runtime_info()
+        logger.info("OpenCV runtime: %s", info)
+    except Exception:
+        logger.exception("Could not inspect OpenCV runtime")

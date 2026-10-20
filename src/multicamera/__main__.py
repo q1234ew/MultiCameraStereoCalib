@@ -1,15 +1,19 @@
 import sys
 
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
-
-from multicamera.logging_config import setup_logging
-from multicamera.runtime_paths import logo_png_path
-from multicamera.ui.main_window import MainWindow
-from multicamera.ui.theme import app_stylesheet
-
-
 def main():
+    if "--self-test-calibration" in sys.argv[1:]:
+        from multicamera.self_test import main as self_test_main
+
+        raise SystemExit(self_test_main(sys.argv[1:]))
+
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QApplication
+
+    from multicamera.logging_config import setup_logging
+    from multicamera.runtime_paths import logo_png_path
+    from multicamera.ui.main_window import MainWindow
+    from multicamera.ui.theme import app_stylesheet
+
     setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("MultiCamera Calibration")

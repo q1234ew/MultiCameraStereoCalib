@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      audit_release:
+        description: "Optional existing Release tag to inspect its archived OpenCV binary"
+        required: false
+        default: ""
+        type: string
   push:
     tags:
       - "v*"
@@ -39,16 +44,40 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             MultiCamera.spec
+            packaging/windows/constraints.txt
 
       - name: Install Python dependencies
         shell: pwsh
         run: |
           python -m pip install -U pip wheel
           if ("${{ inputs.pointcloud }}" -eq "true") {
-            python -m pip install -e ".[build-win,pointcloud]"
+            python -m pip install -c packaging/windows/constraints.txt -e ".[build-win,pointcloud]"
           } else {
-            python -m pip install -e ".[build-win]"
+            python -m pip install -c packaging/windows/constraints.txt -e ".[build-win]"
           }
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Dependency consistency check failed" }
+
+      - name: Inspect previous Release OpenCV
+        if: ${{ inputs.audit_release != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUDIT_RELEASE: ${{ inputs.audit_release }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $downloadDir = Join-Path $env:RUNNER_TEMP "opencv-previous-release"
+          gh release download $env:AUDIT_RELEASE --repo $env:GH_REPO --dir $downloadDir --pattern "MultiCamera_portable_x64.zip" --pattern "SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { throw "Could not download previous Release" }
+          $zipPath = Join-Path $downloadDir "MultiCamera_portable_x64.zip"
+          $expected = (Get-Content (Join-Path $downloadDir "SHA256SUMS.txt") | Where-Object { $_ -match '  MultiCamera_portable_x64\.zip$' }).Split()[0]
+          if ((Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw "Previous Release archive checksum mismatch"
+          }
+          python scripts/inspect_packaged_opencv.py $zipPath --report installer_output/previous_opencv_audit.json
+          if ($LASTEXITCODE -ne 0) { throw "Previous OpenCV inspection failed" }
 
       - name: Validate calibration workflow
         shell: pwsh
@@ -57,6 +86,9 @@ jobs:
         run: |
           python -m pip install pytest
           python -m pytest -q tests
+          if ($LASTEXITCODE -ne 0) { throw "Calibration regression tests failed" }
+          python -m multicamera --self-test-calibration --report installer_output/calibration_source_test.json
+          if ($LASTEXITCODE -ne 0) { throw "Source calibration self-test failed" }
 
       - name: Build portable app
         shell: pwsh
@@ -64,6 +96,24 @@ jobs:
           MULTICAMERA_WITH_OPEN3D: ${{ inputs.pointcloud && '1' || '' }}
         run: |
           pyinstaller --noconfirm MultiCamera.spec
+
+      - name: Validate final EXE calibration
+        shell: pwsh
+        run: ./scripts/test_packaged_calibration.ps1
+
+      - name: Summarize calibration diagnostics
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          foreach ($report in @("calibration_source_test", "calibration_self_test", "previous_opencv_audit")) {
+            $path = "installer_output/$report.json"
+            if (Test-Path $path) {
+              "### $report" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```json' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Get-Content $path -Raw | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
+          }
 
       - name: Package portable ZIP
         shell: pwsh
@@ -93,6 +143,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $assets = @(Get-Item "installer_output/MultiCamera_portable_x64.zip")
+          $assets += Get-Item "installer_output/calibration_source_test.json", "installer_output/calibration_self_test.json"
+          if (Test-Path "installer_output/previous_opencv_audit.json") {
+            $assets += Get-Item "installer_output/previous_opencv_audit.json"
+          }
           if ($env:BUILD_INSTALLER -eq "true") {
             $installers = @(Get-ChildItem "installer_output/MultiCamera_Setup_*_x64.exe" -File)
             if ($installers.Count -eq 0) { throw "Windows installer was not generated" }
@@ -125,6 +179,8 @@ jobs:
             "", "Commit: $env:GITHUB_SHA", "Variant: $variant",
             "", "Download the portable ZIP or, when included, the Setup EXE.",
             "SHA256SUMS.txt contains checksums for the binary downloads.",
+            "calibration_self_test.json records calibration and export executed by the final EXE.",
+            "calibration_source_test.json records the matching source-runtime baseline.",
             "", "Build: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           ) | Set-Content $notesPath -Encoding utf8
 
