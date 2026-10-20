@@ -125,6 +125,10 @@ class StepTimeline(QWidget):
         self._completed.add(index)
         self.update()
 
+    def mark_pending(self, index: int):
+        self._completed.discard(index)
+        self.update()
+
     def reset(self):
         self._current = 0
         self._completed.clear()
@@ -802,11 +806,13 @@ class CalibrationPanel(QWidget):
                     f"外参 RMS={rms_s:.3f}px 基线={bl_mm:.1f}mm",
                     SUCCESS,
                 )
-                row.btn.setEnabled(False)
-                row.btn.setText("完成")
+                row.btn.setEnabled(cal is not None and cal.ready)
+                row.btn.setText("重新标定")
+                any_ready = any_ready or (cal is not None and cal.ready)
             elif cal is not None and cal.ready:
                 row.set_status(f"{cal.num_frames} 帧已就绪，可开始标定", ACCENT)
                 row.btn.setEnabled(True)
+                row.btn.setText("标定")
                 any_ready = True
                 all_calibrated = False
             elif cal is not None:
@@ -816,13 +822,19 @@ class CalibrationPanel(QWidget):
                     TEXT_DIM,
                 )
                 row.btn.setEnabled(False)
+                row.btn.setText("标定")
                 all_calibrated = False
             else:
                 row.set_status("等待采集数据...", TEXT_HINT)
                 row.btn.setEnabled(False)
+                row.btn.setText("标定")
                 all_calibrated = False
 
         self._btn_calib_all.setEnabled(any_ready)
+        if self._calib_worker is not None:
+            self._btn_calib_all.setEnabled(False)
+            for row in self._pair_rows.values():
+                row.btn.setEnabled(False)
 
         n_pairs = len(self._sm.stereo_pairs)
         n_done = len(self._pair_calibs)
@@ -948,11 +960,15 @@ class CalibrationPanel(QWidget):
 
     @Slot()
     def _on_undo_capture(self):
+        if self._calib_worker is not None or self._aux_worker is not None:
+            self._log("标定任务正在运行，请稍后再撤销")
+            return
         if not self._undo_stack:
             return
         batch, advanced_guide = self._undo_stack.pop()
         for ent in reversed(batch):
             self._undo_apply_entry(ent)
+            self._invalidate_pair_result(ent.pair_name)
             pn = ent.pair_name
             self._pair_capture_press_count[pn] = max(
                 0, self._pair_capture_press_count.get(pn, 0) - 1
@@ -972,6 +988,9 @@ class CalibrationPanel(QWidget):
             self._capture_impl()
 
     def _capture_impl(self):
+        if self._calib_worker is not None or self._aux_worker is not None:
+            self._log("标定任务正在运行，请稍后再采集")
+            return
         pairs = self._selected_pairs()
         if not pairs:
             self._log("未配置相机组，请先通过 ⚙ 添加相机")
@@ -1018,6 +1037,12 @@ class CalibrationPanel(QWidget):
             det_l = self._intr_cals[lid].add_frame(left)
             det_r = self._intr_cals[rid].add_frame(right)
             self._stereo_cals[name].add_detection_pair(det_l, det_r)
+            if (
+                self._intr_cals[lid].num_frames > n_ib_l
+                or self._intr_cals[rid].num_frames > n_ib_r
+                or self._stereo_cals[name].num_frames > n_sb
+            ):
+                self._invalidate_pair_result(name)
 
             fi = len(self._fqs[lid])
             fq_l = self._assessor.assess_frame(left, det_l.num_corners, fi)
@@ -1496,6 +1521,7 @@ class CalibrationPanel(QWidget):
             pair_name, lid, rid
         )
 
+        self._invalidate_pair_result(pair_name)
         self._set_calibration_busy(True)
         worker = PairCalibrationWorker(
             pair_name=pair_name,
@@ -1504,8 +1530,6 @@ class CalibrationPanel(QWidget):
             left_calibrator=left_cal,
             right_calibrator=right_cal,
             stereo_calibrator=stereo_cal,
-            left_intrinsics=self._intrinsics.get(lid),
-            right_intrinsics=self._intrinsics.get(rid),
             intrinsic_flags=intrinsic_flags,
             stereo_flags=stereo_flags,
             strategy_name=self._calib_strategy_label(),
@@ -1526,8 +1550,6 @@ class CalibrationPanel(QWidget):
             return
         self._calib_queue = []
         for name in list(self._sm.stereo_pairs.keys()):
-            if name in self._pair_calibs:
-                continue
             cal = self._stereo_cals.get(name)
             if cal and cal.ready:
                 self._calib_queue.append(name)
@@ -1565,9 +1587,36 @@ class CalibrationPanel(QWidget):
         self._intrinsics.clear()
         self._pair_calibs.clear()
         self._rig = None
+        self._aux_intrinsics = None
+        self._btn_cloud.setEnabled(False)
+        self._timeline.mark_pending(1)
+        self._timeline.mark_pending(2)
+        self._sections[1].set_status_hint("")
         self._quality_report.clear()
         self.calibration_reset.emit()
         self._sync_pair_states()
+
+    def _invalidate_pair_result(self, pair_name: str):
+        """Keep collected observations, but invalidate results derived from older data."""
+        pair = self._pair_calibs.pop(pair_name, None)
+        if pair is None:
+            return
+        self._intrinsics.pop(pair.left_id, None)
+        self._intrinsics.pop(pair.right_id, None)
+        self._rig = None
+        self._aux_intrinsics = None
+        self._quality_report.clear()
+        self._lbl_rect_preview.clear()
+        self._btn_multi.setEnabled(False)
+        self._btn_cloud.setEnabled(False)
+        self._timeline.mark_pending(1)
+        self._timeline.mark_pending(2)
+        self._timeline.mark_pending(3)
+        self._sections[1].set_status_hint("数据已更新，待重新标定", WARNING)
+        self._sections[2].set_status_hint("")
+        self._sections[3].set_status_hint("")
+        self.calibration_reset.emit()
+        self._log(f"{pair_name}: 样本已更新，旧标定结果已失效，可直接重新标定")
 
     @Slot(str, str, str, object, object, object)
     def _on_pair_calibration_finished(
@@ -1584,20 +1633,28 @@ class CalibrationPanel(QWidget):
         self._intrinsics[rid] = intr_r
         self._pair_calibs[pair_name] = pair_calib
 
-        q_l = self._evaluator.evaluate_intrinsic(intr_l)
-        q_r = self._evaluator.evaluate_intrinsic(intr_r)
-        q_s = self._evaluator.evaluate_stereo(pair_calib)
-        bl_mm = np.linalg.norm(pair_calib.stereo.T) * 1000.0
-        self._log(f"  {lid}: RMS={intr_l.rms_error:.4f}px [{q_l.grade.label}]")
-        self._log(f"  {rid}: RMS={intr_r.rms_error:.4f}px [{q_r.grade.label}]")
-        self._log(
-            f"  ✓ {pair_name}: 外参 RMS={pair_calib.stereo.rms_error:.4f}px "
-            f"基线={bl_mm:.1f}mm [{q_s.grade.label}]"
-        )
-        self._update_calibration_quality_report(pair_name, q_l, q_r, q_s)
-        self._show_rect_preview(pair_name, pair_calib)
         self._sync_pair_states()
         self._publish_rig_for_export()
+        try:
+            q_l = self._evaluator.evaluate_intrinsic(intr_l)
+            q_r = self._evaluator.evaluate_intrinsic(intr_r)
+            q_s = self._evaluator.evaluate_stereo(pair_calib)
+            bl_mm = np.linalg.norm(pair_calib.stereo.T) * 1000.0
+            self._log(f"  {lid}: RMS={intr_l.rms_error:.4f}px [{q_l.grade.label}]")
+            self._log(f"  {rid}: RMS={intr_r.rms_error:.4f}px [{q_r.grade.label}]")
+            self._log(
+                f"  ✓ {pair_name}: 外参 RMS={pair_calib.stereo.rms_error:.4f}px "
+                f"基线={bl_mm:.1f}mm [{q_s.grade.label}]"
+            )
+            self._update_calibration_quality_report(pair_name, q_l, q_r, q_s)
+        except Exception as exc:
+            logger.exception("Calibration quality display failed: pair=%s", pair_name)
+            self._log(f"{pair_name}: 质量评估显示失败（标定结果已生成）：{exc}")
+        try:
+            self._show_rect_preview(pair_name, pair_calib)
+        except Exception as exc:
+            logger.exception("Rectification preview failed: pair=%s", pair_name)
+            self._log(f"{pair_name}: 校正预览失败（标定结果已生成）：{exc}")
         self._start_next_calibration()
 
     @Slot(str, str)
@@ -1617,6 +1674,8 @@ class CalibrationPanel(QWidget):
         )
         self._btn_undo.setEnabled((not busy) and bool(self._undo_stack))
         self._btn_auto.setEnabled(not busy)
+        self._combo_calib_strategy.setEnabled(not busy)
+        self._combo_data_filter.setEnabled(not busy)
         self._btn_calib_all.setEnabled(False if busy else self._btn_calib_all.isEnabled())
         for row in self._pair_rows.values():
             row.btn.setEnabled(False if busy else row.btn.isEnabled())

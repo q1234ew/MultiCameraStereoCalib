@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -15,6 +17,8 @@ from ..board.charuco_board import CharucoBoard
 from ..calibration.models import MultiCameraRig
 from ..perf import perf_timer
 from ..streaming.stream_manager import AuxiliaryCameraConfig, StereoPairConfig
+
+logger = logging.getLogger(__name__)
 
 
 class CalibrationSession:
@@ -236,10 +240,57 @@ class CalibrationSession:
 
     def save_rig(self, rig: MultiCameraRig):
         path = self.session_dir / self.RESULTS_DIR / "rig.json"
-        path.write_text(
-            json.dumps(rig.to_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=path.parent) as staging:
+            tmp = Path(staging) / path.name
+            tmp.write_text(
+                json.dumps(rig.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        return path
+
+    def save_calibration_results(self, rig: MultiCameraRig) -> tuple[list[Path], list[str]]:
+        """Persist the rig first, then export formats independently of each other."""
+        from .export import (
+            export_rig_kalibr_yaml,
+            export_rig_opencv_standard_yaml,
+            export_rig_opencv_yaml,
         )
+
+        saved = [self.save_rig(rig)]
+        errors: list[str] = []
+        results = self.session_dir / self.RESULTS_DIR
+        exports = [
+            ("rig_opencv.yml", export_rig_opencv_yaml, rig, {}),
+            ("rig_kalibr.yaml", export_rig_kalibr_yaml, rig, {}),
+        ]
+        for index, (name, pair) in enumerate(rig.pairs.items(), start=1):
+            filename = (
+                "rig_opencv_standard.yml" if len(rig.pairs) == 1
+                else f"rig_pair_{index:02d}_opencv_standard.yml"
+            )
+            exports.append((filename, export_rig_opencv_standard_yaml, rig, {"pair_name": name}))
+            if len(rig.pairs) > 1:
+                pair_rig = MultiCameraRig(pairs={name: pair}, reference_camera=pair.left_id)
+                exports.append((
+                    f"rig_pair_{index:02d}_kalibr.yaml", export_rig_kalibr_yaml, pair_rig, {},
+                ))
+        for filename, exporter, export_rig, kwargs in exports:
+            try:
+                # Replace a previous result only after its new export has completed.
+                with TemporaryDirectory(dir=results) as staging:
+                    tmp = Path(staging) / filename
+                    exporter(export_rig, tmp, **kwargs)
+                    if not tmp.is_file() or not tmp.stat().st_size:
+                        raise OSError("Export did not produce a non-empty file")
+                    path = results / filename
+                    tmp.replace(path)
+                saved.append(path)
+            except Exception as exc:
+                logger.exception("Automatic calibration export failed: file=%s", filename)
+                errors.append(f"{filename}: {exc}")
+        return saved, errors
 
     def load_rig(self) -> Optional[MultiCameraRig]:
         path = self.session_dir / self.RESULTS_DIR / "rig.json"

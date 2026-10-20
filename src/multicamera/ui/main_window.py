@@ -417,16 +417,40 @@ class MainWindow(QMainWindow):
         )
         self._rig = rig
         self._act_export.setEnabled(True)
-        if self._current_session:
-            self._current_session.save_rig(rig)
-        self._statusbar.showMessage("✓  标定完成！可在 3D 点云 标签页查看结果")
+        try:
+            if self._current_session is None:
+                self._current_session = self._session_manager.create_session(
+                    self._board,
+                    list(self._stream_manager.stereo_pairs.values()),
+                    auxiliary=self._stream_manager.auxiliary_camera,
+                    name="calib",
+                )
+                self._calib_panel.set_session(self._current_session)
+            saved, errors = self._current_session.save_calibration_results(rig)
+        except Exception as exc:
+            logger.exception("Automatic calibration result save failed")
+            text = f"标定计算完成，但自动保存失败：{exc}。可通过“导出标定结果”另存。"
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
+            QMessageBox.warning(self, "标定文件保存失败", text)
+            return
+        directory = saved[0].parent.resolve()
+        text = f"标定完成，已保存 {len(saved)} 个文件：{directory}"
+        self._calib_panel.append_log(text)
+        for path in saved:
+            logger.info("Calibration result saved: %s", path.resolve())
+        if errors:
+            for error in errors:
+                self._calib_panel.append_log(f"自动导出失败：{error}")
+            text += "（部分格式导出失败，详见操作日志）"
+        self._statusbar.showMessage(text)
 
     @Slot()
     def _on_calib_reset(self):
         logger.info("Calibration state reset")
         self._rig = None
         self._act_export.setEnabled(False)
-        self._statusbar.showMessage("标定数据已重置，请重新标定后再导出")
+        self._statusbar.showMessage("标定数据或策略已更新，请重新标定后再导出")
 
     @Slot(object)
     def _on_pointcloud(self, pcd):
