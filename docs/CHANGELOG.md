@@ -4,6 +4,16 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-10-20 - Windows Release 分发上线验证
+
+### 验证结果
+
+- 新流程提交 `e152106`、标签 `v0.1.0-build.20261020.2` 的 Windows 构建 #10 已成功完成，Release 发布步骤通过。
+- 已在 Release 页面确认轻量版 `MultiCamera_Setup_0.1.0_x64.exe`（约 94.7 MB）、`MultiCamera_portable_x64.zip`（约 147 MB）和 `SHA256SUMS.txt` 三个附件。
+- Release 为预发布版本，包含标定结果自动落盘和补拍后重新标定修复；本轮验证了 Windows 构建、附件上传及发布，未在 Windows 实机运行安装包。
+- 构建记录：https://github.com/q1234ew/MultiCameraStereoCalib/actions/runs/39396166218
+- 下载入口：https://github.com/q1234ew/MultiCameraStereoCalib/releases/tag/v0.1.0-build.20261020.2
+
 ## 2026-10-20 - Windows 安装包改为 Release 分发
 
 提交：随 `Distribute Windows builds through GitHub Releases` 打包流程提交维护。
