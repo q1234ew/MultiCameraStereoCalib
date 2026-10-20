@@ -236,6 +236,7 @@ def test_recalibrate_after_supplement_uses_all_observations(app, window, monkeyp
 
 
 def test_batch_recalibrates_completed_pairs_without_new_capture(app, window, monkeypatch):
+    monkeypatch.delattr(cv2.aruco, "calibrateCameraCharuco", raising=False)
     seed_observations(window)
     panel = window._calib_panel
     panel._calibrate_pair("rgb")

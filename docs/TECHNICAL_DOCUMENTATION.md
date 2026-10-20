@@ -202,6 +202,8 @@ sessions/<session_name>/
 
 单组双目标定由 `PairCalibrationWorker` 在后台 QThread 中执行。
 
+针孔内参使用通用 `cv2.calibrateCamera`：每帧按照 ChArUco ID 从 `CharucoBoard.object_points` 取对应三维点，并与该帧图像角点保持同一顺序，支持只检测到部分角点和非连续/乱序 ID。不依赖部分 OpenCV Python 构建缺失的旧 `cv2.aruco.calibrateCameraCharuco` 接口。日志记录 OpenCV 版本、求解接口、样本数和图像尺寸；鱼眼模型继续使用 `cv2.fisheye.calibrate`。
+
 worker 输入：
 
 - pair name、left/right camera id。
@@ -318,6 +320,7 @@ GitHub Actions 打包策略：
 - tag 构建或手动勾选 `installer` 时才生成 Inno 安装包。
 - 使用 Windows runner 预装的 GitHub CLI，将 `MultiCamera_portable_x64.zip`、可选的 `MultiCamera_Setup_*_x64.exe` 和 `SHA256SUMS.txt` 上传到 GitHub Release 附件，不再调用 `actions/upload-artifact`，不占用 Actions Artifact 存储额度。
 - 手动勾选 `pointcloud` 时才把 Open3D 纳入 CI 包。
+- PyInstaller 打包前安装测试依赖并以离屏 Qt 执行 `python -m pytest -q tests`；测试失败会阻止构建和发布。
 - 发布 job 使用仓库自带的 `GITHUB_TOKEN` 和 `contents: write` 权限，不需要新增 PAT。相同 ref 的构建串行运行，避免同时修改同一个 Release。
 - tag 构建以当前标签创建 Release；手动构建自动使用 `windows-build-<run_id>` 标签，指向本次构建的精确 commit。带 `-` 的标签和手动构建标记为预发布，不覆盖正式 Latest。
 - 新 Release 先创建草稿，附件上传成功后再发布。重跑复用原标签并更新同名附件；启用不可变 Release 的仓库应使用新标签重新发布。
@@ -434,6 +437,14 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q tests/test_calibration_w
 ```
 
 该测试使用仿真投影观测调用真实标定 worker，检查未建会话自动保存、重复写入、OpenCV 文件回读、补拍参与内参重算、撤销失效、已有数据直接重跑、预览失败隔离、多组独立导出和保存错误反馈。
+
+OpenCV ChArUco 内参接口兼容性回归：
+
+```bash
+.venv/bin/python -m pytest -q tests/test_intrinsic_compat.py
+```
+
+使用 24 帧部分/乱序角点观测验证标准与稳健策略在旧 ArUco 标定接口不存在时仍可求解，并与旧接口可用时的结果做数值对照。Windows CI 同时执行这些测试和 UI 工作流回归，不再仅以 EXE 能生成作为发布通过条件。
 
 推荐使用项目虚拟环境：
 

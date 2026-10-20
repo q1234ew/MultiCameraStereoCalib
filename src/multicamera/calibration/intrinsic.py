@@ -101,10 +101,23 @@ class IntrinsicCalibrator:
             return self._calibrate_pinhole(flags)
 
     def _calibrate_pinhole(self, flags: int) -> CameraIntrinsics:
-        rms, K, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-            self._all_corners,
-            self._all_ids,
-            self.board.board,
+        board_corners = self.board.object_points
+        # ChArUco IDs index board corners; detections can be partial and unordered.
+        obj_points = [
+            np.ascontiguousarray(board_corners[ids.flatten()].reshape(-1, 1, 3), dtype=np.float32)
+            for ids in self._all_ids
+        ]
+        img_points = [
+            np.ascontiguousarray(corners.reshape(-1, 1, 2), dtype=np.float32)
+            for corners in self._all_corners
+        ]
+        logger.info(
+            "Pinhole intrinsic calibration: OpenCV=%s api=cv2.calibrateCamera frames=%d size=%s",
+            cv2.__version__, self.num_frames, self._image_size,
+        )
+        rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+            obj_points,
+            img_points,
             self._image_size,
             None,
             None,

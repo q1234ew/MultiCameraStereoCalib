@@ -4,6 +4,27 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-10-21 - 修复 Windows ChArUco 内参标定接口兼容性
+
+提交：随 `Use generic OpenCV calibration for ChArUco intrinsics` 修复提交维护。
+
+### 修复
+
+- 针孔内参改用 `cv2.calibrateCamera`，按每帧 ChArUco 角点 ID 从标定板取对应三维点，取消对部分 OpenCV 构建缺失的 `cv2.aruco.calibrateCameraCharuco` 接口的依赖。
+- 保留部分角点检测、非连续/乱序角点 ID、标准/稳健标定 flags、逐帧误差和位姿输出；原图和板尺寸设置可直接复用。
+- 内参求解日志新增 OpenCV 版本、计算接口、样本数和图像尺寸，方便定位平台差异。
+- Windows CI 在 PyInstaller 打包前执行标定回归，覆盖缺少旧接口时的内参求解、重复标定与结果保存。
+
+### 兼容性
+
+- 不修改标定板尺寸单位、相机会话结构或 JSON/OpenCV/Kalibr 导出字段；鱼眼标定流程不变。
+- 已发布的旧 EXE 不会自动更新，需要安装或解压包含本次修复的新 Release，再导入原图重新标定。
+
+### 验证
+
+- 已通过 `.venv/bin/python -m pytest -q tests`：12 项测试通过，含 24 帧部分/乱序角点仿真、旧接口缺失回归和旧接口数值对照。
+- 已通过 compileall、Ruff、actionlint 和 `git diff --check`。实际用户的 24 对原图不在本机，尚未用该批图像实测。
+
 ## 2026-10-20 - Windows Release 分发上线验证
 
 ### 验证结果
