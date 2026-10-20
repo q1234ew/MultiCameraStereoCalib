@@ -4,6 +4,16 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-10-21 - ChArUco 兼容性修复版发布验证
+
+### 验证结果
+
+- 提交 `4797222`、标签 `v0.1.0-build.20261021.1` 的 Windows 构建 #11 已成功，新增的离屏标定回归步骤通过后才执行打包。
+- Release 已包含轻量版 EXE 安装包（约 97.9 MB）、便携 ZIP（约 150 MB）和 SHA256 校验文件。
+- 构建记录：https://github.com/q1234ew/MultiCameraStereoCalib/actions/runs/39468498306
+- 下载入口：https://github.com/q1234ew/MultiCameraStereoCalib/releases/tag/v0.1.0-build.20261021.1
+- Windows CI 验证使用仿真观测；用户实际的 24 对图片尚未在本机或 CI 中实测。
+
 ## 2026-10-21 - 修复 Windows ChArUco 内参标定接口兼容性
 
 提交：随 `Use generic OpenCV calibration for ChArUco intrinsics` 修复提交维护。
