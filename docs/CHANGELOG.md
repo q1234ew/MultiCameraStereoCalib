@@ -4,6 +4,28 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-10-20 - Windows 安装包改为 Release 分发
+
+提交：随 `Distribute Windows builds through GitHub Releases` 打包流程提交维护。
+
+### 调整
+
+- Windows 工作流改用 GitHub CLI 将安装程序和便携 ZIP 上传到 Release，移除 Actions Artifact 上传，避免 Artifact 存储额度耗尽导致分发失败。
+- 附带 SHA256 校验文件，发布说明记录源码 commit、轻量/点云变体和构建链接；新 Release 在附件上传成功后才发布。
+- 版本标签构建沿用原标签，手动构建使用独立 `windows-build-<run_id>` 标签；预发布构建不设置为正式 Latest。
+- 发布 job 使用内置 token 的 `contents: write` 权限，同 ref 串行发布，重跑可更新原 Release 的同名附件。
+
+### 兼容性
+
+- 保留轻量包默认值、可选 Open3D 和可选 Inno 安装包；应用代码和标定文件格式不变。
+- 下载入口改为仓库 Releases 页面，而非 Actions 页面的 Artifacts 区域。
+- 旧运行的重跑不会采用新工作流，需要从新提交触发构建。不可变 Release 发布后不可覆盖附件，应使用新标签。
+
+### 验证
+
+- 已通过 actionlint、YAML 解析、Release 上传配置检查和 `git diff --check`。
+- 实际 Windows 构建与 Release 发布需由包含本次改动的新提交/新标签验证，不能重跑旧标签来验证新流程。
+
 ## 2026-10-20 - 标定结果自动落盘与补拍后重新标定
 
 提交：随 `Fix calibration autosave and recalibration after capture` 修复提交维护。

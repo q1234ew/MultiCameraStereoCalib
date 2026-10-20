@@ -21,6 +21,11 @@ jobs:
   build-windows:
     name: Build Windows app
     runs-on: windows-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: windows-release-${{ github.ref }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -70,17 +75,65 @@ jobs:
           if (!(Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
           & $iscc packaging\windows\MultiCamera.iss
 
-      - name: Upload installer
-        if: ${{ github.event_name == 'push' || inputs.installer }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: MultiCamera-Windows-Installer
-          path: installer_output\MultiCamera_Setup_*_x64.exe
-          if-no-files-found: error
+      - name: Publish Windows Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_INSTALLER: ${{ github.event_name == 'push' || inputs.installer }}
+          BUILD_POINTCLOUD: ${{ inputs.pointcloud || false }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(Get-Item "installer_output/MultiCamera_portable_x64.zip")
+          if ($env:BUILD_INSTALLER -eq "true") {
+            $installers = @(Get-ChildItem "installer_output/MultiCamera_Setup_*_x64.exe" -File)
+            if ($installers.Count -eq 0) { throw "Windows installer was not generated" }
+            $assets += $installers
+          }
+          foreach ($asset in $assets) {
+            if ($asset.Length -eq 0 -or $asset.Length -ge 2GB) {
+              throw "Release asset must be non-empty and under 2 GiB: $($asset.Name)"
+            }
+          }
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)"
+          }
+          $checksumPath = "installer_output/SHA256SUMS.txt"
+          $checksums | Set-Content $checksumPath -Encoding utf8
+          $assetPaths = @($assets.FullName) + @($checksumPath)
 
-      - name: Upload portable ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: MultiCamera-Windows-Portable-ZIP
-          path: installer_output\MultiCamera_portable_x64.zip
-          if-no-files-found: error
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $env:GITHUB_REF_NAME
+          } else {
+            "windows-build-$env:GITHUB_RUN_ID"
+          }
+          $prerelease = $env:GITHUB_REF_TYPE -ne "tag" -or $tag.Contains("-")
+          $variant = if ($env:BUILD_POINTCLOUD -eq "true") { "With Open3D" } else { "Lightweight (no Open3D)" }
+          $title = "MultiCamera Windows $tag"
+          $notesPath = Join-Path $env:RUNNER_TEMP "windows-release-notes.md"
+          @(
+            "Windows x64 build of MultiCamera Stereo Calibration.",
+            "", "Commit: $env:GITHUB_SHA", "Variant: $variant",
+            "", "Download the portable ZIP or, when included, the Setup EXE.",
+            "SHA256SUMS.txt contains checksums for the binary downloads.",
+            "", "Build: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          ) | Set-Content $notesPath -Encoding utf8
+
+          gh release view $tag --repo $env:GH_REPO --json url
+          if ($LASTEXITCODE -ne 0) {
+            $createArgs = @("release", "create", $tag, "--repo", $env:GH_REPO,
+              "--target", $env:GITHUB_SHA, "--title", $title,
+              "--notes-file", $notesPath, "--draft")
+            if ($prerelease) { $createArgs += "--prerelease" }
+            gh @createArgs
+            if ($LASTEXITCODE -ne 0) { throw "Could not create Windows Release" }
+          }
+          gh release upload $tag @assetPaths --repo $env:GH_REPO --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload Windows Release assets" }
+          $latest = if ($prerelease) { "false" } else { "true" }
+          gh release edit $tag --repo $env:GH_REPO --draft=false "--latest=$latest"
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish Windows Release" }
+          $releaseUrl = gh release view $tag --repo $env:GH_REPO --json url --jq .url
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify Windows Release URL" }
+          "Windows downloads: $releaseUrl" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append

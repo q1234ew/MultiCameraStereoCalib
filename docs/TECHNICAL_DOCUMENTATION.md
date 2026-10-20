@@ -316,8 +316,13 @@ GitHub Actions 打包策略：
 
 - 手动触发默认只生成便携 ZIP，不安装 Inno Setup。
 - tag 构建或手动勾选 `installer` 时才生成 Inno 安装包。
-- 上传 `MultiCamera_portable_x64.zip`，不再上传散文件夹，减少 artifact 打包时间。
+- 使用 Windows runner 预装的 GitHub CLI，将 `MultiCamera_portable_x64.zip`、可选的 `MultiCamera_Setup_*_x64.exe` 和 `SHA256SUMS.txt` 上传到 GitHub Release 附件，不再调用 `actions/upload-artifact`，不占用 Actions Artifact 存储额度。
 - 手动勾选 `pointcloud` 时才把 Open3D 纳入 CI 包。
+- 发布 job 使用仓库自带的 `GITHUB_TOKEN` 和 `contents: write` 权限，不需要新增 PAT。相同 ref 的构建串行运行，避免同时修改同一个 Release。
+- tag 构建以当前标签创建 Release；手动构建自动使用 `windows-build-<run_id>` 标签，指向本次构建的精确 commit。带 `-` 的标签和手动构建标记为预发布，不覆盖正式 Latest。
+- 新 Release 先创建草稿，附件上传成功后再发布。重跑复用原标签并更新同名附件；启用不可变 Release 的仓库应使用新标签重新发布。
+- 下载入口为仓库的 `Releases` 页面，运行摘要同时输出本次 Release URL。下载 EXE/ZIP 附件，不要将自动生成的 Source code 压缩包当作可运行程序。
+- Release 发布失败时 job 保持失败状态，可查看 GitHub CLI 的权限、网络或附件上传错误。旧构建的“Re-run jobs”仍使用旧工作流；切换发布方式后必须用新提交触发构建。
 
 ## 10. 导出格式
 
