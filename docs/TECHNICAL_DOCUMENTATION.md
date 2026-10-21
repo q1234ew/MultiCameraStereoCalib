@@ -479,7 +479,9 @@ Get-Content $report -Raw
 
 自检生成 ChArUco 图案并检测 126 个角点；使用 24 帧部分、乱序且左右不完全相同的角点观测，调用真实内参、双目和校正代码，检查 RMS、已知内参、0.12 米基线与有限校正矩阵；导出四类文件并回读 JSON/OpenCV 矩阵和左右 ID，检查 Kalibr 链字段。所有模拟数据保存在临时目录，不修改用户会话。该烟测不替代真实图片质量评估，不覆盖鱼眼数值标定、点云、视频连接或安装器安装过程。
 
-本次问题排查的已知证据：旧 Windows 构建 #10 的依赖日志明确安装 `opencv-contrib-python 5.0.0.93`，而本地验证使用 `4.13.0.92`；原 `>=4.9` 未限制主版本。用户错误证明旧运行时缺少 `aruco.calibrateCameraCharuco`，并非整个 OpenCV 未打包。归档原生接口的进一步证据以 `previous_opencv_audit.json` 为准，不把本地 4.x 的接口存在性视为 Windows 5.x 的证明。
+本次问题排查的实测证据：旧 Windows 构建 #10 的依赖日志安装 `opencv-contrib-python 5.0.0.93`，而本地验证使用 `4.13.0.92`；原 `>=4.9` 未限制主版本。Windows 构建 #12 下载并校验旧 Release `v0.1.0-build.20261020.2` 的 ZIP，直接加载其 `cv2.pyd`，测得版本 `5.0.0`，旧 `aruco.calibrateCameraCharuco=false`，通用 `calibrateCamera/stereoCalibrate=true`。旧 ZIP SHA256 为 `7fe8e4c3703a29b21fa42b20ceea65475a0fc38859ad044d1cbbb1f0e7e43bb8`；其原生库 SHA256 为 `ae833b9b5771f5932200bd3b8ad0f483f4fbec92cbdbd26d21d38fe524c60e66`，与从 PyPI 下载的 `opencv_contrib_python-5.0.0.93-cp37-abi3-win_amd64.whl` 内 `cv2/cv2.pyd` 完全一致。结论为跨主版本更新后的旧接口不可用，并非 OpenCV 未打包，也非 PyInstaller 裁剪了该函数。
+
+新发布包 `windows-build-39475861438`（应用源码 `a51f264`）已通过最终 EXE 自检，报告 `frozen=true`、contrib `4.13.0.92`、OpenCV `4.13.0`。源码和 EXE 原生库 SHA256 同为 `ac679c0d19b50c03a0f8237ee6a1b87be3bf9cf9c9c94d206d9ccb7f5956de75`；左右内参和双目 RMS 分别约 `0.00001938`、`0.00001852`、`0.00014035` 像素，恢复基线 `0.11999995` 米。构建 #12 总用时 4 分 42 秒，已发布约 93 MB 安装器、143 MB 便携包及三份诊断报告。构建证据：[Actions #12](https://github.com/q1234ew/MultiCameraStereoCalib/actions/runs/39475861438)；下载：[Release](https://github.com/q1234ew/MultiCameraStereoCalib/releases/tag/windows-build-39475861438)。这些数值来自确定性仿真，不代表用户实际采图质量。
 
 升级 OpenCV 时应保留源码基线、EXE 报告和构建链接，确认产物版本与实际使用接口；只重跑源码测试或检查 EXE 是否存在不足以验收打包兼容性。
 

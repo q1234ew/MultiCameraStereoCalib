@@ -4,6 +4,18 @@
 
 本文件采用追加式维护：新增变更只能追加新条目或在最近一条未提交记录中补充细节，不得用新内容覆盖、删除或重写已有历史记录。
 
+## 2026-10-21 - Windows 最终 EXE 自检与旧包缺接口原因实测
+
+### 验证结果
+
+- 源码提交 `a51f264` 的 Windows 构建 #12 成功，用时 4 分 42 秒；最终 EXE 而非仅源码环境完成 ChArUco 检测、内参、双目、校正和导出回读。
+- 新 EXE 报告 `frozen=true`、OpenCV `4.13.0` / contrib `4.13.0.92`；源码与 EXE 的原生库哈希和接口清单一致。仿真双目 RMS 约 `0.00014035` 像素，恢复基线 `0.11999995` 米。
+- 已对旧 Release `v0.1.0-build.20261020.2` 的 ZIP 校验并加载其原生 `cv2.pyd`：版本为 `5.0.0`，旧 `aruco.calibrateCameraCharuco` 不存在，通用标定接口存在。
+- 旧原生库 SHA256 `ae833b9b5771f5932200bd3b8ad0f483f4fbec92cbdbd26d21d38fe524c60e66` 与官方 PyPI `5.0.0.93` Windows wheel 完全一致，确认是依赖跨主版本后的 API 差异，不是 OpenCV 漏打包或 PyInstaller 裁剪接口。
+- 新 Release 包含约 93 MB 安装器、143 MB 便携 ZIP、源码与 EXE 自检报告、旧包审计报告及 SHA256 清单。此验证不包含用户原始采图、鱼眼数值流程或安装器实机安装。
+- 构建：https://github.com/q1234ew/MultiCameraStereoCalib/actions/runs/39475861438
+- 下载：https://github.com/q1234ew/MultiCameraStereoCalib/releases/tag/windows-build-39475861438
+
 ## 2026-10-21 - OpenCV 构建版本约束与最终 EXE 标定自检
 
 ### 修复与防回归
