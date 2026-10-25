@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from typing import Tuple
 
 import cv2
@@ -32,6 +33,67 @@ class PatternBoardConfig:
     def __post_init__(self):
         if not isinstance(self.pattern_type, PatternType):
             self.pattern_type = PatternType(self.pattern_type)
+        for name in ("cols", "rows"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be an integer point count")
+            if not math.isfinite(value) or int(value) != value or not 2 <= value <= 100:
+                raise ValueError(f"{name} must be an integer between 2 and 100")
+            setattr(self, name, int(value))
+        if self.pattern_type == PatternType.CHESSBOARD and min(self.cols, self.rows) < 3:
+            raise ValueError("Chessboards need at least 3 inner corners in each direction")
+        if (isinstance(self.square_size, bool) or
+                not isinstance(self.square_size, (int, float)) or
+                not math.isfinite(self.square_size) or not 0 < self.square_size <= 10):
+            raise ValueError("square_size must be a positive spacing in metres (at most 10 m)")
+        if not isinstance(self.asymmetric, bool):
+            raise ValueError("asymmetric must be true or false")
+        if self.asymmetric and self.pattern_type != PatternType.CIRCLES_GRID:
+            raise ValueError("asymmetric is only valid for circles_grid")
+
+    @classmethod
+    def ir_chessboard(cls) -> "PatternBoardConfig":
+        """Confirmed IR board: 7 x 5 squares, 6 x 4 inner corners, 80 mm spacing."""
+        return cls(cols=6, rows=4, square_size=0.08)
+
+    def to_dict(self) -> dict:
+        return {
+            "cols": self.cols, "rows": self.rows, "square_size": self.square_size,
+            "pattern_type": self.pattern_type.value, "asymmetric": self.asymmetric,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PatternBoardConfig":
+        if not isinstance(data, dict):
+            raise ValueError("Board configuration must be an object")
+        # Legacy ustreamer-ir fields are inner-corner counts and millimetres.
+        def count(key, legacy):
+            value = data.get(key, data.get(legacy))
+            if value is None:
+                raise ValueError(f"Missing {key}/{legacy} (detected point count)")
+            if key in data and legacy in data and data[key] != data[legacy]:
+                raise ValueError(f"Conflicting {key} and {legacy}")
+            return value
+
+        spacing = data.get("square_size")
+        if "square_mm" in data:
+            mm = data["square_mm"]
+            if isinstance(mm, bool) or not isinstance(mm, (int, float)):
+                raise ValueError("square_mm must be numeric")
+            metres = mm / 1000.0
+            if spacing is not None and (
+                isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or
+                not math.isclose(spacing, metres, rel_tol=1e-9, abs_tol=1e-12)
+            ):
+                raise ValueError("Conflicting square_size (m) and square_mm")
+            spacing = metres
+        if spacing is None:
+            raise ValueError("Missing square_size (m) or square_mm (mm)")
+        return cls(
+            cols=count("cols", "board_cols"), rows=count("rows", "board_rows"),
+            square_size=spacing, pattern_type=data.get("pattern_type", "chessboard"),
+            asymmetric=data.get("asymmetric", False),
+        )
 
     @classmethod
     def from_pattern_name(cls, pattern_name: str, **kwargs) -> "PatternBoardConfig":

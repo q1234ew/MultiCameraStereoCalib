@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pytest
 from PySide6.QtCore import QEventLoop, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from multicamera.board.detector import DetectionResult
 from multicamera.calibration.intrinsic import IntrinsicCalibrator
@@ -20,11 +20,6 @@ from multicamera.io import export
 from multicamera.io.session import CalibrationSession
 from multicamera.streaming.stream_manager import CameraConfig, StereoPairConfig
 from multicamera.ui import main_window
-
-
-@pytest.fixture(scope="session")
-def app():
-    return QApplication.instance() or QApplication([])
 
 
 @pytest.fixture

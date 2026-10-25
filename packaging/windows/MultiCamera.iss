@@ -26,6 +26,7 @@ OutputBaseFilename=MultiCamera_Setup_{#MyAppVersion}_x64
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\..\assets\logo.ico
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 MinVersion=10.0

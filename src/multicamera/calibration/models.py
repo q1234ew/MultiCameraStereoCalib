@@ -181,6 +181,7 @@ class AuxCameraCalibration:
     board_type: str = ""
     frame_count: int = 0
     per_frame_errors: Optional[List[float]] = None
+    board_config: Optional[dict] = None
 
     @property
     def R_rgb_left_aux(self) -> np.ndarray:
@@ -202,6 +203,8 @@ class AuxCameraCalibration:
         }
         if self.per_frame_errors is not None:
             d["per_frame_errors"] = self.per_frame_errors
+        if self.board_config is not None:
+            d["board_config"] = dict(self.board_config)
         return d
 
     @classmethod
@@ -215,6 +218,7 @@ class AuxCameraCalibration:
             board_type=d.get("board_type", ""),
             frame_count=d.get("frame_count", 0),
             per_frame_errors=d.get("per_frame_errors"),
+            board_config=d.get("board_config"),
         )
 
 

@@ -95,6 +95,11 @@ def export_rig_opencv_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
         fs.write(f"{prefix}_id", aux.camera_id)
         fs.write(f"{prefix}_modality", aux.modality)
         fs.write(f"{prefix}_board_type", aux.board_type)
+        if aux.board_config is not None:
+            fs.write(f"{prefix}_board_cols", int(aux.board_config["cols"]))
+            fs.write(f"{prefix}_board_rows", int(aux.board_config["rows"]))
+            fs.write(f"{prefix}_board_square_size_m", float(aux.board_config["square_size"]))
+            fs.write(f"{prefix}_board_asymmetric", int(aux.board_config.get("asymmetric", False)))
         fs.write(f"{prefix}_frame_count", int(aux.frame_count))
         fs.write(f"{prefix}_rms_error", float(aux.rms_error))
         fs.write(f"{prefix}_T_rgb_left_aux", aux.T_rgb_left_aux)
@@ -247,6 +252,13 @@ def _select_pair_for_standard_export(
 def export_rig_yaml(rig: MultiCameraRig, path: str | Path) -> Path:
     """Backward-compatible alias for OpenCV YAML export."""
     return export_rig_opencv_yaml(rig, path)
+
+
+def validate_rig_kalibr_chain(rig: MultiCameraRig) -> None:
+    """Reject a camera list that cannot be represented by a relative pose chain."""
+    camera_ids = _ordered_camera_ids(rig)
+    for previous, current in zip(camera_ids, camera_ids[1:]):
+        _relative_transform(rig, previous, current)
 
 
 def export_rig_kalibr_yaml(rig: MultiCameraRig, path: str | Path) -> Path:

@@ -5,18 +5,28 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Slot
+from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QButtonGroup,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
+    QLayout,
     QMessageBox,
     QSplitter,
+    QScrollArea,
     QStatusBar,
+    QStyle,
+    QSizePolicy,
+    QTabBar,
     QTabWidget,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -28,8 +38,13 @@ from ..runtime_paths import logo_png_path, logs_dir, sessions_dir
 from ..streaming.stream_manager import StreamManager
 from .widgets.calib_panel import CalibrationPanel
 from .widgets.config_dialog import ConfigDialog
+from .widgets.export_dialog import ExportDialog
 from .widgets.rgb_settings_dialog import DEFAULT_RGB_SETTINGS_URL, RgbSettingsDialog
 from .widgets.stream_view import MultiStreamView
+from .widgets.pair_gallery import PairGallery
+from .widgets.stereo_capture import StereoCaptureWorkspace
+from .configuration import configuration_impact
+from .theme import TEXT, TEXT_DIM, SUCCESS, WARNING, BORDER, standard_icon, app_icon
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +53,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MultiCamera Stereo Calibration")
-        self.resize(1500, 920)
+        self.resize(1440, 960)
+        self.setMinimumSize(1000, 680)
 
         logo_path = logo_png_path()
         if logo_path is not None:
@@ -81,16 +97,179 @@ class MainWindow(QMainWindow):
         self._cloud_tab_index = self._right_tabs.addTab(
             self._cloud_placeholder, "3D 点云"
         )
+        self._right_tabs.tabBar().hide()
+        self._right_tabs.setStyleSheet("QTabWidget::pane {border:none;}")
+
+        self._workspace = QWidget()
+        workspace = QVBoxLayout(self._workspace)
+        workspace.setContentsMargins(6, 8, 6, 8)
+        workspace.setSpacing(8)
+        self._stereo_capture = StereoCaptureWorkspace(
+            self._calib_panel, self._stream_view, self._board,
+        )
+        workspace.addWidget(self._stereo_capture.banner)
+        self._review_bar = QWidget()
+        review = QHBoxLayout(self._review_bar)
+        review.setContentsMargins(6, 0, 6, 0)
+        self._lbl_review = QLabel()
+        self._lbl_review.setTextFormat(Qt.PlainText)
+        self._lbl_review.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_review.setStyleSheet(f"color:{WARNING};")
+        review.addWidget(self._lbl_review, 1)
+        self._btn_end_review = QToolButton()
+        self._btn_end_review.setText("结束回看")
+        self._btn_end_review.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_end_review.setIcon(app_icon('undo-2'))
+        self._btn_end_review.clicked.connect(self._stream_view.end_review)
+        review.addWidget(self._btn_end_review)
+        workspace.addWidget(self._review_bar)
+        self._review_bar.hide()
+        self._preview_body = QWidget()
+        preview_body = QVBoxLayout(self._preview_body)
+        preview_body.setContentsMargins(0, 0, 0, 0)
+        preview_body.setSizeConstraint(QLayout.SetMinimumSize)
+        self._stream_view.setMinimumHeight(230)
+        preview_body.addWidget(self._stream_view, 1)
+        preview_body.addWidget(self._stereo_capture)
+        self._preview_scroll = QScrollArea()
+        self._preview_scroll.setFrameShape(QFrame.NoFrame)
+        self._preview_scroll.setWidgetResizable(True)
+        self._preview_scroll.setWidget(self._preview_body)
+        workspace.addWidget(self._preview_scroll, 1)
+        self._capture_bottom = QWidget()
+        self._capture_bottom_layout = QHBoxLayout(self._capture_bottom)
+        self._capture_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        self._capture_actions = QWidget()
+        self._capture_actions.setMinimumWidth(310)
+        self._capture_actions.setMaximumWidth(400)
+        self._capture_actions_layout = QVBoxLayout(self._capture_actions)
+        self._capture_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self._capture_actions_layout.setSizeConstraint(QLayout.SetMinimumSize)
+        self._gallery = PairGallery()
+        self._capture_bottom_layout.addWidget(self._gallery, 1, Qt.AlignTop)
+        self._capture_bottom_layout.addWidget(self._capture_actions)
+        workspace.addWidget(self._capture_bottom)
+        self._calib_panel._capture_readiness = self._stereo_capture.auto_ready
+        self._capture_layout_active = False
+        self._capture_section_layout = self._calib_panel._sections[0].parentWidget().layout()
+        self._capture_section_index = self._capture_section_layout.indexOf(self._calib_panel._sections[0])
+
+        log_header = QHBoxLayout()
+        self._toggle_logs = QToolButton()
+        self._toggle_logs.setText("操作日志")
+        self._toggle_logs.setArrowType(Qt.RightArrow)
+        self._toggle_logs.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle_logs.setCheckable(True)
+        log_header.addWidget(self._toggle_logs)
+        self._lbl_latest_log = QLabel()
+        self._lbl_latest_log.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_latest_log.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
+        log_header.addWidget(self._lbl_latest_log, 1)
+        workspace.addLayout(log_header)
+        self._logs_widget = self._calib_panel.take_log_widget()
+        self._logs_widget.setMaximumHeight(150)
+        self._logs_widget.setMinimumHeight(100)
+        workspace.addWidget(self._logs_widget)
+        self._logs_widget.hide()
+        self._toggle_logs.toggled.connect(self._toggle_log_panel)
+
+        self._inspector = QFrame()
+        self._inspector.setObjectName("inspectorColumn")
+        self._inspector.setStyleSheet(f"QFrame#inspectorColumn {{border-left:1px solid {BORDER};}}")
+        self._inspector.setMinimumWidth(360)
+        self._inspector.setMaximumWidth(600)
+        inspector = QVBoxLayout(self._inspector)
+        inspector.setContentsMargins(0, 0, 0, 0)
+        inspector.setSpacing(6)
+        self._comparison_host = QWidget()
+        self._comparison_host.setFixedHeight(238)
+        comparison = QVBoxLayout(self._comparison_host)
+        comparison.setContentsMargins(4, 4, 4, 0)
+        self._stream_view.set_comparison_host(comparison)
+        inspector.addWidget(self._comparison_host)
+        self._comparison_host.hide()
+        inspector.addWidget(self._right_tabs, 1)
 
         # Splitter for main content
         self._splitter = QSplitter(Qt.Horizontal)
-        self._splitter.addWidget(self._stream_view)
-        self._splitter.addWidget(self._right_tabs)
+        self._splitter.addWidget(self._workspace)
+        self._splitter.addWidget(self._inspector)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.setHandleWidth(1)
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([1050, 450])
+        self._splitter.setSizes([1000, 430])
 
-        self.setCentralWidget(self._splitter)
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_workbench_header())
+        layout.addWidget(self._splitter, 1)
+        self.setCentralWidget(central)
+        self._set_stereo_capture_layout(True)
+
+    def _set_stereo_capture_layout(self, active):
+        panel = self._calib_panel
+        if active != self._capture_layout_active:
+            section = panel._sections[0]
+            footer = panel._action_footer
+            if active:
+                self._capture_section_layout.removeWidget(section)
+                self._stereo_capture.details.setWidget(section)
+                panel.layout().removeWidget(footer)
+                self._capture_actions_layout.addWidget(footer)
+                footer.layout().setContentsMargins(10, 8, 10, 8)
+            else:
+                self._stereo_capture.details.takeWidget()
+                self._capture_section_layout.insertWidget(self._capture_section_index, section)
+                self._capture_actions_layout.removeWidget(footer)
+                panel.layout().addWidget(footer)
+                footer.layout().setContentsMargins(16, 12, 16, 16)
+            section.setVisible(active or panel._active_step == 0)
+            footer.show()
+            self._capture_layout_active = active
+        self._stereo_capture.setVisible(active)
+        self._stereo_capture.banner.setVisible(active)
+        self._capture_actions.setVisible(active)
+        self._inspector.setVisible(not active)
+        self._view_aux.setVisible(not active)
+        self._view_split.setVisible(not active)
+
+    def _build_workbench_header(self):
+        header = QWidget()
+        header.setObjectName("workbenchHeader")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.setSpacing(12)
+        row.addWidget(QLabel("任务"))
+        self._combo_task = QComboBox()
+        self._combo_task.addItem("RGB 双目", False)
+        self._combo_task.addItem("RGB + 红外/辅助", True)
+        self._combo_task.setMinimumWidth(164)
+        self._combo_task.setMaximumWidth(260)
+        row.addWidget(self._combo_task)
+        self._workflow_tabs = QTabBar()
+        self._workflow_tabs.setObjectName("workflowTabs")
+        self._workflow_tabs.setExpanding(False)
+        for label in ("采集", "标定", "结果"):
+            self._workflow_tabs.addTab(label)
+        row.addWidget(self._workflow_tabs)
+        row.addStretch()
+        self._view_group = QButtonGroup(self)
+        self._view_split = QToolButton()
+        self._view_split.setText("并排")
+        self._view_aux = QToolButton()
+        self._view_aux.setText("红外优先")
+        self._view_aux.setToolTip("放大辅助画面，RGB 左目保留在右上角")
+        for index, button in enumerate((self._view_split, self._view_aux)):
+            button.setCheckable(True)
+            button.setMinimumHeight(30)
+            self._view_group.addButton(button, index)
+            row.addWidget(button)
+        self._view_split.setChecked(True)
+        self._view_aux.setEnabled(False)
+        return header
 
     def _create_cloud_placeholder(self) -> QWidget:
         placeholder = QWidget()
@@ -100,75 +279,108 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return placeholder
 
+    def _create_action(self, text):
+        action = QAction(self)
+        action.setText(text)
+        return action
+
     def _init_menus(self):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("文件(&F)")
 
-        self._act_config = QAction("相机配置(&C)...", self)
+        self._act_config = self._create_action("相机配置(&C)...")
         self._act_config.setShortcut(QKeySequence("Ctrl+K"))
         file_menu.addAction(self._act_config)
 
-        self._act_new_session = QAction("新建标定会话(&N)", self)
+        self._act_new_session = self._create_action("新建标定会话(&N)")
         self._act_new_session.setShortcut(QKeySequence.New)
         file_menu.addAction(self._act_new_session)
 
-        self._act_load_session = QAction("加载会话(&L)...", self)
+        self._act_load_session = self._create_action("加载会话(&L)...")
         self._act_load_session.setShortcut(QKeySequence.Open)
         file_menu.addAction(self._act_load_session)
 
         file_menu.addSeparator()
 
-        self._act_export = QAction("导出标定结果(&E)...", self)
+        self._act_export = self._create_action("导出标定结果(&E)...")
         self._act_export.setShortcut(QKeySequence("Ctrl+E"))
         self._act_export.setEnabled(False)
         file_menu.addAction(self._act_export)
 
         file_menu.addSeparator()
 
-        self._act_exit = QAction("退出(&Q)", self)
+        self._act_exit = self._create_action("退出(&Q)")
         self._act_exit.setShortcut(QKeySequence.Quit)
         file_menu.addAction(self._act_exit)
 
+        view_menu = menubar.addMenu("视图(&V)")
+        self._act_restore_previews = self._create_action("恢复已关闭预览")
+        self._act_restore_previews.setEnabled(False)
+        view_menu.addAction(self._act_restore_previews)
+
         tools_menu = menubar.addMenu("工具(&T)")
-        self._act_gen_board = QAction("生成标定板图像(&G)...", self)
+        self._act_gen_board = self._create_action("生成标定板图像(&G)...")
         tools_menu.addAction(self._act_gen_board)
-        self._act_rgb_settings = QAction("RGB 参数(&R)...", self)
+        self._act_rgb_settings = self._create_action("RGB 参数(&R)...")
         tools_menu.addAction(self._act_rgb_settings)
         tools_menu.addSeparator()
-        self._act_open_logs = QAction("打开日志目录(&L)", self)
+        self._act_open_logs = self._create_action("打开日志目录(&L)")
         tools_menu.addAction(self._act_open_logs)
+        self._act_cloud_tools = self._create_action("点云工具")
+        tools_menu.addAction(self._act_cloud_tools)
 
     def _init_toolbar(self):
         toolbar = QToolBar("主工具栏")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         toolbar.setIconSize(toolbar.iconSize())
         self.addToolBar(toolbar)
+        toolbar.setIconSize(QSize(18, 18))
+        brand = QLabel("MultiCamera")
+        brand.setStyleSheet(f"font-size:17px; font-weight:bold; color:{TEXT}; padding:0 10px;")
+        toolbar.addWidget(brand)
+        self._lbl_connections = QLabel("未连接")
+        self._lbl_connections.setMinimumWidth(118)
+        toolbar.addWidget(self._lbl_connections)
 
-        self._act_start_streams = QAction("▶  连接相机", self)
+        self._act_start_streams = self._create_action("连接相机")
+        self._act_start_streams.setIcon(standard_icon(self, QStyle.SP_MediaPlay))
         toolbar.addAction(self._act_start_streams)
 
-        self._act_stop_streams = QAction("⏹  断开相机", self)
+        self._act_stop_streams = self._create_action("断开")
+        self._act_stop_streams.setIcon(standard_icon(self, QStyle.SP_MediaStop))
         self._act_stop_streams.setEnabled(False)
         toolbar.addAction(self._act_stop_streams)
 
         toolbar.addSeparator()
 
-        self._act_config_tb = QAction("⚙  相机配置", self)
+        self._act_config_tb = self._create_action("相机配置")
+        self._act_config_tb.setIcon(standard_icon(self, QStyle.SP_FileDialogDetailedView))
         toolbar.addAction(self._act_config_tb)
 
         toolbar.addSeparator()
 
-        self._act_gen_board_tb = QAction("🖨  生成标定板", self)
-        toolbar.addAction(self._act_gen_board_tb)
+        self._act_gen_board_tb = self._create_action("生成标定板")
 
-        self._act_rgb_settings_tb = QAction("RGB 参数", self)
+        self._act_rgb_settings_tb = self._create_action("RGB 参数")
+        self._act_rgb_settings_tb.setIcon(app_icon('sliders-horizontal'))
+        self._act_rgb_settings_tb.setToolTip('同步调整左右 RGB 相机参数')
         toolbar.addAction(self._act_rgb_settings_tb)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+        self._session_button = QToolButton()
+        self._session_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._session_button.setIcon(app_icon('folder-open'))
+        self._session_button.setText("未创建会话")
+        self._session_button.setToolTip("新建采集会话")
+        toolbar.addWidget(self._session_button)
 
     def _init_statusbar(self):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
-        self._statusbar.showMessage("就绪  |  请先通过 ⚙ 相机配置 添加相机，然后点击 ▶ 连接")
+        self._statusbar.showMessage("就绪")
 
     def _connect_signals(self):
         self._act_config.triggered.connect(self._on_config)
@@ -184,6 +396,10 @@ class MainWindow(QMainWindow):
         self._act_rgb_settings.triggered.connect(self._on_rgb_settings)
         self._act_rgb_settings_tb.triggered.connect(self._on_rgb_settings)
         self._act_open_logs.triggered.connect(self._on_open_logs)
+        self._act_restore_previews.triggered.connect(self._stream_view.restore_closed_previews)
+        self._stream_view.preview_visibility_changed.connect(
+            lambda: self._act_restore_previews.setEnabled(self._stream_view.has_closed_previews)
+        )
 
         self._calib_panel.calibration_finished.connect(self._on_calib_finished)
         self._calib_panel.calibration_reset.connect(self._on_calib_reset)
@@ -193,6 +409,26 @@ class MainWindow(QMainWindow):
             self._stream_view.set_capture_sequence
         )
         self._calib_panel.images_imported.connect(self._stream_view.show_static_images)
+        self._calib_panel.aux_images_imported.connect(self._stream_view.show_multimodal_images)
+        self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
+        self._calib_panel.configure_aux_requested.connect(lambda: self._on_config(True))
+        self._calib_panel.workflow_changed.connect(self._sync_workbench_header)
+        self._calib_panel.preview_pairs_changed.connect(self._on_preview_pairs_changed)
+        self._calib_panel.log_added.connect(self._on_log_added)
+        self._calib_panel.export_requested.connect(self._on_export)
+        self._calib_panel.open_results_requested.connect(self._open_result_directory)
+        self._calib_panel.capture_started.connect(self._stream_view.end_review)
+        self._calib_panel.create_session_requested.connect(self._on_new_session)
+        self._gallery.pair_selected.connect(self._stream_view.show_review_images)
+        self._stream_view.review_changed.connect(self._on_review_changed)
+        self._stream_view.presentation_changed.connect(self._on_presentation_changed)
+        self._stream_view.comparison_visible_changed.connect(self._comparison_host.setVisible)
+        self._view_split.clicked.connect(lambda: self._stream_view.set_presentation("split"))
+        self._view_aux.clicked.connect(lambda: self._stream_view.set_presentation("aux_focus"))
+        self._combo_task.currentIndexChanged.connect(self._on_workflow_navigation)
+        self._workflow_tabs.currentChanged.connect(self._on_workflow_navigation)
+        self._session_button.clicked.connect(self._open_session_directory)
+        self._act_cloud_tools.triggered.connect(self._show_cloud_tools)
 
         self._stream_manager.camera_connected.connect(self._on_camera_connected)
         self._stream_manager.camera_disconnected.connect(
@@ -201,20 +437,184 @@ class MainWindow(QMainWindow):
 
     # ── Slots ─────────────────────────────────────────────────
 
+    @Slot(int)
+    def _on_workflow_navigation(self, index):
+        self._right_tabs.setCurrentIndex(0)
+        phase = ("capture", "calibration", "results")[self._workflow_tabs.currentIndex()]
+        self._calib_panel.show_workflow(phase, bool(self._combo_task.currentData()))
+
+    @Slot(str, bool)
+    def _sync_workbench_header(self, phase: str, multimodal: bool):
+        self._set_stereo_capture_layout(phase == "capture" and not multimodal)
+        aux = self._stream_manager.auxiliary_camera
+        label = "RGB + 声像仪 RGB" if aux is not None and aux.modality == "acoustic_rgb" else "RGB + 红外"
+        with QSignalBlocker(self._combo_task), QSignalBlocker(self._workflow_tabs):
+            generic = any(pair.left.stream_type != "rgb" for pair in self._stream_manager.stereo_pairs.values())
+            self._combo_task.setItemText(0, "双目相机组" if generic else "RGB 双目")
+            self._combo_task.setItemText(1, label)
+            self._combo_task.setCurrentIndex(1 if multimodal else 0)
+            self._workflow_tabs.setCurrentIndex({"capture": 0, "calibration": 1, "results": 2, "pointcloud": 2}[phase])
+        self._view_aux.setText("辅助优先" if aux is not None and aux.modality == "acoustic_rgb" else "红外优先")
+        self._on_presentation_changed(self._stream_view.presentation_mode)
+
+    @Slot(str)
+    def _on_presentation_changed(self, mode):
+        with QSignalBlocker(self._view_split), QSignalBlocker(self._view_aux):
+            self._view_split.setChecked(mode == "split")
+            self._view_aux.setChecked(mode == "aux_focus")
+        self._view_aux.setEnabled(self._stream_view.can_focus_aux)
+
+    @Slot(object)
+    def _on_preview_pairs_changed(self, pairs):
+        if self._stream_view.review_key:
+            current = next((p for p in pairs if p.key == self._stream_view.review_key), None)
+            if current is None or not self._stream_view.review_matches(
+                {current.left_id: current.left, current.right_id: current.right}
+            ):
+                self._stream_view.end_review()
+        self._gallery.set_pairs(pairs)
+
+    @Slot(str, bool)
+    def _on_review_changed(self, key, active):
+        if not active:
+            self._gallery.clear_selection()
+        self._lbl_review.setText(f"回看 · {key}")
+        self._lbl_review.setToolTip(key)
+        self._review_bar.setVisible(active)
+
+    @Slot(bool)
+    def _toggle_log_panel(self, expanded):
+        self._toggle_logs.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._logs_widget.setVisible(expanded)
+
+    @Slot(str)
+    def _on_log_added(self, message):
+        self._toggle_logs.setText(f"操作日志（{self._logs_widget.document().blockCount()}）")
+        self._lbl_latest_log.setText(self._lbl_latest_log.fontMetrics().elidedText(
+            message, Qt.ElideRight, max(120, self._lbl_latest_log.width()),
+        ))
+        self._lbl_latest_log.setToolTip(message)
+        if "失败" in message or "无法连接" in message:
+            self._toggle_logs.setChecked(True)
+        if self._current_session is not None:
+            name = self._current_session.name
+            self._session_button.setText(self._session_button.fontMetrics().elidedText(name, Qt.ElideMiddle, 140))
+            self._session_button.setToolTip(str(self._current_session.session_dir.resolve()))
+
+    def _update_connection_summary(self):
+        count, expected = len(self._connection_connected), len(self._connection_expected)
+        text = f"已连接 {count}/{expected} 路" if expected else (f"已连接 {count} 路" if count else "未连接")
+        self._lbl_connections.setText(text)
+        color = SUCCESS if count and (not expected or count == expected) else (WARNING if expected else TEXT_DIM)
+        self._lbl_connections.setStyleSheet(f"color:{color};")
+
     @Slot()
-    def _on_config(self):
+    def _open_session_directory(self):
+        if self._current_session is None:
+            self._on_new_session()
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_session.session_dir.resolve())))
+
+    @Slot()
+    def _open_result_directory(self):
+        directory = self._calib_panel.result_directory
+        if directory is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    @Slot()
+    def _show_cloud_tools(self):
+        self._right_tabs.setCurrentIndex(0)
+        self._calib_panel.show_workflow("pointcloud")
+
+    @Slot()
+    def _on_config(self, auxiliary: bool = False):
         logger.info("Open camera configuration dialog")
+        if self._calib_panel.has_active_operations:
+            QMessageBox.information(self, "配置暂不可修改", "请先停止自动采集，并等待白平衡准备、导入、保存或标定任务完成。")
+            return
+        was_streaming = self._act_stop_streams.isEnabled()
+        preview_auxiliary = auxiliary or self._calib_panel._active_step == 2
         dlg = ConfigDialog(
             self._stream_manager, self._board, self._camera_model, parent=self
         )
+        old_pairs = dict(self._stream_manager.stereo_pairs)
+        old_aux = self._stream_manager.auxiliary_camera
+        impact = None
+
+        def confirm(board, model, pairs, aux):
+            nonlocal impact
+            impact = configuration_impact(self._board, board, self._camera_model, model,
+                                          old_pairs, pairs, old_aux, aux)
+            if not self._calib_panel.has_affected_work(impact):
+                return True
+            effects = []
+            if impact.reset_stereo:
+                effects.append("全部双目采图缓存和标定结果（板规格或镜头模型改变）")
+            elif impact.changed_pairs:
+                effects.append("以下组的采图缓存和标定结果：" + "、".join(sorted(impact.changed_pairs)))
+            if impact.reset_aux:
+                effects.append("辅助相机配对缓存和融合标定结果")
+            approved = QMessageBox.question(
+                self, "确认配置变更影响", "本次修改将失效：\n" + "\n".join(effects) +
+                "\n\n未受影响的相机组将保留。磁盘历史图片和文件不会删除。是否应用？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) == QMessageBox.Yes
+            if not approved:
+                logger.info("Configuration rejected before apply")
+            return approved
+
+        dlg.before_apply = confirm
+        if auxiliary:
+            dlg.focus_auxiliary()
         if dlg.exec():
+            if impact is None:
+                return
             self._board = dlg.board
             self._camera_model = CameraModel(dlg.camera_model)
-            self._stream_view.clear_all()
-            self._stream_view.update_board(self._board)
-            self._calib_panel.update_board(self._board)
-            self._calib_panel.set_camera_model(self._camera_model)
-            self._calib_panel.refresh_pairs()
+            if impact.streams_changed or impact.reset_stereo:
+                affected = set(impact.camera_ids)
+                if impact.reset_aux:
+                    affected.update(a.camera_id for a in (old_aux, self._stream_manager.auxiliary_camera) if a)
+                trackers = {cid: t for cid, t in self._stream_view._trackers.items()
+                            if cid not in affected}
+                mode_trackers = {mode: {cid: t for cid, t in items.items() if cid not in affected}
+                                 for mode, items in self._stream_view._mode_trackers.items()}
+                connection_state = dict(self._stream_view._connection_state)
+                self._stream_view.clear_all()
+                if not impact.streams_changed:
+                    self._stream_view._connection_state = connection_state
+                if impact.reset_stereo:
+                    self._stream_view.update_board(self._board)
+                else:
+                    self._stream_view._trackers = trackers
+                    self._stream_view._mode_trackers = mode_trackers
+            self._calib_panel.apply_configuration(self._board, self._camera_model, impact)
+            logger.info("Configuration impact applied: reset_stereo=%s pairs=%s reset_aux=%s reconnect=%s",
+                        impact.reset_stereo, sorted(impact.changed_pairs), impact.reset_aux, impact.streams_changed)
+            self._rig = self._calib_panel.rig
+            self._act_export.setEnabled(self._rig is not None)
+            if impact.streams_changed:
+                self._act_start_streams.setEnabled(True)
+                self._act_stop_streams.setEnabled(False)
+                self._connection_expected.clear()
+                self._connection_connected.clear()
+                self._connection_failures_shown.clear()
+                self._update_connection_summary()
+            if impact.reset_stereo and not impact.streams_changed:
+                self._stream_view.set_multimodal_mode(
+                    self._calib_panel._active_step == 2, self._calib_panel._rgb_left_camera_id(),
+                    force_refresh=True,
+                )
+            if self._current_session is not None and (impact.streams_changed or impact.reset_stereo):
+                try:
+                    self._current_session.record_configuration(
+                        self._board, list(self._stream_manager.stereo_pairs.values()),
+                        self._stream_manager.auxiliary_camera, camera_model=self._camera_model.value,
+                    )
+                except OSError as exc:
+                    self._calib_panel.append_log(f"配置已应用，但会话配置记录失败：{exc}")
+            if preview_auxiliary:
+                self._calib_panel._activate_step(2)
             model_name = "针孔" if self._camera_model == CameraModel.PINHOLE else "鱼眼"
             logger.info(
                 "Configuration accepted: pairs=%d aux=%s model=%s board=%s",
@@ -226,6 +626,19 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage(
                 f"✓  已配置 {len(self._stream_manager.stereo_pairs)} 组相机 [{model_name}模型]"
             )
+            if was_streaming and impact.streams_changed:
+                self._on_start_streams(preserve_trackers=True)
+
+    @Slot(bool)
+    def _on_preview_mode_changed(self, multimodal: bool):
+        rgb_left_id = self._calib_panel._rgb_left_camera_id()
+        self._stream_view.set_multimodal_mode(multimodal, rgb_left_id)
+        if multimodal:
+            aux = self._stream_manager.auxiliary_camera
+            aux_label = aux.camera_id if aux is not None else "未配置红外/辅助相机"
+            self._statusbar.showMessage(
+                f"融合标定预览：RGB 左目 {rgb_left_id or '未配置'} + {aux_label}"
+            )
 
     @Slot()
     def _on_new_session(self):
@@ -234,12 +647,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先配置相机")
             return
         logger.info("Create calibration session: pairs=%d", len(pairs))
-        self._current_session = self._session_manager.create_session(
-            self._board,
-            pairs,
-            auxiliary=self._stream_manager.auxiliary_camera,
-            name="calib",
-        )
+        try:
+            session = self._session_manager.create_session(
+                self._board, pairs, auxiliary=self._stream_manager.auxiliary_camera, name="calib",
+            )
+        except Exception as exc:
+            logger.exception("Create calibration session failed")
+            self._calib_panel.append_log(f"创建会话失败，未采图：{exc}")
+            QMessageBox.warning(self, "创建会话失败", str(exc).splitlines()[0])
+            return
+        self._current_session = session
         self._calib_panel.set_session(self._current_session)
         self._statusbar.showMessage(f"✓  新建会话: {self._current_session.name}")
 
@@ -263,37 +680,40 @@ class MainWindow(QMainWindow):
                 "当前没有可导出的标定结果。请先完成双目标定或多模态标定。",
             )
             return
-        path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "导出标定结果",
-            "calibration_result.json",
-            "JSON (*.json);;OpenCV 完整 YAML (*.yml *.yaml);;"
-            "OpenCV 标准 Stereo YAML (*.yml *.yaml);;"
-            "Kalibr camchain YAML (*.yaml *.yml)",
+        dialog = ExportDialog(self._rig, self)
+        if not dialog.exec():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存所选标定结果", dialog.suggested_filename, dialog.file_filter,
         )
         if path:
-            logger.info("Export calibration: path=%s filter=%s", path, selected_filter)
-            from ..io.export import (
-                export_rig_json,
-                export_rig_kalibr_yaml,
-                export_rig_opencv_standard_yaml,
-                export_rig_opencv_yaml,
-            )
-
-            if "Kalibr" in selected_filter:
-                export_rig_kalibr_yaml(self._rig, path)
-            elif "OpenCV 标准" in selected_filter:
-                export_rig_opencv_standard_yaml(self._rig, path)
-            elif "OpenCV" in selected_filter or path.endswith((".yml", ".yaml")):
-                export_rig_opencv_yaml(self._rig, path)
-            else:
-                export_rig_json(self._rig, path)
-            self._statusbar.showMessage(f"✓  已导出: {path}")
+            target = Path(path)
+            if not target.suffix:
+                target = target.with_suffix(dialog.file_suffix)
+                if target.exists() and QMessageBox.question(
+                    self, "确认覆盖文件", f"文件已存在：{target}\n是否替换？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
+                    return
+            try:
+                exported = dialog.export_to(target)
+            except Exception as exc:
+                logger.exception("Manual calibration export failed: path=%s format=%s", path, dialog.format_key)
+                message = f"导出失败：{str(exc).splitlines()[0]}。已有文件未被替换。"
+                self._calib_panel.append_log(message)
+                QMessageBox.warning(self, "导出失败", message)
+                return
+            rig = dialog.selected_rig()
+            logger.info("Export calibration: path=%s format=%s pairs=%s aux=%s", exported,
+                        dialog.format_key, list(rig.pairs), list(rig.aux_cameras))
+            self._statusbar.showMessage(f"✓  已导出: {exported}")
+            self._calib_panel.append_log(f"已导出 {dialog.format_key}：{exported}")
 
     @Slot(str)
     def _on_camera_connected(self, cid: str):
         logger.info("Camera connected: %s", cid)
         self._connection_connected.add(cid)
+        self._update_connection_summary()
         total = len(self._connection_expected)
         connected = len(self._connection_connected)
         suffix = f"（{connected}/{total}）" if total else ""
@@ -304,6 +724,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_camera_disconnected(self, cid: str, reason: str):
+        self._connection_connected.discard(cid)
+        self._update_connection_summary()
         url = self._stream_manager.camera_url(cid)
         logger.warning("Camera disconnected: %s url=%s reason=%s", cid, url, reason)
         lifecycle_reasons = {"已断开", "已移除", "重新连接"}
@@ -321,7 +743,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "相机连接失败", message)
 
     @Slot()
-    def _on_start_streams(self):
+    def _on_start_streams(self, *, preserve_trackers: bool = False):
         logger.info("User requested start streams")
         camera_urls = self._stream_manager.configured_camera_urls()
         if not camera_urls:
@@ -332,10 +754,11 @@ class MainWindow(QMainWindow):
         self._connection_expected = set(camera_urls.keys())
         self._connection_connected.clear()
         self._connection_failures_shown.clear()
-        self._stream_view.show_connecting(camera_urls)
+        self._stream_view.show_connecting(camera_urls, preserve_trackers=preserve_trackers)
         self._stream_manager.start_all()
         self._act_start_streams.setEnabled(False)
         self._act_stop_streams.setEnabled(True)
+        self._update_connection_summary()
         self._calib_panel.refresh_pairs()
         self._statusbar.showMessage(f"相机连接中... 共 {len(camera_urls)} 路")
         self._calib_panel.append_log(
@@ -351,6 +774,7 @@ class MainWindow(QMainWindow):
         self._act_stop_streams.setEnabled(False)
         self._connection_expected.clear()
         self._connection_connected.clear()
+        self._update_connection_summary()
         self._connection_failures_shown.clear()
         self._statusbar.showMessage("相机已断开")
 
@@ -369,6 +793,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_rgb_settings(self):
+        if self._calib_panel._white_balance_guard.busy:
+            QMessageBox.information(self, "RGB 参数", "请等待白平衡准备完成或停止连接后再修改参数。")
+            return
         url = self._default_rgb_settings_url()
         urls = self._rgb_settings_urls()
         logger.info("Open RGB settings dialog: url=%s sync_urls=%s", url, ",".join(urls))
@@ -378,6 +805,7 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_rgb_settings_applied(self, urls: list):
+        self._calib_panel._white_balance_guard.invalidate()
         matched: list[str] = []
         applied_urls = [str(url) for url in urls if str(url).strip()]
         for url in applied_urls:
@@ -416,6 +844,7 @@ class MainWindow(QMainWindow):
             rig.reference_camera,
         )
         self._rig = rig
+        self._calib_panel.set_result_model(rig)
         self._act_export.setEnabled(True)
         try:
             if self._current_session is None:
@@ -431,10 +860,12 @@ class MainWindow(QMainWindow):
             logger.exception("Automatic calibration result save failed")
             text = f"标定计算完成，但自动保存失败：{exc}。可通过“导出标定结果”另存。"
             self._statusbar.showMessage(text)
+            self._calib_panel.set_result_storage(None, errors=[str(exc)])
             self._calib_panel.append_log(text)
             QMessageBox.warning(self, "标定文件保存失败", text)
             return
         directory = saved[0].parent.resolve()
+        self._calib_panel.set_result_storage(directory, saved, errors)
         text = f"标定完成，已保存 {len(saved)} 个文件：{directory}"
         self._calib_panel.append_log(text)
         for path in saved:
@@ -449,6 +880,7 @@ class MainWindow(QMainWindow):
     def _on_calib_reset(self):
         logger.info("Calibration state reset")
         self._rig = None
+        self._calib_panel.set_result_model(None)
         self._act_export.setEnabled(False)
         self._statusbar.showMessage("标定数据或策略已更新，请重新标定后再导出")
 
@@ -466,6 +898,10 @@ class MainWindow(QMainWindow):
         self._right_tabs.setCurrentIndex(self._cloud_tab_index)
 
     def closeEvent(self, event):
+        if not self._calib_panel._white_balance_guard.shutdown():
+            self._statusbar.showMessage("正在取消白平衡准备，请稍后再次关闭窗口")
+            event.ignore()
+            return
         self._stream_manager.stop_all()
         super().closeEvent(event)
 

@@ -14,22 +14,29 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QKeySequence,
+    QAction,
     QPainter,
     QPen,
     QPolygonF,
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..opencv_unicode_text import TextPainter
+from ..theme import (BG_DARK, BG_MID, BORDER, TEXT, TEXT_DIM, TEXT_HINT, ACCENT, PRIMARY,
+                     SUCCESS, WARNING, standard_icon, app_icon)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -53,17 +60,17 @@ TILT_LABELS = {
     BoardTilt.TILT_DOWN: "下倾",
 }
 
-# 与视场分块一致：行≈成像距离感（上远下近），列=横向，符合 OpenCV / 工业双目标定常见叙述
+# Image position is independent of physical board distance.
 STEREO_ZONE_LABELS = {
-    (0, 0): "远距-左",
-    (0, 1): "远距-中",
-    (0, 2): "远距-右",
-    (1, 0): "中距-左",
-    (1, 1): "中距-中",
-    (1, 2): "中距-右",
-    (2, 0): "近距-左",
-    (2, 1): "近距-中",
-    (2, 2): "近距-右",
+    (0, 0): "画面左上",
+    (0, 1): "画面上方",
+    (0, 2): "画面右上",
+    (1, 0): "画面左侧",
+    (1, 1): "画面中央",
+    (1, 2): "画面右侧",
+    (2, 0): "画面左下",
+    (2, 1): "画面下方",
+    (2, 2): "画面右下",
 }
 
 
@@ -96,7 +103,7 @@ class CaptureTarget:
         return f"{zone}，{TILT_LABELS[self.tilt]}"
 
 
-# 中距-中优先（共视大、易同步），再十字扩展，四角收尾 — 与 ZED/ROS/OC 文档里「先中后外」习惯一致
+# Bootstrap plan: centre, cross, corners, then varied tilts.
 _STEREO_NINE_FRONTAL: Tuple[Tuple[int, int], ...] = (
     (1, 1),
     (1, 0),
@@ -111,7 +118,7 @@ _STEREO_NINE_FRONTAL: Tuple[Tuple[int, int], ...] = (
 
 
 def build_default_sequence() -> List[CaptureTarget]:
-    """业界常见立体标定 ChArUco 采图序：多距×横向共视 + 中距倾角 + 边距大倾角（共 18 步）。"""
+    """Heuristic bootstrap plan, not measured pose coverage or optimal design."""
     seq: List[CaptureTarget] = []
 
     for r, c in _STEREO_NINE_FRONTAL:
@@ -368,7 +375,7 @@ def paint_board_pose_schematic(
     p.drawLine(int(cx), int(board_zone_bot + 2), int(cx), int(board_zone_top + 4))
 
     # camera body
-    cam_y = iy + ih - cam_zone_h * 0.65
+    cam_y = min(iy + ih - cam_zone_h * 0.65, iy + ih - 24)
     cam_w = min(44.0, iw * 0.4)
     p.setPen(QPen(QColor("#6ecff6"), 1.5))
     p.setBrush(QBrush(QColor("#1a3a52")))
@@ -542,7 +549,7 @@ def _draw_board_grid(img: np.ndarray, quad: np.ndarray, cols: int, rows: int):
 #  Qt Widget — visual sequence panel (sidebar)
 # ═══════════════════════════════════════════════════════════════
 
-_ROW_LABELS = ("远", "中", "近")
+_ROW_LABELS = ("上", "中", "下")
 _COL_LABELS = ("左", "中", "右")
 
 
@@ -638,15 +645,19 @@ class _StepDots(QWidget):
 class _LargeGuideDiagram(QWidget):
     """Prominent FOV + zone + tilt illustration (mature calib apps style)."""
 
+    zone_selected = Signal(int, int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._target: Optional[CaptureTarget] = None
         self._step_index = 0
         self._total = 0
         self._finished = False
+        self._targets = []
+        self.setMouseTracking(True)
         self.setMinimumHeight(220)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        self.setStyleSheet("background: #0a1628; border-radius: 8px;")
+        self.setStyleSheet(f"background:{BG_DARK};")
 
     def set_guide(
         self,
@@ -661,12 +672,51 @@ class _LargeGuideDiagram(QWidget):
         self._finished = finished
         self.update()
 
+    @property
+    def completion_title(self):
+        done = sum(t.status == CaptureStatus.DONE for t in self._targets)
+        return '采图计划已完成' if done == self._total else '引导已浏览完'
+
+    def grid_rect(self):
+        pose_width = max(100., (self.width() - 8) * .38)
+        width = max(80., self.width() - pose_width - 42)
+        available = max(1., self.height() - 56)
+        height = min(width, available - 4)
+        return QRectF(30., 46. + (available - height) / 2., width, height)
+
+    def zone_at(self, point):
+        rect = self.grid_rect()
+        if self._target is None or not rect.contains(point):
+            return None
+        return min(2, int((point.y() - rect.y()) / (rect.height() / 3))), min(
+            2, int((point.x() - rect.x()) / (rect.width() / 3)))
+
+    def mousePressEvent(self, event):
+        zone = self.zone_at(event.position())
+        if event.button() == Qt.LeftButton and zone is not None:
+            self.zone_selected.emit(*zone)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        zone = self.zone_at(event.position())
+        self.setCursor(Qt.PointingHandCursor if zone else Qt.ArrowCursor)
+        if zone is not None:
+            targets = [t for t in self._targets if (t.zone_row, t.zone_col) == zone]
+            done = sum(t.status == CaptureStatus.DONE for t in targets)
+            self.setToolTip(f'{STEREO_ZONE_LABELS[zone]} · 已采 {done}/{len(targets)}\n'
+                            '选择该区域待采姿态；距离为计划提示，并非实时测距')
+        else:
+            self.setToolTip(self.accessibleName() + '\n记录状态不代表实际姿态已自动验证')
+        super().mouseMoveEvent(event)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor("#0a1525"))
+        p.fillRect(0, 0, w, h, QColor(BG_DARK))
 
         if self._finished and self._target is None:
             p.setPen(QColor("#52b788"))
@@ -674,34 +724,36 @@ class _LargeGuideDiagram(QWidget):
             f_done.setPixelSize(18)
             f_done.setBold(True)
             p.setFont(f_done)
-            p.drawText(QRect(0, h // 2 - 30, w, 30), Qt.AlignCenter, "采图已完成")
+            done = sum(t.status == CaptureStatus.DONE for t in self._targets)
+            skipped = sum(t.status == CaptureStatus.SKIPPED for t in self._targets)
+            p.drawText(QRect(0, h // 2 - 30, w, 30), Qt.AlignCenter, self.completion_title)
             f_sub = QFont()
             f_sub.setPixelSize(11)
             p.setFont(f_sub)
-            p.setPen(QColor("#8da6c4"))
+            p.setPen(QColor(TEXT_DIM))
             p.drawText(
                 QRect(0, h // 2 + 4, w, 36), Qt.AlignCenter,
-                "可补拍或进入「双目标定」  ·  点 ← 回到任一步",
+                f"已采 {done} · 跳过 {skipped} · 可继续补拍",
             )
             return
 
         if self._target is None:
-            p.setPen(QColor("#657786"))
+            p.setPen(QColor(TEXT_HINT))
             p.drawText(QRect(0, h // 2 - 10, w, 24), Qt.AlignCenter, "无引导数据")
             return
 
         t = self._target
         step_text = f"{self._step_index + 1}/{self._total}"
         label_text = t.label
-        if t.tilt == BoardTilt.FRONT:
-            hint_text = "共视整板 · 板面平行像面 · 无运动糊"
-        else:
-            hint_text = "共视 · 侧倾 20°–40° · 角点可检"
+        status, status_color = {
+            CaptureStatus.PENDING: ('待采', ACCENT), CaptureStatus.DONE: ('已采', SUCCESS),
+            CaptureStatus.SKIPPED: ('已跳过', WARNING),
+        }[t.status]
 
         # ── header: badge | label | hint ──
         hdr_h = 28
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor(20, 40, 65, 200)))
+        p.setBrush(QBrush(QColor(BG_MID)))
         p.drawRoundedRect(0, 0, w, hdr_h, 8, 8)
 
         from PySide6.QtGui import QFontMetrics
@@ -712,7 +764,7 @@ class _LargeGuideDiagram(QWidget):
         f_badge.setBold(True)
         p.setFont(f_badge)
         badge_w = QFontMetrics(f_badge).horizontalAdvance(step_text) + 14
-        p.setBrush(QBrush(QColor("#0077b6")))
+        p.setBrush(QBrush(QColor(PRIMARY)))
         p.drawRoundedRect(6, 4, badge_w, hdr_h - 8, 4, 4)
         p.setPen(QColor("#ffffff"))
         p.drawText(QRect(6, 4, badge_w, hdr_h - 8), Qt.AlignCenter, step_text)
@@ -722,48 +774,45 @@ class _LargeGuideDiagram(QWidget):
         f_lbl.setPixelSize(13)
         f_lbl.setBold(True)
         p.setFont(f_lbl)
-        p.setPen(QColor("#e0f0ff"))
+        p.setPen(QColor(TEXT))
         lbl_x = 6 + badge_w + 8
+        status_width = 46
+        label_text = QFontMetrics(f_lbl).elidedText(label_text, Qt.ElideRight, max(1, w - lbl_x - status_width - 8))
         lbl_w = QFontMetrics(f_lbl).horizontalAdvance(label_text)
         p.drawText(QRect(lbl_x, 0, lbl_w + 4, hdr_h), Qt.AlignVCenter, label_text)
 
-        # hint — fill remaining space
+        # Keep record status visible even when the title is elided.
         f_hint = QFont()
         f_hint.setPixelSize(10)
         p.setFont(f_hint)
-        p.setPen(QColor("#6a90b0"))
-        hint_x = lbl_x + lbl_w + 10
-        p.drawText(QRect(hint_x, 0, w - hint_x - 4, hdr_h), Qt.AlignVCenter, hint_text)
+        p.setPen(QColor(status_color))
+        p.drawText(QRect(w - status_width - 8, 0, status_width, hdr_h),
+                   Qt.AlignRight | Qt.AlignVCenter, status)
 
         # ── content area: left = FOV grid, right = board pose ──
-        top_y = hdr_h + 4
-        avail_h = float(h - top_y - 4)
+        top_y = hdr_h + 18
+        avail_h = float(h - top_y - 10)
         avail_w = float(w - 8)
 
         # right pose panel: 38% width
-        po_w = max(140.0, avail_w * 0.38)
+        po_w = max(100.0, avail_w * 0.38)
         pose_x = int(w - po_w - 4)
         pose_rect = QRect(pose_x, top_y, int(po_w), int(avail_h))
-        p.setPen(QPen(QColor("#263a50"), 1))
-        p.setBrush(QBrush(QColor(8, 18, 32, 180)))
-        p.drawRoundedRect(pose_rect, 6, 6)
+        p.setPen(QPen(QColor(BORDER), 1))
+        p.drawLine(pose_x - 2, top_y, pose_x - 2, h - 10)
         p.setBrush(Qt.NoBrush)
         paint_board_pose_schematic(p, pose_rect, t.tilt, with_reference=True)
 
         # left FOV grid
-        grid_left = 30.0
-        grid_right = float(pose_x - 8)
-        gw = max(80.0, grid_right - grid_left)
-        gh = min(gw, avail_h - 4)
-        gx0 = grid_left
-        gy0 = float(top_y) + (avail_h - gh) / 2.0
+        grid = self.grid_rect()
+        gx0, gy0, gw, gh = grid.x(), grid.y(), grid.width(), grid.height()
         cw, ch = gw / 3.0, gh / 3.0
 
         # row/col labels
         f_ax = QFont()
         f_ax.setPixelSize(10)
         p.setFont(f_ax)
-        p.setPen(QColor("#5c7a9a"))
+        p.setPen(QColor(TEXT_HINT))
         for j, name in enumerate(_COL_LABELS):
             cx = gx0 + j * cw + cw / 2
             p.drawText(
@@ -778,7 +827,7 @@ class _LargeGuideDiagram(QWidget):
             )
 
         # grid frame
-        p.setPen(QPen(QColor("#3d5a7a"), 1.5))
+        p.setPen(QPen(QColor(BORDER), 1.5))
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(int(gx0) - 1, int(gy0) - 1, int(gw) + 2, int(gh) + 2, 4, 4)
         p.setPen(QPen(QColor(255, 255, 255, 45), 1))
@@ -788,17 +837,65 @@ class _LargeGuideDiagram(QWidget):
             y = int(gy0 + k * ch)
             p.drawLine(int(gx0), y, int(gx0 + gw), y)
 
+        # Counts represent recorded guide steps, not verified pose coverage.
+        for row in range(3):
+            for col in range(3):
+                done = sum(target.status == CaptureStatus.DONE for target in self._targets
+                           if (target.zone_row, target.zone_col) == (row, col))
+                if done:
+                    p.setPen(QColor(SUCCESS))
+                    p.drawText(QRect(int(gx0 + col * cw + 4), int(gy0 + row * ch + 2),
+                                     int(cw - 8), 14), Qt.AlignRight, str(done))
+
         # target cell
         zx = int(gx0 + t.zone_col * cw)
         zy = int(gy0 + t.zone_row * ch)
-        p.setBrush(QBrush(QColor(0, 200, 255, 90)))
-        p.setPen(QPen(QColor(0, 255, 220), 2.5))
+        highlight = QColor(PRIMARY)
+        highlight.setAlpha(100)
+        p.setBrush(QBrush(highlight))
+        p.setPen(QPen(QColor(ACCENT), 2.5))
         p.drawRect(zx + 1, zy + 1, int(cw) - 2, int(ch) - 2)
         zcx = zx + int(cw) / 2.0
         zcy = zy + int(ch) / 2.0
         paint_board_tilt_symbol(
             p, zcx, zcy, float(min(cw, ch) * 0.34), t.tilt, line_scale=2.0,
         )
+
+        count = len(self._targets)
+        if count:
+            segment = (w - 2 * (count - 1)) / count
+            for index, target in enumerate(self._targets):
+                color = SUCCESS if target.status == CaptureStatus.DONE else WARNING if target.status == CaptureStatus.SKIPPED else BORDER
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(ACCENT if index == self._step_index else color))
+                p.drawRoundedRect(QRectF(index * (segment + 2), h - 4, segment, 3), 1, 1)
+
+
+class _ExpandedGuideDialog(QDialog):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.setWindowTitle('采图引导')
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.resize(760, 520)
+        self.setMinimumSize(620, 400)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+        self.canvas = _LargeGuideDiagram()
+        self.canvas.zone_selected.connect(owner._on_zone_selected)
+        layout.addWidget(self.canvas, 1)
+        navigation = QHBoxLayout()
+        self.buttons = []
+        for name, text, callback in (('chevron-left', '上一姿态', owner._on_prev),
+                                     ('chevron-right', '下一姿态', owner._on_next),
+                                     ('scan-line', '下个待采', owner._on_next_pending)):
+            button = QPushButton(text)
+            button.setIcon(app_icon(name))
+            button.setMinimumHeight(36)
+            button.clicked.connect(callback)
+            navigation.addWidget(button)
+            self.buttons.append(button)
+        layout.addLayout(navigation)
 
 
 class CaptureSequenceWidget(QFrame):
@@ -812,43 +909,69 @@ class CaptureSequenceWidget(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameStyle(QFrame.StyledPanel)
-        self.setStyleSheet(
-            "CaptureSequenceWidget { background: #0d1b2a; border-radius: 8px; "
-            "border: 1px solid #1b263b; }"
-        )
+        self.setStyleSheet(f"CaptureSequenceWidget {{background:transparent; border-top:1px solid {BORDER};}}")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
-        outer.setSpacing(4)
+        outer.setSpacing(8)
 
         # ── header: title + progress ──
         header = QHBoxLayout()
         header.setSpacing(6)
         self._title_lbl = QLabel("采图引导")
         self._title_lbl.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #e0e1dd;"
+            f"font-weight:bold; font-size:13px; color:{TEXT};"
         )
         header.addWidget(self._title_lbl)
         header.addStretch()
         self._progress_lbl = QLabel("0 / 0")
-        self._progress_lbl.setStyleSheet("font-size: 12px; color: #adb5bd;")
+        self._progress_lbl.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
         header.addWidget(self._progress_lbl)
+        self._detail_dialog = None
+        self._btn_expand = QToolButton()
+        self._btn_expand.setIcon(app_icon('maximize-2'))
+        self._btn_expand.setFixedSize(24, 24)
+        self._btn_expand.setToolTip('展开采图引导')
+        self._btn_expand.setAccessibleName('展开采图引导')
+        self._btn_expand.clicked.connect(self._open_expanded_guide)
+        header.addWidget(self._btn_expand)
+        self._step_menu = QMenu(self)
+        self._step_actions = []
+        self._btn_steps = QToolButton()
+        self._btn_steps.setIcon(app_icon('list-checks'))
+        self._btn_steps.setFixedSize(24, 20)
+        self._btn_steps.setStyleSheet('padding:0; border:0;')
+        self._btn_steps.setToolTip('姿态清单：查看记录状态并跳转')
+        self._btn_steps.setAccessibleName('选择采图姿态')
+        self._btn_steps.setPopupMode(QToolButton.InstantPopup)
+        self._btn_steps.setMenu(self._step_menu)
+        header.addWidget(self._btn_steps)
         outer.addLayout(header)
 
         # ── primary: large diagram (contains step#, zone, pose, caption) ──
         self._large_guide = _LargeGuideDiagram()
+        self._large_guide.zone_selected.connect(self._on_zone_selected)
         outer.addWidget(self._large_guide)
 
         # ── compact nav: ← / → / skip ──
         nav = QHBoxLayout()
         nav.setSpacing(4)
-        self._btn_prev = QPushButton("←")
-        self._btn_next = QPushButton("→")
+        self._btn_prev = QPushButton()
+        self._btn_prev.setIcon(standard_icon(self, QStyle.SP_ArrowLeft))
+        self._btn_prev.setToolTip("上一个采图姿态")
+        self._btn_prev.setAccessibleName("上一个采图姿态")
+        self._btn_next = QPushButton()
+        self._btn_next.setIcon(standard_icon(self, QStyle.SP_ArrowRight))
+        self._btn_next.setToolTip("查看下一姿态，不计为已采")
+        self._btn_next.setAccessibleName("下一个采图姿态")
         self._btn_skip = QPushButton("跳过")
+        self._btn_skip.setIcon(app_icon('skip-forward'))
+        self._btn_skip.setToolTip('将当前姿态标记为跳过，不新增采图记录')
         for b in (self._btn_prev, self._btn_next, self._btn_skip):
-            b.setFixedHeight(26)
+            b.setFixedHeight(32)
+            b.setStyleSheet("padding:2px 4px;")
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._btn_skip.setMaximumWidth(60)
+        self._btn_skip.setMaximumWidth(76)
         self._btn_prev.clicked.connect(self._on_prev)
         self._btn_next.clicked.connect(self._on_next)
         self._btn_skip.clicked.connect(self._on_skip)
@@ -872,9 +995,72 @@ class CaptureSequenceWidget(QFrame):
         sc_r.setContext(Qt.WidgetWithChildrenShortcut)
         sc_r.activated.connect(self._on_next)
 
+    def set_compact_mode(self, compact: bool):
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed if compact else QSizePolicy.Preferred)
+        self.layout().setAlignment(Qt.AlignTop)
+        self._large_guide.setMinimumHeight(200 if compact else 260)
+        self._large_guide.setMaximumHeight(204 if compact else 16777215)
+        self.layout().setContentsMargins(0 if compact else 8, 6,
+                                        0 if compact else 8, 6)
+        self._progress_lbl.setVisible(not compact)
+        self._dots.setVisible(not compact)
+
+    def set_diagram_height(self, height):
+        self._large_guide.setMinimumHeight(height)
+        self._large_guide.setMaximumHeight(height + 4)
+
+    def _open_expanded_guide(self):
+        if self._detail_dialog is None:
+            self._detail_dialog = _ExpandedGuideDialog(self)
+            self._detail_dialog.finished.connect(self._on_detail_closed)
+        self._update_display()
+        self._detail_dialog.show()
+        self._detail_dialog.raise_()
+        self._detail_dialog.activateWindow()
+
+    def _on_detail_closed(self):
+        self._detail_dialog = None
+
+    def hideEvent(self, event):
+        if self._detail_dialog is not None:
+            self._detail_dialog.close()
+        super().hideEvent(event)
+
     def set_sequence(self, seq: CaptureSequence):
         self._sequence = seq
+        self._step_menu.clear()
+        self._step_actions = []
+        for index in range(seq.total):
+            action = QAction(self._step_menu)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, i=index: self._on_dot_clicked(i))
+            self._step_menu.addAction(action)
+            self._step_actions.append(action)
+        self._step_menu.addSeparator()
+        self._pending_action = self._step_menu.addAction('下个待采姿态')
+        self._pending_action.setIcon(app_icon('scan-line'))
+        self._pending_action.triggered.connect(self._on_next_pending)
         self._update_display()
+
+    def _on_next_pending(self):
+        seq = self._sequence
+        if seq is None:
+            return
+        for offset in range(1, seq.total + 1):
+            index = (seq.current_index + offset) % seq.total
+            if seq.targets[index].status == CaptureStatus.PENDING:
+                self._on_dot_clicked(index)
+                return
+
+    def _on_zone_selected(self, row, col):
+        if self._sequence is None:
+            return
+        candidates = [i for i, target in enumerate(self._sequence.targets)
+                      if (target.zone_row, target.zone_col) == (row, col)]
+        if candidates:
+            index = next((i for i in candidates if self._sequence.targets[i].status == CaptureStatus.PENDING),
+                         candidates[0])
+            self._on_dot_clicked(index)
 
     def refresh(self):
         if self._sequence is None:
@@ -916,11 +1102,29 @@ class CaptureSequenceWidget(QFrame):
         done = self._sequence.done_count
         total = self._sequence.total
         self._progress_lbl.setText(f"{done}/{total}")
+        skipped = sum(t.status == CaptureStatus.SKIPPED for t in self._sequence.targets)
+        self._title_lbl.setText(f'采图引导 · 已采 {done}')
+        summary = f'已采 {done} · 跳过 {skipped} · 待采 {total - done - skipped}'
+        self._btn_steps.setToolTip(summary + '\n姿态清单：查看记录状态并跳转')
+        self._large_guide._targets = self._sequence.targets
+        names = {CaptureStatus.DONE: ('已采', 'check', SUCCESS),
+                 CaptureStatus.SKIPPED: ('跳过', 'circle-minus', WARNING),
+                 CaptureStatus.PENDING: ('待采', 'scan-line', TEXT_DIM)}
+        for index, (target, action) in enumerate(zip(self._sequence.targets, self._step_actions)):
+            label, icon, color = names[target.status]
+            current = ' · 当前' if index == self._sequence.current_index else ''
+            action.setText(f'{index + 1:02d}  {target.label}  · {label}{current}')
+            action.setIcon(app_icon(icon, color))
+            action.setChecked(index == self._sequence.current_index)
+        self._pending_action.setEnabled(any(t.status == CaptureStatus.PENDING for t in self._sequence.targets))
 
         idx = self._sequence.current_index
         self._dots.set_data(self._sequence.targets, idx)
 
         cur = self._sequence.current
+        accessible = f'{idx + 1}/{total}，{cur.label}；{summary}' if cur is not None else f'引导已浏览完；{summary}'
+        self._large_guide.setAccessibleName(accessible)
+        self._large_guide.setToolTip(accessible + '\n记录状态不代表姿态覆盖已自动验证')
         if cur is not None:
             self._large_guide.set_guide(cur, idx, total, False)
         elif self._sequence.finished:
@@ -932,3 +1136,12 @@ class CaptureSequenceWidget(QFrame):
         self._btn_prev.setEnabled(n > 0 and idx > 0)
         self._btn_next.setEnabled(n > 0 and idx < n)
         self._btn_skip.setEnabled(n > 0 and idx < n)
+        if self._detail_dialog is not None:
+            detail = self._detail_dialog
+            detail.canvas._targets = self._sequence.targets
+            detail.canvas.set_guide(cur, idx, total, self._sequence.finished)
+            detail.canvas.setAccessibleName(accessible)
+            detail.canvas.setToolTip(self._large_guide.toolTip())
+            detail.buttons[0].setEnabled(self._btn_prev.isEnabled())
+            detail.buttons[1].setEnabled(self._btn_next.isEnabled())
+            detail.buttons[2].setEnabled(self._pending_action.isEnabled())

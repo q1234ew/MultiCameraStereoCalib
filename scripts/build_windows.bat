@@ -48,5 +48,5 @@ if "%WITH_POINTCLOUD%"=="1" (
 ) else (
     echo 当前包: 轻量包（不包含 Open3D，标定/导出可用）
 )
-echo 可选：在 exe 同级放置 assets\logo.png 作为窗口图标。
+echo 已内置标定格图标；exe 同级 assets\logo.png 可覆盖窗口图标，不改变 EXE 内嵌图标。
 echo 需要 Windows 安装包时，请运行 scripts\build_windows_installer.bat（需额外安装 Inno Setup 6）。

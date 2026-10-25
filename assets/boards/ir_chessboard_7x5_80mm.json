@@ -1,0 +1,7 @@
+{
+  "pattern_type": "chessboard",
+  "cols": 6,
+  "rows": 4,
+  "square_size": 0.08,
+  "asymmetric": false
+}

@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from ..calibration.planar import PatternBoardConfig
 from .mjpeg_grabber import MJPEGGrabber
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,22 @@ class AuxiliaryCameraConfig:
     board_pattern: str = "chessboard"
     stream_type: str = "ir"
     group: str = "multimodal"
+    board_config: Optional[PatternBoardConfig] = None
+
+    def pattern_board_config(self) -> PatternBoardConfig:
+        if self.board_config is not None:
+            return replace(self.board_config)
+        board = (PatternBoardConfig.ir_chessboard() if self.modality == "ir"
+                 else PatternBoardConfig())
+        return replace(board, pattern_type=self.board_pattern)
+
+    def to_dict(self) -> dict:
+        return {
+            "camera_id": self.camera_id, "url": self.url, "modality": self.modality,
+            "board_pattern": self.pattern_board_config().pattern_type.value,
+            "stream_type": self.stream_type,
+            "group": self.group, "board_config": self.pattern_board_config().to_dict(),
+        }
 
 
 class StreamManager(QObject):
@@ -115,9 +132,12 @@ class StreamManager(QObject):
             cfg.camera_id,
             cfg.modality,
             cfg.url,
-            cfg.board_pattern,
+            cfg.pattern_board_config().to_dict(),
         )
         self._auxiliary_camera = cfg
+        if not cfg.url:
+            self._remove_camera(cfg.camera_id)
+            return
         self._add_camera(
             CameraConfig(
                 camera_id=cfg.camera_id,
@@ -136,6 +156,10 @@ class StreamManager(QObject):
         if cfg is not None:
             self._remove_camera(cfg.camera_id)
 
+    def is_camera_running(self, camera_id: str) -> bool:
+        grabber = self._grabbers.get(camera_id)
+        return grabber is not None and grabber.isRunning()
+
     def start_all(self):
         logger.info(
             "Starting streams: pairs=%d aux=%s max_decode_fps=%.1f",
@@ -151,7 +175,7 @@ class StreamManager(QObject):
                 continue
             self._add_camera(pair.left)
             self._add_camera(pair.right)
-        if self._auxiliary_camera is not None:
+        if self._auxiliary_camera is not None and self._auxiliary_camera.url:
             self._add_camera(
                 CameraConfig(
                     camera_id=self._auxiliary_camera.camera_id,
@@ -237,7 +261,7 @@ class StreamManager(QObject):
                 continue
             urls[pair.left.camera_id] = pair.left.url
             urls[pair.right.camera_id] = pair.right.url
-        if self._auxiliary_camera is not None:
+        if self._auxiliary_camera is not None and self._auxiliary_camera.url:
             urls[self._auxiliary_camera.camera_id] = self._auxiliary_camera.url
         return urls
 

@@ -29,6 +29,7 @@ datas: list = []
 binaries: list = []
 hiddenimports: list = collect_submodules("multicamera")
 datas += copy_metadata("opencv-contrib-python")
+datas += collect_data_files("multicamera", includes=["ui/icons/*"])
 include_open3d = os.environ.get("MULTICAMERA_WITH_OPEN3D", "").lower() in {
     "1",
     "true",
@@ -111,6 +112,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="MultiCamera",
+    icon=str(ROOT / "assets" / "logo.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

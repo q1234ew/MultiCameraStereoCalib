@@ -72,13 +72,7 @@ class CalibrationSession:
                 for p in pairs
             ],
             "auxiliary_camera": (
-                {
-                    "camera_id": auxiliary.camera_id,
-                    "url": auxiliary.url,
-                    "modality": auxiliary.modality,
-                    "board_pattern": auxiliary.board_pattern,
-                    "stream_type": auxiliary.stream_type,
-                }
+                auxiliary.to_dict()
                 if auxiliary is not None
                 else None
             ),
@@ -97,6 +91,34 @@ class CalibrationSession:
         return session
 
     # ── Image storage ─────────────────────────────────────────
+
+    def record_configuration(self, board: CharucoBoard, pairs: List[StereoPairConfig],
+                             auxiliary: AuxiliaryCameraConfig | None, camera_model: str = "pinhole"):
+        """Record configuration revisions without deleting historical images/results."""
+        keys = ("board", "pairs", "auxiliary_camera", "camera_model")
+        previous = {key: self._metadata.get(key) for key in keys}
+        current = {
+            "board": board.to_dict(),
+            "pairs": [{"name": p.name, "left_id": p.left.camera_id, "left_url": p.left.url,
+                       "right_id": p.right.camera_id, "right_url": p.right.url,
+                       "stream_type": p.left.stream_type} for p in pairs],
+            "auxiliary_camera": auxiliary.to_dict() if auxiliary else None,
+            "camera_model": camera_model,
+        }
+        if previous == current:
+            return
+        revision = {
+            "changed_at": datetime.now().isoformat(), "previous": previous,
+            "frame_count": self.frame_count,
+            "multimodal_frame_count": self._metadata.get("multimodal_frame_count", 0),
+        }
+        self._metadata["configuration_history"] = [*self._metadata.get("configuration_history", []), revision]
+        self._metadata.update(current)
+        path = self.session_dir / self.METADATA_FILE
+        with TemporaryDirectory(dir=self.session_dir, ignore_cleanup_errors=True) as staging:
+            staged = Path(staging) / path.name
+            staged.write_text(json.dumps(self._metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            staged.replace(path)
 
     def save_frame_pair(
         self,
@@ -222,6 +244,7 @@ class CalibrationSession:
         board_type: str,
         valid_pairs: int,
         rms_error: float,
+        board_config: dict | None = None,
     ):
         self._metadata["multimodal_result"] = {
             "aux_camera_id": aux_camera_id,
@@ -230,6 +253,8 @@ class CalibrationSession:
             "valid_pairs": valid_pairs,
             "rms_error": rms_error,
         }
+        if board_config is not None:
+            self._metadata["multimodal_result"]["board_config"] = dict(board_config)
         self._save_metadata()
 
     @property
