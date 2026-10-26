@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multicamera"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Multi stereo camera joint calibration and point cloud fusion"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,12 +20,14 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "ruff>=0.3",
+    "tomli>=2; python_version < '3.11'",
 ]
 pointcloud = [
     "open3d>=0.18",
 ]
 build-win = [
     "pyinstaller>=6.0",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.scripts]
@@ -33,6 +35,9 @@ multicamera = "multicamera.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "multicamera.__version__"}
 
 [tool.setuptools.package-data]
 multicamera = ["ui/icons/*.svg", "ui/icons/LICENSE", "ui/icons/SOURCE.md"]

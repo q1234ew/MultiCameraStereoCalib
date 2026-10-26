@@ -126,6 +126,23 @@ python -m ruff check src scripts
 python -m multicamera --self-test-calibration --report calibration_self_test.json
 ```
 
+版本号只在 `src/multicamera/__init__.py` 的 `__version__` 中维护；Python 包元数据、Windows 安装器及本地版本化文件名自动读取。修改版本后重新执行对应平台的可编辑安装命令，刷新安装元数据。
+
+本地发布准备命令（不提交、不创建标签、不推送）：
+
+```bash
+python scripts/prepare_release.py --dry-run           # 预览默认 PATCH 升版
+python scripts/prepare_release.py                     # PATCH：0.1.0 → 0.1.1
+python scripts/prepare_release.py --bump minor        # MINOR：0.1.0 → 0.2.0
+python scripts/prepare_release.py --preview --bump patch  # 新 PATCH 版本的首个测试构建
+python scripts/prepare_release.py --preview           # 当前目标版本的下一次测试构建
+python scripts/prepare_release.py --bump none         # 将当前已验证版本准备为正式版
+```
+
+以上为不同用途的示例，并非依次全部执行。实际准备要求工作区干净；`--dry-run` 允许未提交修改且不写入任何文件。预发布按上海日期，从本地标签和 Git 元数据目录内的准备记录取最大序号加一；不会自动访问远程。多人或多机发布前需先同步标签，本地编号不能视为远程预留。版本发生变化后，应更新修改记录、重新安装元数据、完成验证并提交，再创建输出中的建议标签。预发布目标版本如已存在正式标签，必须选择新的升版目标。
+
+发布前执行 `python scripts/check_release.py --installed --require-clean`，再创建正式标签 `vX.Y.Z` 或预发布标签 `vX.Y.Z-build.YYYYMMDD.N`，执行 `python scripts/check_release.py --installed --require-clean --tag <标签>` 核对版本及标签指向。日期按上海时区，序号为当日正整数；检查不会自动创建或推送标签。CI 在构建前重复检查，并对比源码与最终 EXE 的版本、提交和标签。已存在的 Release 禁止覆盖，修复构建必须使用新标签。
+
 Windows 本地构建入口为 `scripts\build_windows.bat`；安装包入口为 `scripts\build_windows_installer.bat`，需要 Inno Setup 6。添加 `--pointcloud` 可选择包含 Open3D 的构建，具体参数见脚本和技术文档。
 
 GitHub Actions 支持手动构建或推送 `v*` 标签触发构建。标签构建包含安装包，默认不包含 Open3D；发布前执行源代码回归、源码自检和最终 EXE 标定自检，通过后将安装包、便携 ZIP、报告及校验值发布到 Release。

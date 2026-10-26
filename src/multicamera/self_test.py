@@ -254,12 +254,15 @@ def _exercise_calibration(report: dict) -> dict:
 
 
 def run_self_test(report_path: str | Path) -> int:
+    from .build_info import build_identity
+
     report = {
         "schema_version": 1, "status": "failed", "stage": "runtime",
         "frozen": bool(getattr(sys, "frozen", False)), "executable": sys.executable,
         "python": sys.version, "platform": platform.platform(),
         "bundle_root": str(getattr(sys, "_MEIPASS", "")),
         "build_commit": os.environ.get("GITHUB_SHA", ""),
+        "build_identity": build_identity(),
     }
     start = time.perf_counter()
     try:

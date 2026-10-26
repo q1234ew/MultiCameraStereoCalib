@@ -10,6 +10,8 @@
 """
 import os
 import pathlib
+import json
+import runpy
 
 from PyInstaller.building.build_main import Analysis, COLLECT, EXE, PYZ
 from PyInstaller.utils.hooks import (
@@ -24,8 +26,16 @@ from PyInstaller.utils.hooks import (
 ROOT = pathlib.Path(SPECPATH).resolve()
 SRC = ROOT / "src"
 ENTRY = SRC / "multicamera" / "__main__.py"
+_release_tools = runpy.run_path(str(ROOT / "scripts" / "check_release.py"))
+_requested_tag = os.environ.get('GITHUB_REF_NAME') if os.environ.get('GITHUB_REF_TYPE') == 'tag' else None
+_build_identity = _release_tools['packaging_identity'](root=ROOT, tag=_requested_tag)
 
 datas: list = []
+_metadata_dir = ROOT / 'build' / 'identity'
+_metadata_dir.mkdir(parents=True, exist_ok=True)
+_metadata_file = _metadata_dir / 'build_identity.json'
+_metadata_file.write_text(json.dumps(_build_identity), encoding='utf-8')
+datas.append((str(_metadata_file), '.'))
 binaries: list = []
 hiddenimports: list = collect_submodules("multicamera")
 datas += copy_metadata("opencv-contrib-python")

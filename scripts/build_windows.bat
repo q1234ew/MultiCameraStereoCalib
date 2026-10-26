@@ -31,6 +31,8 @@ if "%WITH_POINTCLOUD%"=="1" (
 
 python -m pip check
 if errorlevel 1 exit /b 1
+python scripts\check_release.py --installed
+if errorlevel 1 exit /b 1
 python -m multicamera --self-test-calibration --report installer_output\calibration_source_test.json
 if errorlevel 1 exit /b 1
 

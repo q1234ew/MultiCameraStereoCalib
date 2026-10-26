@@ -1141,3 +1141,22 @@ Qt 的 `QUrl.toLocalFile()` 在 Windows 上可返回正斜杠路径，与 `Path`
 ```
 
 本机专项通过不等于 Windows 门禁或最终 EXE 通过。修复提交后使用新的构建标签重新运行原 Windows 工作流，继续保留完整源代码回归及最终 EXE 标定自检，不通过重跑相同错误代码或跳过失败测试发布安装包。失败构建：[Actions #13](https://github.com/q1234ew/MultiCameraStereoCalib/actions/runs/40281324250)。
+
+## 版本来源与发布一致性
+
+产品版本唯一来源为 `src/multicamera/__init__.py::__version__`，保持数字 `MAJOR.MINOR.PATCH`。`pyproject.toml` 使用 setuptools dynamic attr 生成发行包元数据；升级版本后需重新安装可编辑包。Windows 批处理与 Actions 调用 `scripts/check_release.py --installed --print-version`，将结果通过 `/DMyAppVersion` 传给 Inno Setup；未传版本时安装器编译直接失败。PyInstaller 同样校验元数据，并将版本、提交、标签和工作区状态写入内嵌构建身份。
+
+`python scripts/check_release.py --installed --require-clean --tag <标签>` 检查单一版本来源、已安装元数据、工作区及标签指向 HEAD。正式标签为 `vX.Y.Z`，预发布沿用 `vX.Y.Z-build.YYYYMMDD.N`，检查有效日期和正整数序号。日期使用上海时区。普通本地构建允许未提交修改；CI 发布要求干净工作区，且最终 EXE 自检报告的版本、提交及标签与当前构建一致。
+
+源码与最终 EXE 的标定自检报告增加 `build_identity` 字段；原 OpenCV 比对仍保留。CI 仅收集当前产品版本的安装包，Release 记录产品版本、标签、完整提交与构建链接。已存在的 Release（含草稿）拒绝重新上传，失败后需检查原发布状态并使用新标签，禁止覆盖历史二进制。此机制不自动升版、创建或推送标签。
+
+
+### 本地发布准备命令
+
+`scripts/prepare_release.py` 复用 `check_release.py` 的单一版本来源与工作区检查。默认增加 PATCH；`--bump minor` 增加 MINOR 并归零 PATCH；`--preview` 默认不升产品版本，支持组合 `--bump patch/minor`；`--bump none` 可将已验证的当前预发布目标准备为正式版。命令只修改 `__version__` 字符串，保留其余源码和换行格式；不会提交、建标签、访问远程或触发构建。
+
+命令返回 JSON 计划，包含原版本、目标版本、建议标签、准备前提交、工作区状态和后续步骤。`--dry-run` 不创建锁、准备记录或文件，允许在有未提交修改时预览。正式准备必须有已提交 HEAD 且工作区干净，并在写入前再次检查。
+
+预发布使用上海日期，同产品版本和日期下取本地标签及历史预留的最大序号加一。Git 公共元数据目录的 `multicamera-release.json` 保存预留列表和最近计划，同仓库的多个工作树共享编号记录及锁，`multicamera-release.lock` 防止并发写入。写入采用临时文件替换；先预留再改版本，改版本失败可能留下序号空缺，以防重复。准备记录损坏、锁已存在、正式标签已存在或正式计划已预留时直接失败，不覆盖旧记录。
+
+编号仅限本地可见信息，不是远程预留；跨机器准备前应在授权范围内同步标签。版本更改后重新安装可编辑包，完成测试与文档更新后提交，再创建建议标签并运行严格发布检查。正式推送和 Windows 构建仍由后续授权操作完成。

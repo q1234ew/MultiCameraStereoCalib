@@ -1,10 +1,11 @@
 ; Inno Setup 6 — 将 PyInstaller 输出的 dist\MultiCamera 打成 Windows 安装程序
-; 编译：在已安装 Inno Setup 6 的 Windows 上执行 ISCC packaging\windows\MultiCamera.iss
-; （版本号请与 pyproject.toml [project] version 保持一致）
+; 使用 scripts\build_windows_installer.bat，自动传入唯一来源中的产品版本。
 
 #define MyAppName "MultiCamera Calibration"
 #define MyAppShortName "MultiCamera"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #error "Pass /DMyAppVersion from scripts/check_release.py --print-version"
+#endif
 #define MyAppPublisher "MultiCamera"
 #define MyAppExeName "MultiCamera.exe"
 #define DistDir "..\\..\\dist\\MultiCamera"

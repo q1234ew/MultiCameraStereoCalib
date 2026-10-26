@@ -35,6 +35,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,6 +60,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { throw "Dependency consistency check failed" }
+
+      - name: Validate release version and checkout
+        shell: pwsh
+        run: |
+          $checkArgs = @("scripts/check_release.py", "--installed", "--require-clean", "--print-version")
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $checkArgs += @("--tag", $env:GITHUB_REF_NAME) }
+          $version = python @checkArgs
+          if ($LASTEXITCODE -ne 0) { throw "Release consistency validation failed" }
+          "PRODUCT_VERSION=$version" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Inspect previous Release OpenCV
         if: ${{ inputs.audit_release != '' }}
@@ -131,7 +142,8 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (!(Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
-          & $iscc packaging\windows\MultiCamera.iss
+          & $iscc "/DMyAppVersion=$env:PRODUCT_VERSION" packaging\windows\MultiCamera.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
 
       - name: Publish Windows Release
         shell: pwsh
@@ -148,7 +160,7 @@ jobs:
             $assets += Get-Item "installer_output/previous_opencv_audit.json"
           }
           if ($env:BUILD_INSTALLER -eq "true") {
-            $installers = @(Get-ChildItem "installer_output/MultiCamera_Setup_*_x64.exe" -File)
+            $installers = @(Get-Item "installer_output/MultiCamera_Setup_$($env:PRODUCT_VERSION)_x64.exe")
             if ($installers.Count -eq 0) { throw "Windows installer was not generated" }
             $assets += $installers
           }
@@ -176,7 +188,8 @@ jobs:
           $notesPath = Join-Path $env:RUNNER_TEMP "windows-release-notes.md"
           @(
             "Windows x64 build of MultiCamera Stereo Calibration.",
-            "", "Commit: $env:GITHUB_SHA", "Variant: $variant",
+            "", "Version: $env:PRODUCT_VERSION", "Tag: $tag",
+            "Commit: $env:GITHUB_SHA", "Variant: $variant",
             "", "Download the portable ZIP or, when included, the Setup EXE.",
             "SHA256SUMS.txt contains checksums for the binary downloads.",
             "calibration_self_test.json records calibration and export executed by the final EXE.",
@@ -184,8 +197,10 @@ jobs:
             "", "Build: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           ) | Set-Content $notesPath -Encoding utf8
 
-          gh release view $tag --repo $env:GH_REPO --json url
-          if ($LASTEXITCODE -ne 0) {
+          $existing = gh release view $tag --repo $env:GH_REPO --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists; use a new tag to preserve its artifacts"
+          } else {
             $createArgs = @("release", "create", $tag, "--repo", $env:GH_REPO,
               "--target", $env:GITHUB_SHA, "--title", $title,
               "--notes-file", $notesPath, "--draft")
@@ -193,7 +208,7 @@ jobs:
             gh @createArgs
             if ($LASTEXITCODE -ne 0) { throw "Could not create Windows Release" }
           }
-          gh release upload $tag @assetPaths --repo $env:GH_REPO --clobber
+          gh release upload $tag @assetPaths --repo $env:GH_REPO
           if ($LASTEXITCODE -ne 0) { throw "Could not upload Windows Release assets" }
           $latest = if ($prerelease) { "false" } else { "true" }
           gh release edit $tag --repo $env:GH_REPO --draft=false "--latest=$latest"

@@ -32,6 +32,24 @@ try {
     }
     $source = Get-Content $baselinePath -Raw | ConvertFrom-Json
     if ($source.status -ne "passed" -or $source.frozen) { throw "Invalid source baseline" }
+    $expectedVersion = python scripts/check_release.py --installed --print-version
+    if ($LASTEXITCODE -ne 0) { throw "Release version validation failed" }
+    if ($result.build_identity.version -ne $expectedVersion -or
+        $source.build_identity.version -ne $expectedVersion -or
+        !$source.build_identity.commit -or $source.build_identity.commit -eq "未知" -or
+        $result.build_identity.commit -ne $source.build_identity.commit) {
+        throw "Packaged version or commit differs from the tested source"
+    }
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        if ($result.build_identity.dirty -ne $false -or
+            $source.build_identity.dirty -ne $false) {
+            throw "Release identity must describe a clean checkout"
+        }
+        if ($env:GITHUB_REF_TYPE -eq "tag" -and
+            $result.build_identity.tag -ne $env:GITHUB_REF_NAME) {
+            throw "Packaged tag differs from the requested release tag"
+        }
+    }
     if ($result.opencv.version -ne $source.opencv.version -or
         $result.opencv.native_sha256 -ne $source.opencv.native_sha256) {
         throw "Packaged OpenCV version or native library differs from the tested build environment"
