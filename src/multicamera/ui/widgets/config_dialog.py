@@ -7,9 +7,10 @@ import math
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import Qt, Slot, QSignalBlocker
+from PySide6.QtCore import QEvent, Qt, Slot, QSignalBlocker
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -143,13 +144,18 @@ class ConfigDialog(QDialog):
         auxiliary = self._create_multimodal_group()
         self._add_page("相机连接", [pairs], stretch=True)
         self._add_page("融合相机", [auxiliary])
-        board_columns = QWidget()
-        columns = QHBoxLayout(board_columns)
+        self._board_columns = QWidget()
+        columns = QHBoxLayout(self._board_columns)
+        self._board_columns_layout = columns
         columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(16)
-        columns.addWidget(self._create_board_group(), 1)
+        self._rgb_board_group = self._create_board_group()
+        columns.addWidget(self._rgb_board_group, 1)
         columns.addWidget(self._aux_board_group, 1)
-        self._add_page("标定板", [self._create_model_group(), board_columns])
+        self._board_scroll = self._add_page("标定板", [self._create_model_group(), self._board_columns])
+        self._board_viewport = self._board_scroll.viewport()
+        self._board_viewport.installEventFilter(self)
+        self._tabs.currentChanged.connect(self._update_board_columns)
 
         footer = QWidget()
         footer.setObjectName("actionFooter")
@@ -182,6 +188,24 @@ class ConfigDialog(QDialog):
             layout.addStretch()
         scroll.setWidget(body)
         self._tabs.addTab(scroll, title)
+        return scroll
+
+    def _update_board_columns(self, *_):
+        # Use the viewport, not an already-overflowing content widget's width.
+        margins = self._board_scroll.widget().layout().contentsMargins()
+        available = self._board_viewport.width() - margins.left() - margins.right()
+        required = (self._rgb_board_group.minimumSizeHint().width()
+                    + self._aux_board_group.minimumSizeHint().width()
+                    + self._board_columns_layout.spacing())
+        direction = (QBoxLayout.LeftToRight if available >= required + 24
+                     else QBoxLayout.TopToBottom)
+        if self._board_columns_layout.direction() != direction:
+            self._board_columns_layout.setDirection(direction)
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, '_board_viewport', None) and event.type() == QEvent.Resize:
+            self._update_board_columns()
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _configuration_form(group):
@@ -490,15 +514,18 @@ class ConfigDialog(QDialog):
 
         self._btn_add_selected_pair = QPushButton("添加相机组")
         self._btn_add_selected_pair.clicked.connect(self._add_pair_from_dropdowns)
-        picker_row.addWidget(self._btn_add_selected_pair)
 
         self._btn_auto_pair = QPushButton("自动配对")
         self._btn_auto_pair.setToolTip("仅配对同一主机、同类型且唯一的左右目；不推测未知目别")
         self._btn_auto_pair.clicked.connect(self._auto_pair_discovered)
         self._btn_auto_pair.setEnabled(False)
         self._btn_add_selected_pair.setEnabled(False)
-        picker_row.addWidget(self._btn_auto_pair)
         layout.addLayout(picker_row)
+        pair_actions = QHBoxLayout()
+        pair_actions.addStretch()
+        pair_actions.addWidget(self._btn_add_selected_pair)
+        pair_actions.addWidget(self._btn_auto_pair)
+        layout.addLayout(pair_actions)
 
         # ── tables: splitter between discovery and pairs ──
         self._table_splitter = QSplitter(Qt.Vertical)

@@ -292,7 +292,7 @@ def test_result_summary_and_native_actions_use_real_results(bench, monkeypatch, 
     opened = []
     monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True)
     panel._btn_open_results.click()
-    assert opened == [str(panel.result_directory)]
+    assert [Path(path) for path in opened] == [panel.result_directory]
     panel._btn_copy_results.click()
     assert app.clipboard().text() == str(panel.result_directory.resolve())
     assert not panel._lbl_result_summary.isVisible()

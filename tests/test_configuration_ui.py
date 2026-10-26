@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QDialogButtonBox, QMessageBox, QFormLayout
+from PySide6.QtWidgets import QBoxLayout, QDialogButtonBox, QMessageBox, QFormLayout
 
 from multicamera.board.charuco_board import CharucoBoard, CharucoBoardConfig, ArucoDictType
 from multicamera.calibration.planar import PatternBoardConfig, PatternType
@@ -207,11 +207,44 @@ def test_configuration_pages_fit_and_footer_stays_visible(dialog, app, size, tmp
         dialog._tabs.setCurrentIndex(page)
         app.processEvents()
         scroll = dialog._tabs.widget(page)
-        assert scroll.horizontalScrollBar().maximum() == 0
+        assert scroll.horizontalScrollBar().maximum() == 0, f'page={page}, size={size}'
         button = dialog._buttons.button(QDialogButtonBox.Save)
         assert button.isVisible()
         assert button.mapTo(dialog, button.rect().bottomRight()).y() <= dialog.height()
         dialog.grab().save(str(directory / f"config-{page}-{size[0]}x{size[1]}.png"))
+
+
+def test_board_columns_stack_and_restore_without_hiding_overflow(dialog, app):
+    dialog.focus_auxiliary()
+    dialog._tabs.setCurrentIndex(2)
+    dialog.show()
+    required = (dialog._rgb_board_group.minimumSizeHint().width()
+                + dialog._aux_board_group.minimumSizeHint().width()
+                + dialog._board_columns_layout.spacing())
+    margins = dialog._board_scroll.widget().layout().contentsMargins()
+    for width, expected in ((required - 1, QBoxLayout.TopToBottom),
+                            (required + 40, QBoxLayout.LeftToRight)):
+        dialog._board_scroll.setFixedWidth(width + margins.left() + margins.right())
+        app.processEvents()
+        dialog._update_board_columns()
+        app.processEvents()
+        assert dialog._board_columns_layout.direction() == expected
+        assert dialog._board_scroll.horizontalScrollBar().maximum() == 0
+
+
+def test_larger_font_configuration_fits_narrow_window(dialog, app):
+    dialog.setStyleSheet('QWidget {font-size:16px;} QComboBox {font-size:17px;}')
+    dialog.focus_auxiliary()
+    dialog._add_row()
+    dialog.resize(900, 640)
+    dialog.show()
+    for page in range(3):
+        dialog._tabs.setCurrentIndex(page)
+        app.processEvents()
+        scroll = dialog._tabs.widget(page)
+        assert scroll.horizontalScrollBar().maximum() == 0, f'large-font page={page}'
+        button = dialog._buttons.button(QDialogButtonBox.Save)
+        assert button.mapTo(dialog, button.rect().bottomRight()).y() <= dialog.height()
 
 
 @pytest.mark.parametrize("size", [(1080, 760), (900, 640)])
