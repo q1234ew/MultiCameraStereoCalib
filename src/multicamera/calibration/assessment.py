@@ -78,6 +78,7 @@ class DataAssessment:
     avg_sharpness: float = 0.0
     frame_qualities: List[FrameQuality] = field(default_factory=list)
     coverage_heatmap: Optional[np.ndarray] = None
+    image_coverage: Optional[float] = None
 
     @property
     def grade(self) -> Grade:
@@ -96,7 +97,8 @@ class DataAssessment:
         usable_ratio = self.usable_frames / self.total_frames
         s = 0.0
         s += min(usable_ratio, 1.0) * 25
-        s += min(self.coverage, 1.0) * 30
+        coverage = self.image_coverage if self.image_coverage is not None else self.coverage
+        s += min(coverage, 1.0) * 30
         s += min(self.distribution_uniformity, 1.0) * 25
         s += min(self.total_frames / 20.0, 1.0) * 20
         return s
@@ -111,7 +113,9 @@ class DataAssessment:
         if self.total_frames < 15:
             tips.append(f"帧数不足 ({self.total_frames}/15)，建议继续采集")
         if self.coverage < 0.7:
-            tips.append(f"角点覆盖率偏低 ({self.coverage:.0%})，请移动标定板覆盖更多角点")
+            tips.append(f"板角点完整度偏低 ({self.coverage:.0%})，请确保整板可见")
+        if self.image_coverage is not None and self.image_coverage < .7:
+            tips.append(f"视场网格覆盖不足 ({self.image_coverage:.0%})，请补拍边缘和角落")
         if self.distribution_uniformity < 0.5:
             tips.append("角点分布不均匀，请在图像各区域都拍摄标定板")
         blurry = sum(1 for fq in self.frame_qualities if fq.is_blurry)
@@ -124,7 +128,7 @@ class DataAssessment:
         if underexp > 0:
             tips.append(f"有 {underexp} 帧欠曝，请增加环境光照")
         if not tips:
-            tips.append("数据质量良好，可以进行标定")
+            tips.append("基础图像检查通过；仍需检查姿态多样性和标定误差")
         return tips
 
 
@@ -165,9 +169,9 @@ class DataAssessor:
             normed = corner_distribution.astype(np.float64)
             normed = normed / normed.sum()
             ideal = 1.0 / normed.size
-            max_dev = 1.0 - ideal
-            actual_dev = np.mean(np.abs(normed - ideal))
-            uniformity = max(0.0, 1.0 - actual_dev / max_dev)
+            max_dev = 2.0 * (1.0 - ideal)
+            actual_dev = np.sum(np.abs(normed - ideal))
+            uniformity = max(0.0, 1.0 - actual_dev / max_dev) if max_dev else 1.
 
         return DataAssessment(
             camera_id=camera_id,
@@ -180,6 +184,8 @@ class DataAssessor:
             else 0.0,
             frame_qualities=frame_qualities,
             coverage_heatmap=corner_distribution,
+            image_coverage=(float(np.count_nonzero(corner_distribution) / corner_distribution.size)
+                            if corner_distribution is not None and corner_distribution.size else None),
         )
 
 
@@ -222,15 +228,18 @@ class CalibrationEvaluator:
         thresholds = self.INTRINSIC_THRESHOLDS[model]
         grade = self._grade_rms(intrinsics.rms_error, thresholds)
 
-        per_frame = intrinsics.per_frame_errors or []
+        per_frame = (list(intrinsics.per_frame_errors)
+                     if intrinsics.per_frame_errors is not None else [])
         max_err = max(per_frame) if per_frame else 0.0
         mean_err = float(np.mean(per_frame)) if per_frame else 0.0
 
         details = {
             "模型": "针孔" if model == CameraModel.PINHOLE else "鱼眼",
             "RMS 重投影误差": f"{intrinsics.rms_error:.4f} px",
-            "最大帧误差": f"{max_err:.4f} px",
-            "平均帧误差": f"{mean_err:.4f} px",
+            "最大帧误差": f"{max_err:.4f} px" if per_frame else "未记录",
+            "平均帧误差": f"{mean_err:.4f} px" if per_frame else "未记录",
+            "逐帧误差口径": ("二维点距离 RMS（px）" if intrinsics.per_frame_error_metric == "euclidean_rms_px"
+                         else "历史结果未记录；请勿直接跨版本比较"),
             "焦距 (fx, fy)": (
                 f"({intrinsics.camera_matrix[0, 0]:.1f}, "
                 f"{intrinsics.camera_matrix[1, 1]:.1f})"
@@ -242,15 +251,18 @@ class CalibrationEvaluator:
         }
 
         suggestions = []
+        if not np.isfinite(intrinsics.rms_error) or intrinsics.rms_error < 0:
+            suggestions.append("RMS 重投影误差无效，需重新核对标定结果")
         if intrinsics.rms_error > thresholds[1]:
             suggestions.append("重投影误差偏高，建议检查标定板平整度和采集质量")
         if max_err > intrinsics.rms_error * 3:
             bad_frames = [
                 i for i, e in enumerate(per_frame) if e > intrinsics.rms_error * 2.5
             ]
-            suggestions.append(
-                f"第 {bad_frames} 帧误差异常，建议剔除后重新标定"
-            )
+            has_ids = intrinsics.frame_ids is not None and len(intrinsics.frame_ids) == len(per_frame)
+            labels = [intrinsics.frame_ids[i] if has_ids else str(i + 1) for i in bad_frames]
+            prefix = "源编号" if has_ids else "参与序号（非原图编号）"
+            suggestions.append(f"{prefix} {', '.join(labels)} 误差异常，建议检查后重新标定")
 
         fx = intrinsics.camera_matrix[0, 0]
         fy = intrinsics.camera_matrix[1, 1]
@@ -294,6 +306,16 @@ class CalibrationEvaluator:
             "RMS 重投影误差": f"{pair.stereo.rms_error:.4f} px",
             "基线距离": f"{np.linalg.norm(pair.stereo.T):.4f} m",
         }
+        alignment = pair.calibration_info.get('rectification', {})
+        if alignment:
+            coordinate = alignment.get('coordinate', '?')
+            details['同 ID 校正检查'] = (
+                f"训练配对 {alignment.get('frame_count', 0)} 对 / {alignment.get('point_count', 0)} 点；"
+                f"校正像素 {coordinate} 坐标差，非独立验证"
+            )
+            if alignment.get('status') == 'ok':
+                details['同 ID 校正残差 RMS'] = f"{alignment['rms_px']:.4f} px"
+                details['同 ID 校正残差 P95'] = f"{alignment['p95_abs_px']:.4f} px"
 
         epipolar_errors = None
         if (
@@ -306,6 +328,13 @@ class CalibrationEvaluator:
             details["平均极线误差"] = f"{mean_epi:.4f} px"
 
         suggestions = []
+        if alignment:
+            if alignment.get('status') != 'ok':
+                suggestions.append('同 ID 校正检查无效，请核对模型、校正矩阵和角点')
+            elif alignment['rms_px'] > 1.:
+                suggestions.append('同 ID 校正残差偏高，请目视检查校正图及异常配对；此值受校正像素尺度影响')
+        if not np.isfinite(pair.stereo.rms_error) or pair.stereo.rms_error < 0:
+            suggestions.append("双目 RMS 重投影误差无效，需重新核对标定结果")
         if pair.stereo.rms_error > thresholds[1]:
             suggestions.append("双目重投影误差偏高，建议增加标定帧或检查同步精度")
 
@@ -395,6 +424,8 @@ class CalibrationEvaluator:
 
     @staticmethod
     def _grade_rms(rms: float, thresholds: Tuple[float, float, float]) -> Grade:
+        if not np.isfinite(rms) or rms < 0:
+            return Grade.POOR
         if rms <= thresholds[0]:
             return Grade.EXCELLENT
         if rms <= thresholds[1]:
@@ -405,6 +436,8 @@ class CalibrationEvaluator:
 
     @staticmethod
     def _rms_to_score(rms: float, thresholds: Tuple[float, float, float]) -> float:
+        if not np.isfinite(rms) or rms < 0:
+            return 0.0
         if rms <= thresholds[0]:
             return 90 + 10 * max(0, (thresholds[0] - rms) / thresholds[0])
         if rms <= thresholds[1]:

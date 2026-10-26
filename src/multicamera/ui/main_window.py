@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QButtonGroup,
+    QBoxLayout,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -129,8 +130,14 @@ class MainWindow(QMainWindow):
         preview_body.setContentsMargins(0, 0, 0, 0)
         preview_body.setSizeConstraint(QLayout.SetMinimumSize)
         self._stream_view.setMinimumHeight(230)
-        preview_body.addWidget(self._stream_view, 1)
-        preview_body.addWidget(self._stereo_capture)
+        self._capture_preview_splitter = QSplitter(Qt.Vertical)
+        self._capture_preview_splitter.setChildrenCollapsible(False)
+        self._capture_preview_splitter.setHandleWidth(5)
+        self._capture_preview_splitter.addWidget(self._stream_view)
+        self._capture_preview_splitter.addWidget(self._stereo_capture)
+        self._capture_preview_splitter.setStretchFactor(0, 1)
+        self._capture_preview_splitter.setStretchFactor(1, 0)
+        preview_body.addWidget(self._capture_preview_splitter, 1)
         self._preview_scroll = QScrollArea()
         self._preview_scroll.setFrameShape(QFrame.NoFrame)
         self._preview_scroll.setWidgetResizable(True)
@@ -146,6 +153,7 @@ class MainWindow(QMainWindow):
         self._capture_actions_layout.setContentsMargins(0, 0, 0, 0)
         self._capture_actions_layout.setSizeConstraint(QLayout.SetMinimumSize)
         self._gallery = PairGallery()
+        self._gallery._toggle.toggled.connect(self._on_gallery_expansion_changed)
         self._capture_bottom_layout.addWidget(self._gallery, 1, Qt.AlignTop)
         self._capture_bottom_layout.addWidget(self._capture_actions)
         workspace.addWidget(self._capture_bottom)
@@ -235,6 +243,40 @@ class MainWindow(QMainWindow):
         self._inspector.setVisible(not active)
         self._view_aux.setVisible(not active)
         self._view_split.setVisible(not active)
+        self._sync_capture_density()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_capture_layout_active'):
+            self._sync_capture_density()
+
+    def _sync_capture_density(self):
+        compact = self._capture_layout_active and (self.height() < 900 or self.width() < 1150)
+        if compact == getattr(self, '_compact_capture', None):
+            return
+        self._compact_capture = compact
+        self._stereo_capture.set_compact(compact)
+        self._calib_panel.set_capture_footer_compact(compact)
+        self._stream_view.setMinimumHeight(170 if compact else 230)
+        self._capture_actions.setMaximumWidth(16777215 if compact else 400)
+        self._capture_bottom_layout.setDirection(
+            QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight,
+        )
+        if compact:
+            self._gallery_before_compact = self._gallery._toggle.isChecked()
+            self._changing_gallery_density = True
+            self._gallery._toggle.setChecked(False)
+            self._changing_gallery_density = False
+        elif hasattr(self, '_gallery_before_compact'):
+            self._changing_gallery_density = True
+            self._gallery._toggle.setChecked(self._gallery_before_compact)
+            self._changing_gallery_density = False
+        self._capture_preview_splitter.setOrientation(Qt.Horizontal if compact else Qt.Vertical)
+        self._capture_preview_splitter.setSizes([750, 400] if compact else [380, 320])
+
+    def _on_gallery_expansion_changed(self, expanded):
+        if getattr(self, '_compact_capture', False) and not getattr(self, '_changing_gallery_density', False):
+            self._gallery_before_compact = expanded
 
     def _build_workbench_header(self):
         header = QWidget()
@@ -412,6 +454,10 @@ class MainWindow(QMainWindow):
         self._calib_panel.aux_images_imported.connect(self._stream_view.show_multimodal_images)
         self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
         self._calib_panel.configure_aux_requested.connect(lambda: self._on_config(True))
+        self._calib_panel.configure_stereo_requested.connect(lambda: self._on_config(False))
+        self._calib_panel.data_source_changed.connect(self._update_connection_summary)
+        self._calib_panel.offline_imported.connect(self._gallery.show_first_page)
+        self._calib_panel.diagnostic_preview_requested.connect(self._on_gallery_pair_selected)
         self._calib_panel.workflow_changed.connect(self._sync_workbench_header)
         self._calib_panel.preview_pairs_changed.connect(self._on_preview_pairs_changed)
         self._calib_panel.log_added.connect(self._on_log_added)
@@ -419,7 +465,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.open_results_requested.connect(self._open_result_directory)
         self._calib_panel.capture_started.connect(self._stream_view.end_review)
         self._calib_panel.create_session_requested.connect(self._on_new_session)
-        self._gallery.pair_selected.connect(self._stream_view.show_review_images)
+        self._gallery.pair_selected.connect(self._on_gallery_pair_selected)
         self._stream_view.review_changed.connect(self._on_review_changed)
         self._stream_view.presentation_changed.connect(self._on_presentation_changed)
         self._stream_view.comparison_visible_changed.connect(self._comparison_host.setVisible)
@@ -446,6 +492,8 @@ class MainWindow(QMainWindow):
     @Slot(str, bool)
     def _sync_workbench_header(self, phase: str, multimodal: bool):
         self._set_stereo_capture_layout(phase == "capture" and not multimodal)
+        self._view_aux.setVisible(multimodal)
+        self._view_split.setVisible(multimodal)
         aux = self._stream_manager.auxiliary_camera
         label = "RGB + 声像仪 RGB" if aux is not None and aux.modality == "acoustic_rgb" else "RGB + 红外"
         with QSignalBlocker(self._combo_task), QSignalBlocker(self._workflow_tabs):
@@ -482,6 +530,11 @@ class MainWindow(QMainWindow):
         self._lbl_review.setToolTip(key)
         self._review_bar.setVisible(active)
 
+    @Slot(str, object)
+    def _on_gallery_pair_selected(self, key, images):
+        self._calib_panel.select_offline_preview(key)
+        self._stream_view.show_review_images(key, images)
+
     @Slot(bool)
     def _toggle_log_panel(self, expanded):
         self._toggle_logs.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
@@ -504,6 +557,8 @@ class MainWindow(QMainWindow):
     def _update_connection_summary(self):
         count, expected = len(self._connection_connected), len(self._connection_expected)
         text = f"已连接 {count}/{expected} 路" if expected else (f"已连接 {count} 路" if count else "未连接")
+        if not count and not expected and self._calib_panel.offline_selection:
+            text = '离线数据'
         self._lbl_connections.setText(text)
         color = SUCCESS if count and (not expected or count == expected) else (WARNING if expected else TEXT_DIM)
         self._lbl_connections.setStyleSheet(f"color:{color};")
@@ -642,6 +697,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_new_session(self):
+        if self._background_tasks_block("新建会话"):
+            return
         pairs = list(self._stream_manager.stereo_pairs.values())
         if not pairs:
             QMessageBox.warning(self, "提示", "请先配置相机")
@@ -650,25 +707,39 @@ class MainWindow(QMainWindow):
         try:
             session = self._session_manager.create_session(
                 self._board, pairs, auxiliary=self._stream_manager.auxiliary_camera, name="calib",
+                camera_model=self._camera_model.value,
             )
+            self._calib_panel.set_session(session)
         except Exception as exc:
             logger.exception("Create calibration session failed")
             self._calib_panel.append_log(f"创建会话失败，未采图：{exc}")
+            self._statusbar.showMessage(f"创建会话失败：{exc}")
             QMessageBox.warning(self, "创建会话失败", str(exc).splitlines()[0])
             return
         self._current_session = session
-        self._calib_panel.set_session(self._current_session)
         self._statusbar.showMessage(f"✓  新建会话: {self._current_session.name}")
 
     @Slot()
     def _on_load_session(self):
+        if self._background_tasks_block("加载会话"):
+            return
         dir_path = QFileDialog.getExistingDirectory(
             self, "选择会话目录", str(sessions_dir())
         )
         if dir_path:
+            if self._background_tasks_block("加载会话"):
+                return
             logger.info("Load calibration session: %s", dir_path)
-            self._current_session = CalibrationSession.load(Path(dir_path))
-            self._calib_panel.set_session(self._current_session)
+            try:
+                session = CalibrationSession.load(Path(dir_path))
+                self._calib_panel.set_session(session)
+            except Exception as exc:
+                text = f"加载会话失败，已保留当前会话：{exc}"
+                self._statusbar.showMessage(text)
+                self._calib_panel.append_log(text)
+                logger.exception("Load calibration session failed: %s", dir_path)
+                return
+            self._current_session = session
             self._statusbar.showMessage(f"✓  加载会话: {self._current_session.name}")
 
     @Slot()
@@ -853,6 +924,7 @@ class MainWindow(QMainWindow):
                     list(self._stream_manager.stereo_pairs.values()),
                     auxiliary=self._stream_manager.auxiliary_camera,
                     name="calib",
+                    camera_model=self._camera_model.value,
                 )
                 self._calib_panel.set_session(self._current_session)
             saved, errors = self._current_session.save_calibration_results(rig)
@@ -897,9 +969,27 @@ class MainWindow(QMainWindow):
         self._cloud_viewer.set_pointcloud(pcd)
         self._right_tabs.setCurrentIndex(self._cloud_tab_index)
 
+    def _background_tasks_block(self, action: str) -> bool:
+        if not self._calib_panel.has_active_background_tasks():
+            return False
+        text = (
+            f"{action}已拒绝：后台任务尚未完成，请先停止自动采集，"
+            "并等待标定、导入、保存或白平衡准备安全结束后重试。"
+        )
+        self._statusbar.showMessage(text)
+        self._calib_panel.append_log(text)
+        logger.warning(text)
+        return True
+
     def closeEvent(self, event):
+        if self._background_tasks_block("关闭窗口"):
+            event.ignore()
+            return
         if not self._calib_panel._white_balance_guard.shutdown():
-            self._statusbar.showMessage("正在取消白平衡准备，请稍后再次关闭窗口")
+            text = "关闭窗口已拒绝：白平衡资源尚未释放，请稍后重试。"
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
+            logger.warning(text)
             event.ignore()
             return
         self._stream_manager.stop_all()

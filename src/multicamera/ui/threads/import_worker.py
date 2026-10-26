@@ -6,12 +6,14 @@ import glob
 import os
 import re
 import traceback
+from collections import Counter
 from pathlib import Path
 
 import cv2
 from PySide6.QtCore import QThread, Signal
 
 from ...board.detector import CharucoDetector
+from ...calibration.assessment import DataAssessor
 from ...calibration.planar import PlanarPatternDetector
 
 
@@ -26,6 +28,7 @@ class StereoImageImportWorker(QThread):
         super().__init__(parent)
         self.folder = folder
         self.board = board
+        self.frame_qualities = {}
 
     def run(self):
         try:
@@ -38,7 +41,14 @@ class StereoImageImportWorker(QThread):
                 return
 
             self.log.emit(f"发现 {len(pairs)} 对候选离线图片")
+            paired_files = {path for _, left, right in pairs for path in (left, right)}
+            unused = [path for path in Path(self.folder).rglob('*')
+                      if path.is_file() and path.suffix.lower() in _IMAGE_EXTS and path not in paired_files]
+            if unused:
+                self.log.emit(f"有 {len(unused)} 张图片未参与配对，请检查左右命名或缺失文件")
             detector = CharucoDetector(self.board)
+            assessor = DataAssessor()
+            self.frame_qualities = {}
             imported = []
             skipped = 0
             for idx, lp, rp in pairs:
@@ -49,6 +59,10 @@ class StereoImageImportWorker(QThread):
                     continue
                 det_l = detector.detect(img_l)
                 det_r = detector.detect(img_r)
+                self.frame_qualities[str(idx)] = (
+                    assessor.assess_frame(img_l, det_l.num_corners, len(imported)),
+                    assessor.assess_frame(img_r, det_r.num_corners, len(imported)),
+                )
                 imported.append((idx, img_l, img_r, det_l, det_r))
 
             if not imported:
@@ -107,6 +121,8 @@ def _discover_stereo_pairs(folder: str) -> list[tuple[str, Path, Path]]:
     root = Path(folder)
     files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in _IMAGE_EXTS]
     by_norm = {_norm_path(p): p for p in files}
+    if len(by_norm) != len(files):
+        raise ValueError("存在仅大小写不同的图片路径，无法可靠区分左右配对，请先整理目录")
     pairs: list[tuple[str, Path, Path]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -120,6 +136,9 @@ def _discover_stereo_pairs(folder: str) -> list[tuple[str, Path, Path]]:
         seen.add(key)
         idx = _pair_index(root, left)
         pairs.append((idx, left, right))
+    counts = Counter(index for index, _, _ in pairs)
+    pairs = [(left.relative_to(root).as_posix() if counts[index] > 1 or not index else index, left, right)
+             for index, left, right in pairs]
     pairs.sort(key=lambda item: _natural_key(item[0]))
     return pairs
 

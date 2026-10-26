@@ -365,6 +365,7 @@ class CameraView(QFrame):
 
     def set_connected(self, connected: bool):
         if connected:
+            self._close_button.setToolTip("关闭此路预览（保持相机连接）")
             self._status_dot.setStyleSheet(f"color:{SUCCESS}; background:transparent;")
             self._header.setStyleSheet(
                 f"font-weight: bold; font-size: 13px; color: {TEXT};"
@@ -676,7 +677,7 @@ class MultiStreamView(QWidget):
             return self._planar_board.cols * self._planar_board.rows
         return self._board.num_corners
 
-    def _draw_detection(self, frame: np.ndarray, result: DetectionResult) -> np.ndarray:
+    def _draw_detection(self, frame: np.ndarray, result: DetectionResult, *, include_target=True) -> np.ndarray:
         if not self._multimodal_mode:
             vis = frame.copy()
             if result.valid:
@@ -686,11 +687,12 @@ class MultiStreamView(QWidget):
                 for point in points:
                     cv2.circle(vis, tuple(point.astype(int)), 2, (91, 182, 231), -1)
             target = self._capture_sequence.current if self._capture_sequence else None
-            if target is not None and self._review_images is None:
+            if include_target and target is not None and self._review_images is None:
                 h, w = frame.shape[:2]
                 x = int(target.norm_cx * w)
                 y = int(target.norm_cy * h)
-                rx, ry = int(w * .14), int(h * .14)
+                extent = {'small': .09, 'medium': .14, 'large': .20}.get(target.scale, .14)
+                rx, ry = int(w * extent), int(h * extent)
                 # A suggested image region, not a calibrated 3D target projection.
                 for start, end in (
                     ((x - rx, y - ry), (x + rx, y - ry)),
@@ -743,8 +745,10 @@ class MultiStreamView(QWidget):
             if camera_id not in visible_ids:
                 continue
             view = self._get_or_create_view(camera_id)
-            view.set_display_name(self._camera_label(camera_id))
-            view.set_connected(True)
+            view.set_display_name(self._camera_label(camera_id) + ' · 离线')
+            view.set_connected(False)
+            view._status_dot.setToolTip('离线图像，不代表相机已连接')
+            view._close_button.setToolTip('关闭这路离线图像预览')
             h, w = frame.shape[:2]
 
             if camera_id not in self._trackers:
@@ -752,13 +756,13 @@ class MultiStreamView(QWidget):
 
             result = self._detect_for_preview(frame)
             if self._show_guide:
-                display = self._draw_detection(frame, result)
+                display = self._draw_detection(frame, result, include_target=False)
             else:
                 display = frame
 
             view.update_frame(display)
-            suffix = f" | 角点 {result.num_corners}/{self._preview_corner_count}" if self._multimodal_mode else ""
-            view.update_info(f"{w}x{h} | 静态{suffix}")
+            suffix = f" | 角点 {result.num_corners}/{self._preview_corner_count}"
+            view.update_info(f"{w}x{h} | 离线图像{suffix}")
         if self._multimodal_mode:
             # Keep both roles visible even when only one offline image is available.
             for cid in self._multimodal_ids():

@@ -58,6 +58,7 @@ class PairGallery(QWidget):
         self._previous = QToolButton()
         self._previous.setIcon(standard_icon(self, QStyle.SP_ArrowLeft))
         self._previous.setToolTip("上一页配对图像")
+        self._previous.setAccessibleName("上一页配对图像")
         self._previous.setFixedSize(30, 36)
         self._previous.clicked.connect(lambda: self._page(-1))
         row.addWidget(self._previous)
@@ -80,6 +81,7 @@ class PairGallery(QWidget):
         self._next = QToolButton()
         self._next.setIcon(standard_icon(self, QStyle.SP_ArrowRight))
         self._next.setToolTip("下一页配对图像")
+        self._next.setAccessibleName("下一页配对图像")
         self._next.setFixedSize(30, 36)
         self._next.clicked.connect(lambda: self._page(1))
         row.addWidget(self._next)
@@ -112,6 +114,11 @@ class PairGallery(QWidget):
     def clear_selection(self):
         self._selected_key = None
         self._list.clearSelection()
+
+    def show_first_page(self):
+        self._start = 0
+        self.clear_selection()
+        self._refresh_page()
 
     @Slot(bool)
     def _set_expanded(self, expanded: bool):

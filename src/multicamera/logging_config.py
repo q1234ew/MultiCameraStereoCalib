@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import faulthandler
 import os
 import platform
 import sys
@@ -17,6 +18,8 @@ from .runtime_paths import exe_dir, logs_dir
 LOG_FILE_NAME = "multicamera.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
+FAULT_LOG_FILE_NAME = "multicamera_fault.log"
+_fault_stream = None
 
 
 def setup_logging(level: int = logging.INFO) -> Path:
@@ -53,8 +56,37 @@ def setup_logging(level: int = logging.INFO) -> Path:
 
     _install_exception_hooks()
     _install_qt_message_handler()
+    _install_fault_handler(log_path.parent)
     _log_startup_context(log_path)
     return log_path
+
+
+def _install_fault_handler(directory: Path) -> None:
+    global _fault_stream
+    try:
+        if _fault_stream is not None:
+            faulthandler.disable()
+            _fault_stream.close()
+            _fault_stream = None
+        path = directory / FAULT_LOG_FILE_NAME
+        # Native handlers keep a file descriptor: rotate only before enabling.
+        if path.exists() and path.stat().st_size >= LOG_MAX_BYTES:
+            for index in range(LOG_BACKUP_COUNT, 0, -1):
+                previous = path if index == 1 else path.with_name(f"{path.name}.{index - 1}")
+                target = path.with_name(f"{path.name}.{index}")
+                if previous.exists():
+                    previous.replace(target)
+        stream = path.open('ab', buffering=0)
+        try:
+            stream.write(f"\n=== native fault log pid={os.getpid()} python={sys.version.split()[0]} ===\n".encode('utf-8'))
+            faulthandler.enable(file=stream, all_threads=True)
+        except Exception:
+            stream.close()
+            raise
+        _fault_stream = stream
+        logging.getLogger(__name__).info("Native fault log: %s", path)
+    except Exception:
+        logging.getLogger(__name__).exception("Could not enable native fault logging")
 
 
 def _install_exception_hooks() -> None:
@@ -110,6 +142,13 @@ def _log_startup_context(log_path: Path) -> None:
     logger.info("platform=%s", platform.platform())
     logger.info("cwd=%s", Path.cwd())
     logger.info("pid=%s", os.getpid())
+    try:
+        import PySide6
+        from PySide6.QtCore import qVersion
+
+        logger.info("PySide6=%s Qt=%s", PySide6.__version__, qVersion())
+    except Exception:
+        logger.exception("Could not inspect Qt runtime")
     try:
         from .diagnostics import opencv_runtime_info
 

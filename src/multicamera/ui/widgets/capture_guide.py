@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..opencv_unicode_text import TextPainter
+from .board_motion import BoardTilt, TILT_LABELS, tilt_point
 from ..theme import (BG_DARK, BG_MID, BORDER, TEXT, TEXT_DIM, TEXT_HINT, ACCENT, PRIMARY,
                      SUCCESS, WARNING, standard_icon, app_icon)
 
@@ -43,22 +44,6 @@ from ..theme import (BG_DARK, BG_MID, BORDER, TEXT, TEXT_DIM, TEXT_HINT, ACCENT,
 #  Data model
 # ═══════════════════════════════════════════════════════════════
 
-
-class BoardTilt(Enum):
-    FRONT = auto()
-    TILT_LEFT = auto()
-    TILT_RIGHT = auto()
-    TILT_UP = auto()
-    TILT_DOWN = auto()
-
-
-TILT_LABELS = {
-    BoardTilt.FRONT: "正面",
-    BoardTilt.TILT_LEFT: "左倾",
-    BoardTilt.TILT_RIGHT: "右倾",
-    BoardTilt.TILT_UP: "上倾",
-    BoardTilt.TILT_DOWN: "下倾",
-}
 
 # Image position is independent of physical board distance.
 STEREO_ZONE_LABELS = {
@@ -87,6 +72,7 @@ class CaptureTarget:
     zone_col: int          # 0-2
     tilt: BoardTilt
     status: CaptureStatus = CaptureStatus.PENDING
+    scale: str = "medium"
 
     @property
     def norm_cx(self) -> float:
@@ -270,70 +256,19 @@ class CaptureSequence:
 _ZONE_BORDER_PAD = 0.03  # 3% padding from edges
 
 # 倾角在示意中的口语说明（相对镜头/画面）
-TILT_POSE_HINT: dict[BoardTilt, str] = {
-    BoardTilt.FRONT: "正对镜头，平行像面",
-    BoardTilt.TILT_LEFT: "向左侧倾",
-    BoardTilt.TILT_RIGHT: "向右侧倾",
-    BoardTilt.TILT_UP: "向上侧倾",
-    BoardTilt.TILT_DOWN: "向下侧倾",
-}
+TILT_POSE_HINT: dict[BoardTilt, str] = {**TILT_LABELS, BoardTilt.FRONT: "正对镜头，平行像面"}
 
 
 def board_corners_f(
     cx: float, cy: float, half_w: float, half_h: float, tilt: BoardTilt
 ) -> np.ndarray:
-    """标定板四角 (4x2)，与旧版 OpenCV 示意几何一致，便于多尺度复用。"""
-    if tilt == BoardTilt.FRONT:
-        return np.array(
-            [
-                [cx - half_w, cy - half_h],
-                [cx + half_w, cy - half_h],
-                [cx + half_w, cy + half_h],
-                [cx - half_w, cy + half_h],
-            ],
-            dtype=np.float64,
-        )
-    if tilt == BoardTilt.TILT_LEFT:
-        return np.array(
-            [
-                [cx - half_w + half_w / 3, cy - half_h + half_h / 4],
-                [cx + half_w, cy - half_h],
-                [cx + half_w, cy + half_h],
-                [cx - half_w + half_w / 3, cy + half_h - half_h / 4],
-            ],
-            dtype=np.float64,
-        )
-    if tilt == BoardTilt.TILT_RIGHT:
-        return np.array(
-            [
-                [cx - half_w, cy - half_h],
-                [cx + half_w - half_w / 3, cy - half_h + half_h / 4],
-                [cx + half_w - half_w / 3, cy + half_h - half_h / 4],
-                [cx - half_w, cy + half_h],
-            ],
-            dtype=np.float64,
-        )
-    if tilt == BoardTilt.TILT_UP:
-        return np.array(
-            [
-                [cx - half_w + half_w / 4, cy - half_h + half_h / 3],
-                [cx + half_w - half_w / 4, cy - half_h + half_h / 3],
-                [cx + half_w, cy + half_h],
-                [cx - half_w, cy + half_h],
-            ],
-            dtype=np.float64,
-        )
-    if tilt == BoardTilt.TILT_DOWN:
-        return np.array(
-            [
-                [cx - half_w, cy - half_h],
-                [cx + half_w, cy - half_h],
-                [cx + half_w - half_w / 4, cy + half_h - half_h / 3],
-                [cx - half_w + half_w / 4, cy + half_h - half_h / 3],
-            ],
-            dtype=np.float64,
-        )
-    return board_corners_f(cx, cy, half_w, half_h, BoardTilt.FRONT)
+    """Lens-view projection of the same motion used by the animation."""
+    points = np.array([tilt_point(x, y, 1., tilt) for x, y in
+                       ((-1.45, -1), (1.45, -1), (1.45, 1), (-1.45, 1))])
+    projected = points[:, :2] / points[:, 2:3]
+    # Fit the slot without reversing perspective: the nearer edge stays larger.
+    projected /= np.maximum(np.max(np.abs(projected), axis=0), 1e-9)
+    return projected * (half_w, half_h) + (cx, cy)
 
 
 def paint_board_pose_schematic(

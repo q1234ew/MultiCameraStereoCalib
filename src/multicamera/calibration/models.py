@@ -26,6 +26,8 @@ class CameraIntrinsics:
     per_frame_errors: Optional[List[float]] = None
     rvecs: Optional[List[np.ndarray]] = None
     tvecs: Optional[List[np.ndarray]] = None
+    frame_ids: Optional[List[str]] = None
+    per_frame_error_metric: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -37,6 +39,10 @@ class CameraIntrinsics:
         }
         if self.per_frame_errors is not None:
             d["per_frame_errors"] = self.per_frame_errors
+        if self.frame_ids is not None:
+            d["frame_ids"] = list(self.frame_ids)
+        if self.per_frame_error_metric is not None:
+            d["per_frame_error_metric"] = self.per_frame_error_metric
         return d
 
     @classmethod
@@ -48,6 +54,8 @@ class CameraIntrinsics:
             model=CameraModel(d.get("model", "pinhole")),
             rms_error=d.get("rms_error", 0.0),
             per_frame_errors=d.get("per_frame_errors"),
+            frame_ids=d.get("frame_ids"),
+            per_frame_error_metric=d.get("per_frame_error_metric"),
         )
 
 
@@ -146,9 +154,10 @@ class StereoPairCalibration:
     left_intrinsics: CameraIntrinsics
     right_intrinsics: CameraIntrinsics
     stereo: StereoCalibResult
+    calibration_info: Dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "pair_name": self.pair_name,
             "left_id": self.left_id,
             "right_id": self.right_id,
@@ -156,6 +165,9 @@ class StereoPairCalibration:
             "right_intrinsics": self.right_intrinsics.to_dict(),
             "stereo": self.stereo.to_dict(),
         }
+        if self.calibration_info:
+            result["calibration_info"] = self.calibration_info
+        return result
 
     @classmethod
     def from_dict(cls, d: dict) -> StereoPairCalibration:
@@ -166,6 +178,7 @@ class StereoPairCalibration:
             left_intrinsics=CameraIntrinsics.from_dict(d["left_intrinsics"]),
             right_intrinsics=CameraIntrinsics.from_dict(d["right_intrinsics"]),
             stereo=StereoCalibResult.from_dict(d["stereo"]),
+            calibration_info=d.get("calibration_info", {}),
         )
 
 

@@ -18,6 +18,153 @@ def _check(condition, message):
         raise RuntimeError(message)
 
 
+def _exercise_fisheye(report: dict) -> dict:
+    import cv2
+    import numpy as np
+
+    from .board.charuco_board import CharucoBoard, CharucoBoardConfig
+    from .board.detector import DetectionResult
+    from .calibration.intrinsic import IntrinsicCalibrator
+    from .calibration.models import CameraModel, MultiCameraRig, StereoPairCalibration
+    from .calibration.stereo import StereoCalibrator
+    from .io.export import export_rig_calibration_bundle
+
+    report["stage"] = "fisheye_observations"
+    board = CharucoBoard(CharucoBoardConfig())
+    frames, size = 16, (1280, 720)
+    left, right = [IntrinsicCalibrator(board, CameraModel.FISHEYE, min_frames=frames)
+                   for _ in range(2)]
+    stereo = StereoCalibrator(board, CameraModel.FISHEYE, min_frames=frames)
+    k = np.array([[900., 0., 640.], [0., 880., 360.], [0., 0., 1.]])
+    d = np.array([.03, -.01, .002, -.001])
+    expected_r = cv2.Rodrigues(np.array([.01, -.02, .005]))[0]
+    expected_t = np.array([[-.12], [0.], [0.]])
+    obj = board.object_points.astype(np.float64).reshape(-1, 1, 3)
+    ids = np.arange(board.num_corners, dtype=np.int32)
+    observations = []
+    for i in range(frames):
+        rv = np.array([.3 * np.sin(i), .25 * np.cos(i), .03 * i])
+        tv = np.array([[-.12 + .01 * i], [-.1 + .015 * np.sin(i)], [.7 + .025 * i]])
+        right_rv = cv2.Rodrigues(expected_r @ cv2.Rodrigues(rv)[0])[0]
+        keep = ids != i if i % 3 else np.ones(len(ids), dtype=bool)
+        detections = []
+        for rotation, translation in ((rv, tv), (right_rv, expected_r @ tv + expected_t)):
+            points = cv2.fisheye.projectPoints(obj, rotation, translation, k, d)[0]
+            detections.append(DetectionResult(
+                points[keep].astype(np.float32), ids[keep].reshape(-1, 1), [], None, size,
+            ))
+        _check(left.add_detection(detections[0]), "Fisheye left observation rejected")
+        _check(right.add_detection(detections[1]), "Fisheye right observation rejected")
+        _check(stereo.add_detection_pair(*detections), "Fisheye stereo observation rejected")
+        observations.append(detections)
+    counts = stereo.frame_common_corner_counts
+    _check(len(set(counts)) > 1, "Fisheye variable corner counts not exercised")
+    report["stage"] = "fisheye_intrinsics_left"
+    intr_l = left.calibrate()
+    report["stage"] = "fisheye_intrinsics_right"
+    intr_r = right.calibrate()
+    for intr in (intr_l, intr_r):
+        _check(intr.model == CameraModel.FISHEYE, "Fisheye intrinsic model changed")
+        _check(np.isfinite(intr.rms_error) and intr.rms_error < .001,
+               "Fisheye intrinsic RMS too high")
+        np.testing.assert_allclose(intr.camera_matrix, k, atol=.03, rtol=0)
+        np.testing.assert_allclose(intr.dist_coeffs.ravel(), d, atol=.003, rtol=0)
+        _check(len(intr.per_frame_errors) == frames, "Fisheye per-frame errors missing")
+
+    report["stage"] = "fisheye_variable_corner_guard"
+    try:
+        stereo.calibrate(intr_l, intr_r)
+    except cv2.error as exc:
+        raise RuntimeError("Fisheye variable corners reached an OpenCV assertion") from exc
+    except ValueError as exc:
+        rejection = str(exc)
+        _check("跨帧共同角点" in rejection and "鱼眼兼容" in rejection,
+               "Fisheye variable-corner rejection is not actionable")
+    else:
+        raise RuntimeError("Fisheye variable corners were not explicitly rejected")
+    report["stage"] = "fisheye_stereo_calibration"
+    compatible = stereo.copy_with_common_ids()
+    _check(compatible.num_frames == frames, "Fisheye compatibility discarded frames")
+    _check(compatible.frame_ids == stereo.frame_ids, "Fisheye compatibility changed frame IDs")
+    _check(len(set(compatible.frame_common_corner_counts)) == 1,
+           "Fisheye compatibility did not equalize corner counts")
+    _check(stereo.frame_common_corner_counts == counts, "Fisheye source observations mutated")
+    result = compatible.calibrate(intr_l, intr_r)
+    _check(result.model == CameraModel.FISHEYE, "Fisheye stereo model changed")
+    _check(np.isfinite(result.rms_error) and result.rms_error < .001, "Fisheye stereo RMS too high")
+    np.testing.assert_allclose(result.R, expected_r, atol=1e-4, rtol=0)
+    np.testing.assert_allclose(result.T.reshape(3, 1), expected_t, atol=1e-4, rtol=0)
+
+    report["stage"] = "fisheye_rectification"
+    for matrix in (result.Q, result.R1, result.R2, result.P1, result.P2,
+                   result.map1_left, result.map2_left, result.map1_right, result.map2_right):
+        _check(matrix is not None and np.isfinite(matrix).all(), "Fisheye rectification invalid")
+    for mapping in (result.map1_left, result.map2_left, result.map1_right, result.map2_right):
+        _check(mapping.shape == size[::-1], "Fisheye rectification map size changed")
+    # Measure perpendicular to the rectified disparity axis using identical corner IDs.
+    axis = 1 if abs(result.P2[0, 3]) > abs(result.P2[1, 3]) else 0
+    residuals = []
+    for det_l, det_r in observations:
+        rectified = [cv2.fisheye.undistortPoints(
+            det.charuco_corners.astype(np.float64), intr.camera_matrix, intr.dist_coeffs,
+            R=rotation, P=projection,
+        ).reshape(-1, 2) for det, intr, rotation, projection in (
+            (det_l, intr_l, result.R1, result.P1), (det_r, intr_r, result.R2, result.P2),
+        )]
+        residuals.extend((rectified[0][:, axis] - rectified[1][:, axis]).tolist())
+    rectified_rms = float(np.sqrt(np.mean(np.square(residuals))))
+    _check(np.isfinite(rectified_rms) and rectified_rms < .001,
+           "Fisheye rectified same-ID residual too high")
+
+    rig = MultiCameraRig(reference_camera="fisheye_L", pairs={
+        "fisheye": StereoPairCalibration(
+            "fisheye", "fisheye_L", "fisheye_R", intr_l, intr_r, result,
+        ),
+    })
+    report["stage"] = "fisheye_export_and_readback"
+    with tempfile.TemporaryDirectory(prefix="multicamera-fisheye-selftest-") as temp:
+        paths = export_rig_calibration_bundle(rig, temp)
+        restored = MultiCameraRig.from_dict(json.loads(paths[0].read_text(encoding="utf-8")))
+        pair = restored.pairs["fisheye"]
+        for intr, expected in ((pair.left_intrinsics, intr_l), (pair.right_intrinsics, intr_r)):
+            _check(intr.model == CameraModel.FISHEYE, "JSON lost fisheye intrinsic model")
+            np.testing.assert_allclose(intr.camera_matrix, expected.camera_matrix)
+            np.testing.assert_allclose(intr.dist_coeffs, expected.dist_coeffs)
+        _check(pair.stereo.model == CameraModel.FISHEYE, "JSON lost fisheye stereo model")
+        np.testing.assert_allclose(pair.stereo.R, result.R)
+        np.testing.assert_allclose(pair.stereo.T, result.T)
+        np.testing.assert_allclose(pair.stereo.Q, result.Q)
+        for path in paths[1:3]:
+            fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+            try:
+                _check(fs.isOpened(), f"Cannot reopen fisheye {path.name}")
+                for key in ("camera_model", "left_model", "right_model"):
+                    _check(fs.getNode(key).string() == "fisheye", "OpenCV lost fisheye model")
+                _check(fs.getNode("distortion_model").string() == "equidistant",
+                       "OpenCV lost equidistant distortion model")
+                for key, expected in (("M1", intr_l.camera_matrix), ("D1", intr_l.dist_coeffs),
+                                      ("M2", intr_r.camera_matrix), ("D2", intr_r.dist_coeffs),
+                                      ("R", result.R), ("T", result.T), ("Q", result.Q),
+                                      ("R1", result.R1), ("R2", result.R2),
+                                      ("P1", result.P1), ("P2", result.P2)):
+                    np.testing.assert_allclose(fs.getNode(key).mat(), expected)
+            finally:
+                fs.release()
+        _check(all(path.stat().st_size > 0 for path in paths), "Empty fisheye export file")
+        exports = [path.name for path in paths]
+    return {
+        "model": "fisheye", "frames": frames, "compatible_frames": compatible.num_frames,
+        "original_common_corner_counts": counts,
+        "compatible_common_corners": compatible.frame_common_corner_counts[0],
+        "variable_corner_rejection": rejection,
+        "left_rms": float(intr_l.rms_error), "right_rms": float(intr_r.rms_error),
+        "stereo_rms": float(result.rms_error), "baseline_m": float(np.linalg.norm(result.T)),
+        "rectified_rms_px": rectified_rms, "rectified_error_axis": "xy"[axis],
+        "rectified_corner_count": len(residuals), "exports": exports,
+        "coverage": "fisheye intrinsics, explicit common-ID stereo, rectification, JSON/OpenCV readback",
+    }
+
+
 def _exercise_calibration(report: dict) -> dict:
     import cv2
     import numpy as np
@@ -54,9 +201,10 @@ def _exercise_calibration(report: dict) -> dict:
         _check(right.add_detection(detections[1]), "Right observation rejected")
         _check(stereo.add_detection_pair(*detections), "Stereo observation rejected")
     report["stage"] = "intrinsics_left"
-    intr_l = left.calibrate()
+    # The synthetic pinhole lens is distortion-free; keep the Kalibr-incompatible k3 fixed.
+    intr_l = left.calibrate(flags=cv2.CALIB_FIX_K3)
     report["stage"] = "intrinsics_right"
-    intr_r = right.calibrate()
+    intr_r = right.calibrate(flags=cv2.CALIB_FIX_K3)
     report["stage"] = "stereo_calibration"
     result = stereo.calibrate(intr_l, intr_r)
     for intr in (intr_l, intr_r):
@@ -101,6 +249,7 @@ def _exercise_calibration(report: dict) -> dict:
         "stereo_rms": float(result.rms_error), "baseline_m": float(np.linalg.norm(result.T)),
         "exports": exports,
         "coverage": "pinhole intrinsics, stereo, rectification, JSON/OpenCV readback, Kalibr export",
+        "fisheye": _exercise_fisheye(report),
     }
 
 

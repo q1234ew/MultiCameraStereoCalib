@@ -22,6 +22,7 @@ def stereo_bench(app, monkeypatch, tmp_path):
     configure_application_style(app)
     monkeypatch.setattr(main_window, 'sessions_dir', lambda: tmp_path / 'sessions')
     window = main_window.MainWindow()
+    window._stereo_capture.guide_mode.setCurrentIndex(1)
     configure(window)
     window._calib_panel.show_workflow('capture', False)
     window.resize(1440, 1024)
@@ -98,7 +99,22 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
             assert win.rect().contains(control.mapTo(win, control.rect().bottomRight()))
             assert control.height() >= control.minimumSizeHint().height()
         assert guide.instruction.height() >= guide.instruction.fontMetrics().height()
+        assert win._preview_scroll.horizontalScrollBar().maximum() == 0
+        if width == 1280:
+            viewport = win._preview_scroll.viewport()
+            canvas = guide.schematic.canvas
+            assert viewport.rect().contains(canvas.mapTo(viewport, canvas.rect().topLeft()))
+            assert viewport.rect().contains(canvas.mapTo(viewport, canvas.rect().bottomRight()))
+            assert guide.compact_summary.isVisible() and not guide.pose.isVisible()
         win.grab().save(str(directory / f'stereo-capture-{width}.png'))
+    panel._capture_sequence.jump_to(10)
+    guide.refresh()
+    guide.schematic.pause.setChecked(True)
+    guide.schematic.progress = .65
+    win._preview_scroll.ensureWidgetVisible(guide.schematic.canvas)
+    app.processEvents()
+    assert '右边缘靠近镜头' in guide.instruction.text()
+    win.grab().save(str(directory / 'stereo-capture-motion-scrolled.png'))
 
 
 def test_pose_uses_calibrated_pnp_not_example_values(stereo_bench):
@@ -146,6 +162,7 @@ def test_auto_waits_for_stability_and_rejects_stale_or_review(stereo_bench, monk
     assert not guide.auto_ready()
     guide.refresh()
     assert '回看' in guide.instruction.text()
+    assert not guide.schematic.timer.isActive()
 
 
 def test_auto_toggle_and_navigation_stop_timer(stereo_bench):
@@ -173,3 +190,32 @@ def test_region_overlay_never_modifies_source_or_implies_depth(stereo_bench):
     assert np.array_equal(frame, before)
     assert not np.array_equal(rendered, before)
     assert all('距' not in target.label for target in win._calib_panel._capture_sequence.targets)
+
+
+def test_basic_checks_do_not_claim_pose_acceptance(stereo_bench):
+    win = stereo_bench
+    det, frame, _ = sample(win)
+    win._calib_panel._capture_sequence.jump_to(10)
+    publish(win, det, frame)
+    publish(win, det, frame)
+    guide = win._stereo_capture
+    assert '不含姿态' in guide.status.text()
+    assert '待人工确认' in guide.pose_status.text()
+    assert not guide.auto_ready()
+
+
+def test_duplicate_capture_is_advisory_and_undoable(stereo_bench, monkeypatch):
+    win = stereo_bench
+    panel = win._calib_panel
+    det, frame, _ = sample(win)
+    monkeypatch.setattr(panel, '_ensure_capture_session', lambda: True)
+    monkeypatch.setattr(panel, '_prepare_white_balance', lambda *args: True)
+    publish(win, det, frame)
+    panel._capture_impl()
+    count = panel._stereo_cals['rgb'].num_frames
+    publish(win, det, frame)
+    panel._capture_impl()
+    assert panel._stereo_cals['rgb'].num_frames == count + 1
+    assert '重复构图提醒' in panel._log_text.toPlainText()
+    panel._on_undo_capture()
+    assert panel._stereo_cals['rgb'].num_frames == count

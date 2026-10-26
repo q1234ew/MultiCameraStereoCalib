@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import cv2
@@ -12,6 +13,7 @@ from ..board.charuco_board import CharucoBoard
 from ..board.detector import CharucoDetector, DetectionResult
 from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel, StereoCalibResult
+from .observations import prepare_observation
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,9 @@ class StereoCalibrator:
         self._obj_points: List[np.ndarray] = []
         self._img_points_left: List[np.ndarray] = []
         self._img_points_right: List[np.ndarray] = []
+        self._corner_ids: List[np.ndarray] = []
         self._image_size: Optional[Tuple[int, int]] = None
+        self.frame_ids: List[str] = []
 
     @property
     def num_frames(self) -> int:
@@ -48,6 +52,10 @@ class StereoCalibrator:
     @property
     def frame_common_corner_counts(self) -> List[int]:
         return [int(len(obj)) for obj in self._obj_points]
+
+    @property
+    def frame_corner_ids(self) -> List[np.ndarray]:
+        return [ids.copy() for ids in self._corner_ids]
 
     @property
     def ready(self) -> bool:
@@ -66,15 +74,23 @@ class StereoCalibrator:
         self,
         det_l: DetectionResult,
         det_r: DetectionResult,
+        frame_id: str | None = None,
     ) -> bool:
         """Store an already computed left/right ChArUco detection pair."""
         if det_l.valid and det_r.valid:
+            corners_l, ids_l, size = prepare_observation(det_l, self.board, self._image_size)
+            corners_r, ids_r, _ = prepare_observation(det_r, self.board, size)
+            det_l = replace(det_l, charuco_corners=corners_l, charuco_ids=ids_l)
+            det_r = replace(det_r, charuco_corners=corners_r, charuco_ids=ids_r)
             obj_pts, img_l, img_r = self._find_common_points(det_l, det_r)
             if obj_pts is not None and len(obj_pts) >= MIN_COMMON_CORNERS:
+                common_ids = np.intersect1d(ids_l.ravel(), ids_r.ravel())
                 self._obj_points.append(obj_pts)
                 self._img_points_left.append(img_l)
                 self._img_points_right.append(img_r)
-                self._image_size = det_l.image_size
+                self._corner_ids.append(common_ids.copy())
+                self.frame_ids.append(str(frame_id) if frame_id is not None else str(self.num_frames))
+                self._image_size = size
                 return True
         return False
 
@@ -85,11 +101,14 @@ class StereoCalibrator:
         self._obj_points.pop()
         self._img_points_left.pop()
         self._img_points_right.pop()
+        self._corner_ids.pop()
+        self.frame_ids.pop()
         if not self._obj_points:
             self._image_size = None
         return True
 
     def copy_with_indices(self, indices: List[int]) -> "StereoCalibrator":
+        self._require_corner_ids()
         clone = StereoCalibrator(self.board, self.model, self.min_frames)
         for idx in indices:
             if idx < 0 or idx >= self.num_frames:
@@ -97,7 +116,41 @@ class StereoCalibrator:
             clone._obj_points.append(self._obj_points[idx].copy())
             clone._img_points_left.append(self._img_points_left[idx].copy())
             clone._img_points_right.append(self._img_points_right[idx].copy())
+            clone._corner_ids.append(self._corner_ids[idx].copy())
+            clone.frame_ids.append(self.frame_ids[idx])
         clone._image_size = self._image_size if clone._obj_points else None
+        return clone
+
+    def _require_corner_ids(self):
+        if len(self._corner_ids) != self.num_frames:
+            raise ValueError("缺少逐帧角点 ID，无法按真实 ID 复制观测，请重新采集或导入")
+        for i, ids in enumerate(self._corner_ids):
+            if (ids is None or np.asarray(ids).ndim != 1
+                    or len(ids) != len(self._obj_points[i])
+                    or not np.issubdtype(np.asarray(ids).dtype, np.integer)
+                    or len(np.unique(ids)) != len(ids)):
+                raise ValueError(f"第 {i + 1} 帧角点 ID 缺失或无效，无法按真实 ID 复制观测")
+
+    def copy_with_common_ids(self) -> "StereoCalibrator":
+        """Explicitly select identical board IDs across all views on a copy."""
+        if not self.num_frames:
+            raise ValueError("没有双目观测，无法计算跨帧共同角点")
+        self._require_corner_ids()
+        common_ids = self._corner_ids[0].copy()
+        for ids in self._corner_ids[1:]:
+            common_ids = np.intersect1d(common_ids, ids)
+        if len(common_ids) < MIN_COMMON_CORNERS:
+            raise ValueError(
+                f"跨帧共同角点仅 {len(common_ids)} 个，至少需要 {MIN_COMMON_CORNERS} 个；"
+                "请补拍具有足够共同角点的标定板观测"
+            )
+        clone = self.copy_with_indices(list(range(self.num_frames)))
+        for i, ids in enumerate(self._corner_ids):
+            _, take, _ = np.intersect1d(ids, common_ids, return_indices=True)
+            clone._obj_points[i] = self._obj_points[i][take].copy()
+            clone._img_points_left[i] = self._img_points_left[i][take].copy()
+            clone._img_points_right[i] = self._img_points_right[i][take].copy()
+            clone._corner_ids[i] = np.sort(common_ids).copy()
         return clone
 
     def calibrate(
@@ -106,10 +159,25 @@ class StereoCalibrator:
         right_intrinsics: CameraIntrinsics,
         flags: int = 0,
     ) -> StereoCalibResult:
+        """Solve and update both intrinsics from the solver's returned K/D.
+
+        Zero flags preserve the fixed-intrinsic default. Nonzero flags belong
+        to the selected model's OpenCV namespace. Changed intrinsics invalidate
+        single-camera fit metrics and poses; their original observations are
+        not available here to recompute them.
+        """
         if not self.ready:
             raise ValueError(
                 f"Need at least {self.min_frames} frames, have {self.num_frames}"
             )
+
+        if self.model not in (CameraModel.PINHOLE, CameraModel.FISHEYE):
+            raise ValueError(f"Unsupported camera model: {self.model}")
+        self._validate_intrinsics(left_intrinsics)
+        self._validate_intrinsics(right_intrinsics)
+        size = self._validate_image_size(self._image_size)
+        if left_intrinsics.image_size != size or right_intrinsics.image_size != size:
+            raise ValueError("Intrinsics and stereo observations must have the same image size")
 
         if self.model == CameraModel.FISHEYE:
             with perf_timer("fisheye stereo calibrate", threshold_ms=500.0):
@@ -129,10 +197,10 @@ class StereoCalibrator:
             self._obj_points,
             self._img_points_left,
             self._img_points_right,
-            left.camera_matrix,
-            left.dist_coeffs,
-            right.camera_matrix,
-            right.dist_coeffs,
+            np.array(left.camera_matrix, dtype=np.float64, copy=True),
+            np.array(left.dist_coeffs, dtype=np.float64, copy=True),
+            np.array(right.camera_matrix, dtype=np.float64, copy=True),
+            np.array(right.dist_coeffs, dtype=np.float64, copy=True),
             self._image_size,
             flags=flags,
         )
@@ -141,7 +209,11 @@ class StereoCalibrator:
         result = StereoCalibResult(
             R=R, T=T, E=E, F=F, rms_error=rms, model=CameraModel.PINHOLE
         )
-        self._rectify_pinhole(result, left, right)
+        solved_left = self._solved_intrinsics(left, K1, d1)
+        solved_right = self._solved_intrinsics(right, K2, d2)
+        self._rectify_pinhole(result, solved_left, solved_right)
+        self._apply_intrinsics(left, solved_left)
+        self._apply_intrinsics(right, solved_right)
         return result
 
     def _rectify_pinhole(
@@ -170,21 +242,32 @@ class StereoCalibrator:
     def _calibrate_fisheye(
         self, left: CameraIntrinsics, right: CameraIntrinsics, flags: int
     ) -> StereoCalibResult:
+        counts = self.frame_common_corner_counts
+        if len(set(counts)) > 1:
+            details = "、".join(
+                f"{self.frame_ids[i] if i < len(self.frame_ids) else i + 1}: {count} 点"
+                for i, count in enumerate(counts)
+            )
+            raise ValueError(
+                "鱼眼双目标定要求跨帧共同角点数量一致，当前观测为："
+                f"{details}。请选择“鱼眼兼容：跨帧共同角点”后重试；原始观测未修改。"
+            )
         obj_fish = [o.reshape(-1, 1, 3).astype(np.float64) for o in self._obj_points]
         img_l = [p.reshape(-1, 1, 2).astype(np.float64) for p in self._img_points_left]
         img_r = [p.reshape(-1, 1, 2).astype(np.float64) for p in self._img_points_right]
 
-        K1 = left.camera_matrix.copy()
-        d1 = left.dist_coeffs.copy().reshape(4, 1)
-        K2 = right.camera_matrix.copy()
-        d2 = right.dist_coeffs.copy().reshape(4, 1)
+        K1 = np.array(left.camera_matrix, dtype=np.float64, copy=True)
+        d1 = np.array(left.dist_coeffs, dtype=np.float64, copy=True).reshape(4, 1)
+        K2 = np.array(right.camera_matrix, dtype=np.float64, copy=True)
+        d2 = np.array(right.dist_coeffs, dtype=np.float64, copy=True).reshape(4, 1)
 
-        fish_flags = (
+        fish_flags = flags or (
             cv2.fisheye.CALIB_FIX_INTRINSIC
             | cv2.fisheye.CALIB_FIX_SKEW
         )
 
-        rms, K1, d1, K2, d2, R, T = cv2.fisheye.stereoCalibrate(
+        # Newer bindings also return per-view board poses after R/T.
+        rms, K1, d1, K2, d2, R, T, *_ = cv2.fisheye.stereoCalibrate(
             obj_fish, img_l, img_r,
             K1, d1, K2, d2,
             self._image_size,
@@ -199,7 +282,11 @@ class StereoCalibrator:
         result = StereoCalibResult(
             R=R, T=T, E=E, F=F, rms_error=rms, model=CameraModel.FISHEYE
         )
-        self._rectify_fisheye(result, left, right)
+        solved_left = self._solved_intrinsics(left, K1, d1)
+        solved_right = self._solved_intrinsics(right, K2, d2)
+        self._rectify_fisheye(result, solved_left, solved_right)
+        self._apply_intrinsics(left, solved_left)
+        self._apply_intrinsics(right, solved_right)
         return result
 
     def _rectify_fisheye(
@@ -235,6 +322,57 @@ class StereoCalibrator:
 
     # ── Common ────────────────────────────────────────────────
 
+    @staticmethod
+    def _validate_image_size(size) -> Tuple[int, int]:
+        if (not isinstance(size, (tuple, list)) or len(size) != 2
+                or any(isinstance(v, (bool, np.bool_))
+                       or not isinstance(v, (int, np.integer)) or v <= 0 for v in size)):
+            raise ValueError("Image size must contain two positive integer dimensions")
+        return tuple(int(v) for v in size)
+
+    def _validate_intrinsics(self, intrinsics: CameraIntrinsics):
+        if intrinsics.model != self.model:
+            raise ValueError("Intrinsic model must match the stereo camera model")
+        self._validate_image_size(intrinsics.image_size)
+        k = np.asarray(intrinsics.camera_matrix)
+        if (k.shape != (3, 3) or not np.isfinite(k).all()
+                or k[0, 0] <= 0 or k[1, 1] <= 0
+                or not np.allclose(k[2], [0., 0., 1.], rtol=0, atol=1e-12)
+                or k[1, 0] != 0):
+            raise ValueError("Camera matrix must be finite 3x3 with positive focal lengths")
+        d = np.asarray(intrinsics.dist_coeffs)
+        counts = (4,) if self.model == CameraModel.FISHEYE else (4, 5, 8, 12, 14)
+        if (d.ndim not in (1, 2) or (d.ndim == 2 and 1 not in d.shape)
+                or d.size not in counts or not np.isfinite(d).all()):
+            raise ValueError("Invalid distortion coefficient vector for the camera model")
+
+    def _solved_intrinsics(self, original: CameraIntrinsics, k, d) -> CameraIntrinsics:
+        solved = replace(
+            original,
+            camera_matrix=np.array(k, dtype=np.float64, copy=True),
+            dist_coeffs=np.array(d, dtype=np.float64, copy=True),
+        )
+        self._validate_intrinsics(solved)
+        changed = (not np.array_equal(original.camera_matrix, solved.camera_matrix)
+                   or not np.array_equal(np.asarray(original.dist_coeffs).ravel(),
+                                         solved.dist_coeffs.ravel()))
+        if changed:
+            solved.rms_error = float("nan")
+            solved.per_frame_errors = None
+            solved.rvecs = None
+            solved.tvecs = None
+        return solved
+
+    @staticmethod
+    def _apply_intrinsics(target: CameraIntrinsics, solved: CameraIntrinsics):
+        # Commit only after rectification succeeds, never during OpenCV's solve.
+        target.camera_matrix = solved.camera_matrix
+        target.dist_coeffs = solved.dist_coeffs
+        target.rms_error = solved.rms_error
+        target.per_frame_errors = solved.per_frame_errors
+        target.rvecs = solved.rvecs
+        target.tvecs = solved.tvecs
+
     def _find_common_points(
         self, det_l: DetectionResult, det_r: DetectionResult
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -262,6 +400,8 @@ class StereoCalibrator:
         )
 
     def reset(self):
+        self.frame_ids.clear()
+        self._corner_ids.clear()
         self._obj_points.clear()
         self._img_points_left.clear()
         self._img_points_right.clear()

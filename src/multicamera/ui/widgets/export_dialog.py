@@ -3,6 +3,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import os
+import re
 
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QPlainTextEdit, QVBoxLayout,
@@ -14,8 +15,9 @@ from ...io.export import (
     export_rig_json, export_rig_kalibr_yaml, export_rig_opencv_standard_yaml,
     export_rig_opencv_yaml,
     validate_rig_kalibr_chain,
+    KalibrDistortionError,
 )
-from ..theme import TEXT_DIM, WARNING
+from ..theme import TEXT_DIM, WARNING, app_icon
 
 
 class ExportDialog(QDialog):
@@ -64,7 +66,11 @@ class ExportDialog(QDialog):
         layout.addWidget(self._error)
         self._buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self._buttons.button(QDialogButtonBox.Save).setText("选择保存位置...")
+        self._buttons.button(QDialogButtonBox.Save).setIcon(app_icon('download'))
+        self._buttons.button(QDialogButtonBox.Save).setProperty('class', 'primary')
+        self._buttons.button(QDialogButtonBox.Save).setDefault(True)
         self._buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        self._buttons.button(QDialogButtonBox.Cancel).setIcon(app_icon('x'))
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)
@@ -82,8 +88,10 @@ class ExportDialog(QDialog):
 
     @property
     def suggested_filename(self) -> str:
-        scope, _ = self._scope.currentData()
-        return f"calibration_{scope}_{self.format_key}{self.file_suffix}"
+        scope, key = self._scope.currentData()
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', key).strip(' .')
+        suffix = f'_{name}' if name else ''
+        return f"calibration_{scope}{suffix}_{self.format_key}{self.file_suffix}"
 
     @property
     def file_suffix(self) -> str:
@@ -109,6 +117,7 @@ class ExportDialog(QDialog):
         pair_scope = self._scope.currentData()[0] == "pair"
         index = self._format.findData("standard")
         self._format.model().item(index).setEnabled(pair_scope)
+        self._format.model().item(index).setToolTip('先在“导出对象”中选择具体双目组' if not pair_scope else '')
         if self.format_key == "standard" and not pair_scope:
             self._format.setCurrentIndex(self._format.findData("opencv"))
         self._refresh()
@@ -133,11 +142,13 @@ class ExportDialog(QDialog):
             "json": "包含所选对象的内参、外参及质量指标。",
             "opencv": "保留所选对象的项目完整字段；包含辅助相机时写入 AUX→RGB 左目变换。",
             "standard": "仅包含所选双目组的 M1/D1/M2/D2/R/T 等标准字段，不包含任何红外/辅助参数。",
-            "kalibr": "输出所选相机的链式参数；所有相机之间必须有可用的相对外参，不等同 Kalibr 原生采集流程。",
+            "kalibr": "输出可表达的相机链式参数；非零针孔高阶畸变不能无损转换。相机之间须有相对外参，不等同 Kalibr 原生采集流程。",
         }
         note = notes[self.format_key]
         if self._scope.currentData()[0] == "fusion":
             note += " 融合导出保留参考 RGB 双目基础参数（含 RGB 右目），跨模态配对仍为 RGB 左目与辅助相机。"
+        if self.format_key == 'standard' and any(pair.left_intrinsics.model.value == 'fisheye' for pair in rig.pairs.values()):
+            note += ' 当前为鱼眼模型，第三方必须按 fisheye/equidistant 解释畸变，不能按普通针孔处理。'
         self._note.setText(note)
         problem = ""
         if self.format_key == "standard" and self._scope.currentData()[0] != "pair":
@@ -145,8 +156,10 @@ class ExportDialog(QDialog):
         if self.format_key == "kalibr":
             try:
                 validate_rig_kalibr_chain(rig)
+            except KalibrDistortionError:
+                problem = '当前高阶畸变无法无损转换为 Kalibr radtan；请改用 JSON/OpenCV，或核实后重新进行约束标定。'
             except ValueError as exc:
-                problem = f"相机外参链不完整，请选择单组双目或已连通的融合对象：{exc}"
+                problem = f"Kalibr 参数不兼容或外参链不完整，请核对导出对象：{exc}"
         self._error.setText(problem)
         self._buttons.button(QDialogButtonBox.Save).setEnabled(not problem)
 

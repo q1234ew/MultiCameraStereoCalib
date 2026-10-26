@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPointF, QSignalBlocker
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPointF, QSignalBlocker, QThread
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -23,6 +23,7 @@ from PySide6.QtGui import (
     QImage,
 )
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QComboBox,
     QApplication,
     QCheckBox,
@@ -91,6 +92,27 @@ from .pair_gallery import PreviewPair
 logger = logging.getLogger(__name__)
 
 
+def _detach_from_layout(widget):
+    """Explicitly release the old layout item before Qt reparents a widget."""
+    parent = widget.parentWidget()
+    layout = parent.layout() if parent is not None else None
+    if layout is None:
+        return False
+
+    def remove(current):
+        for index in range(current.count()):
+            item = current.itemAt(index)
+            if item.widget() is widget:
+                current.removeWidget(widget)
+                return True
+            nested = item.layout()
+            if nested is not None and remove(nested):
+                return True
+        return False
+
+    return remove(layout)
+
+
 class _ActionPages(QStackedWidget):
     """Only the current operation page determines the fixed footer height."""
 
@@ -127,6 +149,7 @@ class _UndoCaptureEntry:
     pop_intrinsic_l: bool
     pop_intrinsic_r: bool
     pop_stereo: bool
+    session: Optional[CalibrationSession] = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -361,7 +384,7 @@ class _PairRow(QFrame):
         top.addStretch()
         self.btn = QPushButton("标定")
         self.btn.setProperty("class", "primary")
-        self.btn.setFixedWidth(72)
+        self.btn.setMinimumWidth(104)
         self.btn.setEnabled(False)
         top.addWidget(self.btn)
         lay.addLayout(top)
@@ -395,6 +418,9 @@ class CalibrationPanel(QWidget):
     aux_images_imported = Signal(dict)
     preview_mode_changed = Signal(bool)
     configure_aux_requested = Signal()
+    configure_stereo_requested = Signal()
+    data_source_changed = Signal()
+    offline_imported = Signal()
     workflow_changed = Signal(str, bool)
     preview_pairs_changed = Signal(object)
     export_requested = Signal()
@@ -402,6 +428,7 @@ class CalibrationPanel(QWidget):
     log_added = Signal(str)
     capture_started = Signal()
     create_session_requested = Signal()
+    diagnostic_preview_requested = Signal(str, object)
 
     def __init__(self, stream_manager: StreamManager, board: CharucoBoard, parent=None):
         super().__init__(parent)
@@ -410,7 +437,7 @@ class CalibrationPanel(QWidget):
         self._camera_model = CameraModel.PINHOLE
         self._active_step = 0
         self._workflow_phase = "capture"
-        self._live_preview_indices: dict[str, list[tuple[int, int]]] = {}
+        self._live_preview_indices: dict[str, list[tuple[int, int, str]]] = {}
         self._result_directory = None
         self._result_files = []
         self._result_errors = []
@@ -437,6 +464,8 @@ class CalibrationPanel(QWidget):
         self._save_workers: Dict[str, FrameSaveWorker] = {}
         self._save_queue: list[tuple[str, str, np.ndarray, np.ndarray, int]] = []
         self._pending_save_tokens: set[str] = set()
+        self._guidance_failed_saves: set[tuple[int, str, str]] = set()
+        self._save_sessions: dict[str, CalibrationSession] = {}
         self._canceled_save_tokens: set[str] = set()
         self._calib_worker: Optional[PairCalibrationWorker] = None
         self._aux_worker: Optional[AuxCalibrationWorker] = None
@@ -450,7 +479,10 @@ class CalibrationPanel(QWidget):
         self._aux_observation_board: Optional[PatternBoardConfig] = None
         self._pending_aux_context = None
         self._offline_import_records = []
+        self._offline_frame_qualities = {}
         self._offline_lr_swapped = False
+        self._offline_source_folder = None
+        self._pending_import_folder = None
         self._calib_strategy_key = "standard"
         self._data_filter_key = "all"
         self._unavailable_cameras: set[str] = set()
@@ -482,6 +514,11 @@ class CalibrationPanel(QWidget):
         self._log(f"模型: {'针孔' if model == CameraModel.PINHOLE else '鱼眼'}")
 
     def set_session(self, session: CalibrationSession):
+        if session is not self._session:
+            if self._session is not None and self.has_active_background_tasks():
+                raise RuntimeError("后台任务尚未结束，不能切换采集会话")
+            self._undo_stack.clear()
+            self._refresh_undo_btn()
         self._white_balance_guard.invalidate()
         self._session = session
         self._next_session_frame_idx = session.frame_count
@@ -497,6 +534,12 @@ class CalibrationPanel(QWidget):
         return bool(self._auto_timer.isActive() or self._calib_worker or self._aux_worker or
                     self._stereo_import_worker or self._aux_import_worker or
                     self._save_workers or self._save_queue or self._aux_dataset_busy())
+
+    def has_active_background_tasks(self) -> bool:
+        # Result signals can arrive before QThread.run() has actually returned.
+        return bool(self.has_active_operations or self._calib_queue or
+                    self._pending_save_tokens or
+                    any(worker.isRunning() for worker in self.findChildren(QThread)))
 
     def has_affected_work(self, impact: ConfigurationImpact) -> bool:
         stereo = bool(self._intrinsics or self._pair_calibs or
@@ -586,6 +629,11 @@ class CalibrationPanel(QWidget):
     def result_directory(self):
         return self._result_directory
 
+    @property
+    def offline_selection(self):
+        selected = self._selected_pairs()
+        return bool(selected) and all(self._sm.is_virtual_pair(name) for name in selected)
+
     def show_workflow(self, phase: str, multimodal: bool = False):
         if phase not in {"capture", "calibration", "results", "pointcloud"}:
             raise ValueError(f"Unknown workflow phase: {phase}")
@@ -601,15 +649,19 @@ class CalibrationPanel(QWidget):
         for name, cfg in self._selected_pairs().items():
             imported = getattr(self, "_imported_pair_frames", {}).get(name)
             if imported is not None:
-                pairs.extend(PreviewPair(f"{name} {i + 1:04d}", cfg.left.camera_id, cfg.right.camera_id, left, right)
+                labels = [str(record[0]) for record in self._offline_import_records] if name == 'offline' else []
+                pairs.extend(PreviewPair(f"{name} {labels[i] if i < len(labels) else f'{i + 1:04d}'}",
+                                        cfg.left.camera_id, cfg.right.camera_id, left, right)
                              for i, (left, right) in enumerate(imported))
                 continue
             left_cal, right_cal = self._intr_cals.get(cfg.left.camera_id), self._intr_cals.get(cfg.right.camera_id)
             if left_cal is None or right_cal is None:
                 continue
-            for index, (left, right) in enumerate(self._live_preview_indices.get(name, [])):
-                if left < len(left_cal.stored_images) and right < len(right_cal.stored_images):
-                    pairs.append(PreviewPair(f"{name} {index + 1:04d}", cfg.left.camera_id, cfg.right.camera_id,
+            for left, right, frame_id in self._live_preview_indices.get(name, []):
+                if (left < len(left_cal.stored_images) and right < len(right_cal.stored_images) and
+                        left_cal.stored_images[left] is not None and right_cal.stored_images[right] is not None):
+                    pairs.append(PreviewPair(f"{name} {int(frame_id):04d}" if frame_id.isdecimal() else f"{name} {frame_id}",
+                                             cfg.left.camera_id, cfg.right.camera_id,
                                              left_cal.stored_images[left], right_cal.stored_images[right]))
         return pairs
 
@@ -652,14 +704,19 @@ class CalibrationPanel(QWidget):
             lines.extend(['', *decision.details, '', *decision.risks])
             self._lbl_result_summary.setText("\n".join(lines).rstrip())
         if self._result_errors:
-            status = "保存异常\n" + "\n".join(self._result_errors)
+            status = (f"已保存 {len(self._result_files)} 个文件 · 部分格式未生成\n"
+                      if self._result_directory is not None else "保存失败\n")
+            status += "\n".join(self._result_errors)
         elif self._result_directory is not None:
             directory = Path(self._result_directory)
             status = f"文件已保存：{len(self._result_files)} 个\n{directory.parent.name}/{directory.name}"
         else:
             status = "文件待生成或另存" if rig is not None else ""
         self._lbl_result_storage.setText(status)
-        self._lbl_result_storage.setToolTip(str(self._result_directory or ''))
+        storage_tip = str(self._result_directory or '')
+        if self._result_files:
+            storage_tip += '\n本次文件：\n' + '\n'.join(Path(path).name for path in self._result_files)
+        self._lbl_result_storage.setToolTip(storage_tip)
         self._btn_export_results.setEnabled(rig is not None)
         self._btn_open_results.setEnabled(self._result_directory is not None)
         self._btn_copy_results.setEnabled(self._result_directory is not None)
@@ -720,7 +777,7 @@ class CalibrationPanel(QWidget):
         l0.addWidget(self._lbl_rgb_board)
 
         min_row = QHBoxLayout()
-        min_row.addWidget(QLabel("最少帧数"))
+        min_row.addWidget(QLabel("最少配对数"))
         self._spin_min = QSpinBox()
         self._spin_min.setRange(5, 200)
         self._spin_min.setValue(20)
@@ -743,14 +800,15 @@ class CalibrationPanel(QWidget):
         )
         btn_row.addWidget(self._btn_import)
         self._btn_swap_offline = QPushButton("交换离线左右图")
+        self._btn_swap_offline.setIcon(app_icon('arrow-left-right'))
         self._btn_swap_offline.setToolTip(
-            "导入离线图片后可交换左右图像源；交换后需重新标定并导出"
+            "交换离线图像角色并清空该组旧标定结果；不修改原文件，需重新标定并导出"
         )
         self._btn_swap_offline.setVisible(False)
         btn_row.addWidget(self._btn_swap_offline)
         self._btn_undo = QToolButton()
         self._btn_undo.setIcon(app_icon('undo-2'))
-        self._btn_undo.setFixedSize(32, 32)
+        self._btn_undo.setFixedSize(36, 36)
         self._btn_undo.setAccessibleName("撤销上一帧")
         self._btn_undo.setEnabled(False)
         self._btn_undo.setToolTip(
@@ -841,6 +899,13 @@ class CalibrationPanel(QWidget):
         self._lbl_calib_hint.setWordWrap(True)
         self._lbl_calib_hint.setStyleSheet(f"font-size:12px; color:{TEXT_HINT};")
         l1.addWidget(self._lbl_calib_hint)
+        self._btn_configure_stereo = QToolButton()
+        self._btn_configure_stereo.setIcon(app_icon('settings'))
+        self._btn_configure_stereo.setText('模型与标定板')
+        self._btn_configure_stereo.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_configure_stereo.setAccessibleName('配置双目相机模型与标定板')
+        self._btn_configure_stereo.clicked.connect(self.configure_stereo_requested)
+        l1.addWidget(self._btn_configure_stereo)
 
         strategy_row = QHBoxLayout()
         strategy_row.addWidget(QLabel("优化策略"))
@@ -862,8 +927,10 @@ class CalibrationPanel(QWidget):
         self._combo_data_filter.addItem("全部使用", "all")
         self._combo_data_filter.addItem("自动质量筛选", "quality")
         self._combo_data_filter.addItem("角点丰富优先", "corners")
+        self._combo_data_filter.addItem("鱼眼兼容：跨帧共同角点", "fisheye_common")
         self._combo_data_filter.setToolTip(
-            "筛选只作用于本次标定计算，不删除已采集/导入的原始数据"
+            "评分筛选保留约 80% 且不少于最少配对数，不保证姿态最优；不删除原图。\n"
+            "鱼眼兼容模式须明确选择：保留全部有效帧，双目阶段只使用跨帧共同 ID 的角点。"
         )
         filter_row.addWidget(self._combo_data_filter, 1)
         l1.addLayout(filter_row)
@@ -888,6 +955,11 @@ class CalibrationPanel(QWidget):
 
         self._quality_report = QTextEdit()
         self._quality_report.setReadOnly(True)
+        self._btn_frame_diagnostics = QPushButton("逐帧误差检查")
+        self._btn_frame_diagnostics.setIcon(app_icon('scan-line'))
+        self._btn_frame_diagnostics.setEnabled(False)
+        self._btn_frame_diagnostics.clicked.connect(self._show_frame_diagnostics)
+        l1.addWidget(self._btn_frame_diagnostics)
         self._quality_report.setMaximumHeight(150)
         self._quality_report.setPlaceholderText("标定完成后显示质量评估、风险提示和优化建议")
         l1.addWidget(self._quality_report)
@@ -1098,7 +1170,6 @@ class CalibrationPanel(QWidget):
             section.setStyleSheet("CollapsibleSection { border:none; background:transparent; }")
             section.content_layout.setContentsMargins(0, 0, 0, 0)
             section.content_layout.setAlignment(Qt.AlignTop)
-        self._lbl_calib_hint.hide()
 
         ml.addStretch()
         scroll.setWidget(container)
@@ -1127,16 +1198,27 @@ class CalibrationPanel(QWidget):
         return value
 
     def _build_action_footer(self, outer):
+        # Implicit layout migration can leave stale QWidgetItem wrappers in PySide.
+        for button in (self._btn_capture, self._btn_import, self._btn_auto, self._btn_undo,
+                       self._btn_swap_offline, self._btn_calib_all, self._btn_capture_aux,
+                       self._btn_import_aux, self._btn_calib_aux, self._btn_multi, self._btn_cloud):
+            _detach_from_layout(button)
         footer = QFrame()
         self._action_footer = footer
         footer.setObjectName("actionFooter")
         layout = QVBoxLayout(footer)
         layout.setContentsMargins(16, 12, 16, 16)
         layout.setSpacing(8)
+        self._footer_info = QWidget()
+        info = QVBoxLayout(self._footer_info)
+        info.setContentsMargins(0, 0, 0, 0)
+        info.setSpacing(6)
+        info.setAlignment(Qt.AlignTop)
+        layout.addWidget(self._footer_info)
         self._lbl_raw_save = QLabel()
         self._lbl_raw_save.setWordWrap(True)
         self._lbl_raw_save.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
-        layout.addWidget(self._lbl_raw_save)
+        info.addWidget(self._lbl_raw_save)
         self._wb_progress = QWidget()
         progress_row = QHBoxLayout(self._wb_progress)
         progress_row.setContentsMargins(0, 0, 0, 0)
@@ -1151,7 +1233,7 @@ class CalibrationPanel(QWidget):
         self._btn_cancel_wb.setToolTip("取消白平衡准备及本次待执行的采图")
         self._btn_cancel_wb.clicked.connect(self._cancel_white_balance)
         progress_row.addWidget(self._btn_cancel_wb)
-        layout.addWidget(self._wb_progress)
+        info.addWidget(self._wb_progress)
         self._wb_progress.hide()
         self._wb_progress_timer = QTimer(self)
         self._wb_progress_timer.setInterval(250)
@@ -1161,7 +1243,7 @@ class CalibrationPanel(QWidget):
         self._check_wb.setChecked(True)
         self._check_wb.setToolTip("首次实时采图前准备两路 RGB；不回写历史色温。无控制接口的相机可手动关闭此项。")
         self._check_wb.toggled.connect(self._on_white_balance_policy_changed)
-        layout.addWidget(self._check_wb)
+        info.addWidget(self._check_wb)
         self._footer_pages = _ActionPages()
         layout.addWidget(self._footer_pages)
 
@@ -1175,6 +1257,7 @@ class CalibrationPanel(QWidget):
             return box
 
         capture = page()
+        self._capture_footer_layout = capture
         self._btn_capture.setText("采集配对图像")
         self._btn_capture.setIcon(app_icon('camera', '#ffffff'))
         self._btn_capture.setMinimumHeight(40)
@@ -1182,6 +1265,7 @@ class CalibrationPanel(QWidget):
         row = QHBoxLayout()
         row.addWidget(self._btn_import, 1)
         row.addWidget(self._btn_auto)
+        self._capture_import_row = row
         capture.addLayout(row)
         row = QHBoxLayout()
         row.addWidget(self._btn_undo)
@@ -1194,8 +1278,10 @@ class CalibrationPanel(QWidget):
         row.addWidget(self._btn_swap_offline)
         row.addStretch()
         self._btn_to_calibration = QPushButton("前往标定")
+        self._btn_to_calibration.setIcon(app_icon('chevron-right'))
         self._btn_to_calibration.clicked.connect(lambda: self.show_workflow("calibration"))
         row.addWidget(self._btn_to_calibration)
+        self._capture_nav_row = row
         capture.addLayout(row)
 
         calibration = page()
@@ -1253,6 +1339,23 @@ class CalibrationPanel(QWidget):
         cloud.addWidget(self._btn_cloud)
         outer.addWidget(footer)
         self._refresh_result_summary()
+        self._refresh_capture_source_ui()
+
+    def set_capture_footer_compact(self, compact):
+        if compact != getattr(self, '_footer_compact', False):
+            self._footer_compact = compact
+            if compact:
+                self._capture_footer_layout.removeWidget(self._btn_capture)
+                self._capture_import_row.insertWidget(0, self._btn_capture, 1)
+            else:
+                self._capture_import_row.removeWidget(self._btn_capture)
+                self._capture_footer_layout.insertWidget(0, self._btn_capture)
+        self._action_footer.layout().setDirection(
+            QBoxLayout.LeftToRight if compact else QBoxLayout.TopToBottom,
+        )
+        self._footer_info.setMaximumWidth(280 if compact else 16777215)
+        self._action_footer.layout().setStretch(0, 1 if compact else 0)
+        self._action_footer.layout().setStretch(1, 2 if compact else 0)
 
     def _set_board_details(self, expanded):
         self._aux_board_details.setVisible(expanded)
@@ -1330,9 +1433,10 @@ class CalibrationPanel(QWidget):
         self._lbl_raw_save.setVisible(capture)
         self._check_wb.setVisible(capture)
         self._refresh_result_summary()
+        self._refresh_capture_source_ui()
 
     def _connect_signals(self):
-        self._spin_min.valueChanged.connect(self._update_capture_stats)
+        self._spin_min.valueChanged.connect(self._on_min_pairs_changed)
         self._btn_capture.clicked.connect(self._on_capture)
         self._btn_undo.clicked.connect(self._on_undo_capture)
         self._btn_auto.toggled.connect(self._on_auto_toggle)
@@ -1426,11 +1530,14 @@ class CalibrationPanel(QWidget):
         self.preview_mode_changed.emit(self._active_step == 2)
         self._update_capture_stats()
         self._refresh_preview_pairs()
+        self._refresh_capture_source_ui()
 
     @Slot(str)
     def _on_capture_target_changed(self, text):
         self._update_capture_stats()
         self._refresh_preview_pairs()
+        self._refresh_capture_source_ui()
+        self.data_source_changed.emit()
 
     def _selected_pairs(self) -> Dict:
         all_pairs = self._sm.stereo_pairs
@@ -1438,6 +1545,12 @@ class CalibrationPanel(QWidget):
         if sel and sel != "全部相机组" and sel in all_pairs:
             return {sel: all_pairs[sel]}
         return dict(all_pairs)
+
+    def _on_min_pairs_changed(self, value):
+        for calibrator in (*self._intr_cals.values(), *self._stereo_cals.values()):
+            calibrator.min_frames = value
+        self._update_capture_stats()
+        self._sync_pair_states()
 
     # ── Dynamic pair rows ─────────────────────────────────────
 
@@ -1459,6 +1572,14 @@ class CalibrationPanel(QWidget):
 
         self._sync_pair_states()
 
+    def _pair_data_ready(self, pair_name):
+        cfg = self._sm.stereo_pairs.get(pair_name)
+        if cfg is None:
+            return False
+        calibrators = [self._stereo_cals.get(pair_name), self._intr_cals.get(cfg.left.camera_id),
+                       self._intr_cals.get(cfg.right.camera_id)]
+        return all(cal is not None and cal.ready for cal in calibrators)
+
     def _sync_pair_states(self):
         any_ready = False
         all_calibrated = True
@@ -1466,6 +1587,7 @@ class CalibrationPanel(QWidget):
         for name, row in self._pair_rows.items():
             cal = self._stereo_cals.get(name)
             done = name in self._pair_calibs
+            ready = self._pair_data_ready(name)
 
             if done:
                 pc = self._pair_calibs[name]
@@ -1473,24 +1595,33 @@ class CalibrationPanel(QWidget):
                 rms_i_r = pc.right_intrinsics.rms_error
                 rms_s = pc.stereo.rms_error
                 bl_mm = np.linalg.norm(pc.stereo.T) * 1000.0
+                grades = [self._evaluator.evaluate_intrinsic(pc.left_intrinsics),
+                          self._evaluator.evaluate_intrinsic(pc.right_intrinsics),
+                          self._evaluator.evaluate_stereo(pc)]
+                worst = min(grades, key=lambda quality: quality.score).grade
+                color = DANGER if worst == Grade.POOR else WARNING if worst == Grade.FAIR else SUCCESS
                 row.set_status(
-                    f"✓  内参 L={rms_i_l:.3f}px R={rms_i_r:.3f}px  |  "
+                    f"已计算 · 内参 L={rms_i_l:.3f}px R={rms_i_r:.3f}px  |  "
                     f"外参 RMS={rms_s:.3f}px 基线={bl_mm:.1f}mm",
-                    SUCCESS,
+                    color,
                 )
-                row.btn.setEnabled(cal is not None and cal.ready)
+                row.btn.setEnabled(ready)
                 row.btn.setText("重新标定")
-                any_ready = any_ready or (cal is not None and cal.ready)
-            elif cal is not None and cal.ready:
-                row.set_status(f"{cal.num_frames} 帧已就绪，可开始标定", ACCENT)
+                any_ready = any_ready or ready
+            elif ready:
+                row.set_status(f"{cal.num_frames} 对已就绪，可开始标定", ACCENT)
                 row.btn.setEnabled(True)
                 row.btn.setText("标定")
                 any_ready = True
                 all_calibrated = False
             elif cal is not None:
                 pc = self._pair_capture_press_count.get(name, 0)
+                cfg = self._sm.stereo_pairs[name]
+                left = self._intr_cals.get(cfg.left.camera_id)
+                right = self._intr_cals.get(cfg.right.camera_id)
                 row.set_status(
-                    f"按下采集 {pc} 次 · 立体可用 {cal.num_frames} 帧（需 {self._spin_min.value()} 帧）",
+                    f"数据记录 {pc} 对 · 有效配对 {cal.num_frames}/{cal.min_frames} · "
+                    f"左内参 {left.num_frames if left else 0} / 右内参 {right.num_frames if right else 0}",
                     TEXT_DIM,
                 )
                 row.btn.setEnabled(False)
@@ -1503,6 +1634,8 @@ class CalibrationPanel(QWidget):
                 all_calibrated = False
 
         self._btn_calib_all.setEnabled(any_ready)
+        self._btn_frame_diagnostics.setEnabled(bool(self._pair_calibs))
+        self._btn_calib_all.setText('开始标定' if len(self._pair_rows) == 1 else '标定全部就绪组')
         if self._calib_worker is not None or self._aux_dataset_busy() or self._stereo_import_worker is not None:
             self._btn_calib_all.setEnabled(False)
             for row in self._pair_rows.values():
@@ -1559,6 +1692,56 @@ class CalibrationPanel(QWidget):
             self._lbl_raw_save.setText("原图保存已启用")
             self._lbl_raw_save.setToolTip(str(base))
             self._lbl_raw_save.setStyleSheet(f"font-size:12px; color:{TEXT_DIM}; background:transparent;")
+        if self.offline_selection and self._active_step != 2:
+            self._lbl_raw_save.setText('离线原图保留在源目录')
+            self._lbl_raw_save.setToolTip(str(self._offline_source_folder or '导入目录；原文件不修改'))
+            self._lbl_raw_save.setStyleSheet(f"font-size:12px; color:{TEXT_DIM}; background:transparent;")
+
+    def _refresh_capture_source_ui(self):
+        offline = self.offline_selection and self._active_step != 2
+        capture = self._workflow_phase == 'capture'
+        busy = getattr(self, '_ui_operation_busy', False)
+        for control in (self._btn_capture, self._btn_auto, self._btn_undo, self._btn_skip_stereo):
+            control.setVisible(not offline)
+        self._check_wb.setVisible(capture and not offline)
+        if offline and self._btn_auto.isChecked():
+            self._btn_auto.setChecked(False)
+        self._seq_widget.setVisible(not offline)
+        self._btn_capture.setEnabled(not busy and not offline)
+        self._btn_auto.setEnabled(not busy and not offline)
+        if offline != getattr(self, '_offline_footer_mode', False):
+            self._offline_footer_mode = offline
+            if offline:
+                self._capture_nav_row.removeWidget(self._btn_to_calibration)
+                self._capture_import_row.insertWidget(0, self._btn_to_calibration, 1)
+            else:
+                self._capture_import_row.removeWidget(self._btn_to_calibration)
+                self._capture_nav_row.addWidget(self._btn_to_calibration)
+        new_class = 'primary' if offline else None
+        if self._btn_to_calibration.property('class') != new_class:
+            self._btn_to_calibration.setProperty('class', new_class)
+            self._btn_to_calibration.style().unpolish(self._btn_to_calibration)
+            self._btn_to_calibration.style().polish(self._btn_to_calibration)
+        self._btn_to_calibration.setEnabled(not busy)
+        model = '针孔' if self._camera_model == CameraModel.PINHOLE else '鱼眼'
+        board = self._board.config
+        self._lbl_calib_hint.setText(
+            f"{model}模型 · ChArUco {board.cols}×{board.rows} 格\n"
+            f"方格 {board.square_length * 1000:g} mm · 标记 {board.marker_length * 1000:g} mm"
+        )
+        with QSignalBlocker(self._combo_calib_strategy):
+            self._combo_calib_strategy.setItemText(
+                1, '稳健：固定鱼眼 k3/k4' if self._camera_model == CameraModel.FISHEYE
+                else '稳健：固定切向/高阶畸变',
+            )
+        fish_index = self._combo_data_filter.findData('fisheye_common')
+        self._combo_data_filter.model().item(fish_index).setEnabled(self._camera_model == CameraModel.FISHEYE)
+        if self._camera_model != CameraModel.FISHEYE and self._combo_data_filter.currentData() == 'fisheye_common':
+            with QSignalBlocker(self._combo_data_filter):
+                self._combo_data_filter.setCurrentIndex(0)
+            self._data_filter_key = 'all'
+        self._btn_configure_stereo.setEnabled(not busy)
+        self._refresh_disk_hint()
 
     def _refresh_undo_btn(self):
         self._btn_undo.setEnabled(bool(self._undo_stack) and self._calib_worker is None)
@@ -1577,6 +1760,7 @@ class CalibrationPanel(QWidget):
         self._next_session_frame_idx += 1
         token = uuid.uuid4().hex
         self._pending_save_tokens.add(token)
+        self._save_sessions[token] = self._session
         self._save_queue.append((token, pair_name, left.copy(), right.copy(), frame_idx))
         self._start_next_frame_save()
         return frame_idx, token
@@ -1588,11 +1772,12 @@ class CalibrationPanel(QWidget):
         if token in self._canceled_save_tokens:
             self._pending_save_tokens.discard(token)
             self._canceled_save_tokens.discard(token)
+            self._save_sessions.pop(token, None)
             self._start_next_frame_save()
             return
         worker = FrameSaveWorker(
             token,
-            self._session,
+            self._save_sessions[token],
             pair_name,
             left,
             right,
@@ -1609,21 +1794,28 @@ class CalibrationPanel(QWidget):
     def _on_frame_save_finished(self, token: str, pair_name: str, frame_idx: int):
         self._save_workers.pop(token, None)
         self._pending_save_tokens.discard(token)
+        session = self._save_sessions.pop(token, None)
         if token in self._canceled_save_tokens:
             self._canceled_save_tokens.discard(token)
-            if self._session is not None:
-                self._session.delete_saved_pair_frame(pair_name, frame_idx)
+            if session is not None:
+                try:
+                    session.delete_saved_pair_frame(pair_name, frame_idx)
+                except Exception as exc:
+                    logger.exception("Undo saved frame failed: pair=%s frame=%s", pair_name, frame_idx)
+                    self._log(f"{pair_name}: 撤销图片失败（帧 {frame_idx}）— {exc}")
         self._start_next_frame_save()
 
     @Slot(str, str, int, str)
     def _on_frame_save_failed(self, token: str, pair_name: str, frame_idx: int, reason: str):
         self._save_workers.pop(token, None)
         self._pending_save_tokens.discard(token)
+        session = self._save_sessions.pop(token, None)
         if token in self._canceled_save_tokens:
             self._canceled_save_tokens.discard(token)
             self._start_next_frame_save()
             return
         self._log(f"{pair_name}: 保存图片失败（帧 {frame_idx}）— {reason}")
+        self._guidance_failed_saves.add((id(session), pair_name, f"{frame_idx:04d}"))
         self._start_next_frame_save()
 
     def _undo_apply_entry(self, e: _UndoCaptureEntry) -> None:
@@ -1641,8 +1833,12 @@ class CalibrationPanel(QWidget):
                 self._fqs[e.lid].pop()
         if e.save_token is not None and e.save_token in self._pending_save_tokens:
             self._canceled_save_tokens.add(e.save_token)
-        elif e.session_frame_idx is not None and self._session:
-            self._session.delete_saved_pair_frame(e.pair_name, e.session_frame_idx)
+        elif e.session_frame_idx is not None and e.session is not None:
+            try:
+                e.session.delete_saved_pair_frame(e.pair_name, e.session_frame_idx)
+            except Exception as exc:
+                logger.exception("Delete undone capture failed: pair=%s frame=%s", e.pair_name, e.session_frame_idx)
+                self._log(f"{e.pair_name}: 内存已撤销，但磁盘图片删除失败（帧 {e.session_frame_idx}）：{exc}")
 
     @Slot()
     def _on_undo_capture(self):
@@ -1732,13 +1928,26 @@ class CalibrationPanel(QWidget):
             n_ib_r = self._intr_cals[rid].num_frames
             n_sb = self._stereo_cals[name].num_frames
 
-            det_l = self._intr_cals[lid].add_frame(left)
-            det_r = self._intr_cals[rid].add_frame(right)
-            self._stereo_cals[name].add_detection_pair(det_l, det_r)
+            source_id = (f"{self._next_session_frame_idx:04d}" if self._next_session_frame_idx is not None
+                         else str(self._pair_capture_press_count.get(name, 0) + 1))
+            det_l = self._intr_cals[lid].add_frame(left, frame_id=source_id)
+            det_r = self._intr_cals[rid].add_frame(right, frame_id=source_id)
+            similar_l = self._intr_cals[lid].find_similar_detection(
+                det_l, exclude_last=self._intr_cals[lid].num_frames > n_ib_l,
+            )
+            similar_r = self._intr_cals[rid].find_similar_detection(
+                det_r, exclude_last=self._intr_cals[rid].num_frames > n_ib_r,
+            )
+            if similar_l is not None and similar_r is not None:
+                self._log(
+                    f"{name}: 重复构图提醒 — 左图近似样本 {similar_l + 1}，"
+                    f"右图近似样本 {similar_r + 1}；本次仍保留，建议改变位置、大小或倾角"
+                )
+            self._store_stereo_detection(name, det_l, det_r, source=source_id)
             if (self._stereo_cals[name].num_frames > n_sb and
                     self._intr_cals[lid].num_frames > n_ib_l and self._intr_cals[rid].num_frames > n_ib_r):
                 self._live_preview_indices.setdefault(name, []).append((
-                    len(self._intr_cals[lid].stored_images) - 1, len(self._intr_cals[rid].stored_images) - 1,
+                    len(self._intr_cals[lid].stored_images) - 1, len(self._intr_cals[rid].stored_images) - 1, source_id,
                 ))
             if (
                 self._intr_cals[lid].num_frames > n_ib_l
@@ -1773,7 +1982,7 @@ class CalibrationPanel(QWidget):
             ql = "OK" if fq_l.usable else "⚠"
             qr = "OK" if fq_r.usable else "⚠"
             self._log(
-                f"{name}: L={det_l.num_corners}[{ql}] "
+                f"{name} [{source_id}]: L={det_l.num_corners}[{ql}] "
                 f"R={det_r.num_corners}[{qr}] 帧{sc.num_frames}"
             )
 
@@ -1787,6 +1996,7 @@ class CalibrationPanel(QWidget):
                     pop_intrinsic_l=self._intr_cals[lid].num_frames > n_ib_l,
                     pop_intrinsic_r=self._intr_cals[rid].num_frames > n_ib_r,
                     pop_stereo=self._stereo_cals[name].num_frames > n_sb,
+                    session=self._session,
                 )
             )
 
@@ -1826,6 +2036,7 @@ class CalibrationPanel(QWidget):
         import os
 
         self._log(f"正在后台导入图片: {os.path.basename(folder)}")
+        self._pending_import_folder = Path(folder).resolve()
         self._set_import_busy(True)
         worker = StereoImageImportWorker(folder, self._board, parent=self)
         worker.log.connect(self._log)
@@ -1838,13 +2049,18 @@ class CalibrationPanel(QWidget):
 
     @Slot(object)
     def _on_import_images_ready(self, img_pairs):
+        self._offline_frame_qualities = dict(getattr(self._stereo_import_worker, 'frame_qualities', {}))
         self._stereo_import_worker = None
         self._set_import_busy(False)
         self._log(f"导入 {len(img_pairs)} 对图片")
 
         self._offline_import_records = list(img_pairs)
+        self._offline_source_folder = self._pending_import_folder
+        self._pending_import_folder = None
         self._offline_lr_swapped = False
+        self._import_view_idx = 0
         self._load_offline_records(swapped=False, log_frames=True)
+        self.offline_imported.emit()
 
     def _load_offline_records(self, swapped: bool, log_frames: bool = False):
         img_pairs = list(self._offline_import_records)
@@ -1854,28 +2070,33 @@ class CalibrationPanel(QWidget):
 
         pair_name = "offline"
         lid, rid = "offline_L", "offline_R"
-        min_f = min(self._spin_min.value(), len(img_pairs))
+        min_f = max(self._spin_min.minimum(), min(self._spin_min.value(), len(img_pairs)))
         self._spin_min.setValue(min_f)
 
         self._reset_offline_pair(pair_name, lid, rid, min_f)
-        self._capture_sequence.reset()
+        self._combo_pair.setCurrentText(pair_name)
 
         for idx, img_l, img_r, det_l, det_r in img_pairs:
             if swapped:
                 img_l, img_r = img_r, img_l
                 det_l, det_r = det_r, det_l
-            self._intr_cals[lid].add_detection(det_l, image=img_l)
-            self._intr_cals[rid].add_detection(det_r, image=img_r)
-            self._stereo_cals[pair_name].add_detection_pair(det_l, det_r)
+            self._intr_cals[lid].add_detection(det_l, image=img_l, frame_id=str(idx))
+            self._intr_cals[rid].add_detection(det_r, image=img_r, frame_id=str(idx))
+            self._store_stereo_detection(pair_name, det_l, det_r, source=str(idx))
+            for camera_id in (lid, rid):
+                reason = self._intr_cals[camera_id].last_rejection_reason
+                if reason:
+                    self._log(f"[{idx}] {camera_id}: 未用于内参标定 — {reason}")
 
             fi = len(self._fqs[lid])
-            fq_l = self._assessor.assess_frame(img_l, det_l.num_corners, fi)
-            fq_r = self._assessor.assess_frame(img_r, det_r.num_corners, fi)
+            cached_quality = self._offline_frame_qualities.get(str(idx))
+            if cached_quality is not None:
+                fq_l, fq_r = cached_quality[::-1] if swapped else cached_quality
+            else:
+                fq_l = self._assessor.assess_frame(img_l, det_l.num_corners, fi)
+                fq_r = self._assessor.assess_frame(img_r, det_r.num_corners, fi)
             self._fqs[lid].append(fq_l)
             self._fqs[rid].append(fq_r)
-
-            if not self._capture_sequence.finished:
-                self._capture_sequence.advance()
 
             if log_frames:
                 self._log(
@@ -1900,9 +2121,13 @@ class CalibrationPanel(QWidget):
         self._update_capture_stats()
         self._sync_pair_states()
         self._timeline.mark_completed(0)
-        self._sections[0].set_status_hint(f"✓ {len(img_pairs)} 帧已导入", SUCCESS)
+        usable = self._stereo_cals[pair_name].num_frames
+        self._sections[0].set_status_hint(
+            f"已加载 {len(img_pairs)} 对 · 有效配对 {usable} 对",
+            SUCCESS if self._pair_data_ready(pair_name) else WARNING,
+        )
         direction = "（已交换左右图）" if swapped else ""
-        self._log(f"导入完成{direction}，{self._stereo_cals[pair_name].num_frames} 帧可用")
+        self._log(f"导入完成{direction}，{len(img_pairs)} 对已加载，{self._stereo_cals[pair_name].num_frames} 对可用于标定")
 
         self._pair_capture_press_count[pair_name] = len(img_pairs)
 
@@ -1920,6 +2145,8 @@ class CalibrationPanel(QWidget):
         self._btn_import_next.hide()
         self._lbl_import_nav.hide()
         self._refresh_preview_pairs()
+        self._refresh_capture_source_ui()
+        self.data_source_changed.emit()
 
     @Slot()
     def _on_swap_offline_images(self):
@@ -1939,8 +2166,9 @@ class CalibrationPanel(QWidget):
     @Slot(str)
     def _on_import_images_failed(self, message: str):
         self._stereo_import_worker = None
+        self._pending_import_folder = None
         self._set_import_busy(False)
-        self._log(message.splitlines()[0])
+        self._log('离线导入失败：' + message.splitlines()[0])
 
     def _reset_offline_pair(self, pair_name: str, lid: str, rid: str, min_f: int):
         self._live_preview_indices.pop(pair_name, None)
@@ -1982,6 +2210,12 @@ class CalibrationPanel(QWidget):
         self.images_imported.emit({lid: img_l, rid: img_r})
         self._update_import_nav_label()
 
+    def select_offline_preview(self, key: str):
+        for index, record in enumerate(self._offline_import_records):
+            if key == f'offline {record[0]}':
+                self._show_imported_frame(index)
+                break
+
     def _update_import_nav_label(self):
         if not hasattr(self, "_imported_frames"):
             return
@@ -2004,6 +2238,8 @@ class CalibrationPanel(QWidget):
     @Slot(bool)
     def _on_auto_toggle(self, checked: bool):
         if checked:
+            if not self._ensure_capture_session():
+                return
             self._auto_timer.start()
             self._btn_auto.setText("自动采集")
         else:
@@ -2045,11 +2281,12 @@ class CalibrationPanel(QWidget):
             )
         if assessments:
             ac = np.mean([a.coverage for a in assessments])
+            ai = np.mean([a.image_coverage or 0. for a in assessments])
             au = np.mean([a.distribution_uniformity for a in assessments])
             tu = sum(a.usable_frames for a in assessments)
             tf = sum(a.total_frames for a in assessments)
             self._lbl_assess.setText(
-                f"覆盖 {ac:.0%} | 均匀 {au:.0%} | 可用 {tu}/{tf}"
+                f"板角点完整度 {ac:.0%} | 视场网格 {ai:.0%} | 均匀度 {au:.0%} | 可用 {tu}/{tf}"
             )
             worst = min(assessments, key=lambda a: a.score)
             self._data_score.set_grade(worst.grade, worst.score)
@@ -2061,18 +2298,30 @@ class CalibrationPanel(QWidget):
             self._lbl_tips.clear()
         self._lbl_tips.setVisible(bool(self._lbl_tips.text()))
 
-        any_ready = any(c.ready for c in self._stereo_cals.values())
+        any_ready = any(self._pair_data_ready(name) for name in self._selected_pairs())
         if any_ready:
             self._sections[0].set_status_hint("✓ 可标定", SUCCESS)
 
     def _calib_strategy_label(self) -> str:
         return self._combo_calib_strategy.currentText().split("：", 1)[0]
 
+    def _store_stereo_detection(self, pair_name, left, right, source=""):
+        try:
+            return self._stereo_cals[pair_name].add_detection_pair(left, right, frame_id=source or None)
+        except (ValueError, TypeError) as exc:
+            self._log(f"{pair_name} {source}: 未用于双目标定 — {exc}")
+            return False
+
     def _data_filter_label(self) -> str:
         return self._combo_data_filter.currentText()
 
     def _calib_strategy_flags(self) -> tuple[int, int]:
         key = self._combo_calib_strategy.currentData() or "standard"
+        if self._camera_model == CameraModel.FISHEYE:
+            intrinsic_flags = cv2.fisheye.CALIB_FIX_K3 | cv2.fisheye.CALIB_FIX_K4 if key == "robust" else 0
+            stereo_flags = (cv2.fisheye.CALIB_USE_INTRINSIC_GUESS if key == "joint_refine"
+                            else cv2.fisheye.CALIB_FIX_INTRINSIC)
+            return intrinsic_flags, stereo_flags
         if key == "robust":
             intrinsic_flags = (
                 cv2.CALIB_ZERO_TANGENT_DIST
@@ -2085,92 +2334,6 @@ class CalibrationPanel(QWidget):
         if key == "joint_refine":
             return 0, cv2.CALIB_USE_INTRINSIC_GUESS
         return 0, cv2.CALIB_FIX_INTRINSIC
-
-    def _filtered_calibrators_for_pair(self, pair_name: str, lid: str, rid: str):
-        filter_key = self._combo_data_filter.currentData() or "all"
-        left_cal = self._intr_cals[lid]
-        right_cal = self._intr_cals[rid]
-        stereo_cal = self._stereo_cals[pair_name]
-        if filter_key == "all":
-            return left_cal, right_cal, stereo_cal
-
-        if filter_key == "quality":
-            left_idx = self._quality_filter_indices(left_cal)
-            right_idx = self._quality_filter_indices(right_cal)
-            stereo_idx = self._top_count_indices(
-                stereo_cal.frame_common_corner_counts,
-                stereo_cal.min_frames,
-                keep_ratio=0.8,
-            )
-        else:
-            left_idx = self._top_count_indices(
-                left_cal.frame_corner_counts,
-                left_cal.min_frames,
-                keep_ratio=0.8,
-            )
-            right_idx = self._top_count_indices(
-                right_cal.frame_corner_counts,
-                right_cal.min_frames,
-                keep_ratio=0.8,
-            )
-            stereo_idx = self._top_count_indices(
-                stereo_cal.frame_common_corner_counts,
-                stereo_cal.min_frames,
-                keep_ratio=0.8,
-            )
-
-        f_left = left_cal.copy_with_indices(left_idx)
-        f_right = right_cal.copy_with_indices(right_idx)
-        f_stereo = stereo_cal.copy_with_indices(stereo_idx)
-
-        if not (f_left.ready and f_right.ready and f_stereo.ready):
-            self._log("数据筛选后帧数不足，已回退为全部使用")
-            return left_cal, right_cal, stereo_cal
-
-        self._log(
-            f"数据筛选[{self._data_filter_label()}]: "
-            f"L {f_left.num_frames}/{left_cal.num_frames}, "
-            f"R {f_right.num_frames}/{right_cal.num_frames}, "
-            f"Stereo {f_stereo.num_frames}/{stereo_cal.num_frames}"
-        )
-        return f_left, f_right, f_stereo
-
-    def _quality_filter_indices(self, cal):
-        scores = []
-        images = cal.stored_images
-        counts = cal.frame_corner_counts
-        max_corners = max(counts) if counts else 1
-        for idx, count in enumerate(counts):
-            corner_score = count / max(max_corners, 1)
-            image_score = 0.6
-            if idx < len(images):
-                img = images[idx]
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-                sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                brightness = float(gray.mean())
-                sharp_score = min(sharpness / 120.0, 1.0)
-                bright_score = max(0.0, 1.0 - abs(brightness - 128.0) / 128.0)
-                image_score = 0.65 * sharp_score + 0.35 * bright_score
-            scores.append(0.55 * corner_score + 0.45 * image_score)
-        return self._top_score_indices(scores, cal.min_frames, keep_ratio=0.8)
-
-    @staticmethod
-    def _top_count_indices(counts: list[int], min_frames: int, keep_ratio: float) -> list[int]:
-        return CalibrationPanel._top_score_indices(
-            [float(c) for c in counts],
-            min_frames,
-            keep_ratio,
-        )
-
-    @staticmethod
-    def _top_score_indices(scores: list[float], min_frames: int, keep_ratio: float) -> list[int]:
-        n = len(scores)
-        if n == 0:
-            return []
-        keep = max(min_frames, int(np.ceil(n * keep_ratio)))
-        keep = min(n, keep)
-        ranked = sorted(range(n), key=lambda i: scores[i], reverse=True)
-        return sorted(ranked[:keep])
 
     def _update_calibration_quality_report(self, pair_name: str, q_l, q_r, q_s):
         def fmt_quality(title: str, q) -> list[str]:
@@ -2201,13 +2364,31 @@ class CalibrationPanel(QWidget):
         lines.append("")
         lines.append(f"总体: {worst.grade.label}（按最低分项评定）")
         if worst.grade in {Grade.FAIR, Grade.POOR}:
-            lines.append("优化策略: 优先补采边角/倾角样本，剔除高误差帧后重跑；必要时尝试稳健策略。")
+            lines.append("优化策略: 先核对镜头模型、板尺寸和左右配对，再检查异常帧及边角/倾角覆盖；约束策略并不等同鲁棒剔除。")
         elif (self._combo_calib_strategy.currentData() or "standard") == "joint_refine":
             lines.append("优化策略: 联合精修适合最终对比，若结果不稳定可回到标准策略。")
         else:
-            lines.append("优化策略: 当前结果可用；如需第三方使用，请导出 OpenCV 标准 Stereo YAML。")
+            lines.append("结果复核: 训练集误差不代表实际精度，请检查校正残差并验证独立图像；第三方使用前须确认镜头模型。")
 
         self._quality_report.setPlainText("\n".join(lines))
+
+    def _show_frame_diagnostics(self):
+        from .calibration_diagnostics import CalibrationDiagnosticsDialog
+
+        if not self._pair_calibs:
+            return
+        current = getattr(self, '_diagnostic_dialog', None)
+        if current is not None:
+            current.raise_()
+            current.activateWindow()
+            return
+        dialog = CalibrationDiagnosticsDialog(self._pair_calibs, self.preview_pairs(), self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.preview_requested.connect(self.diagnostic_preview_requested)
+        self.calibration_reset.connect(dialog.reject)
+        dialog.finished.connect(lambda _: setattr(self, '_diagnostic_dialog', None))
+        self._diagnostic_dialog = dialog
+        dialog.show()
 
     # ── Stereo calibration (per pair: intrinsic + extrinsic) ──
 
@@ -2228,8 +2409,8 @@ class CalibrationPanel(QWidget):
 
         pair_cfg = self._sm.stereo_pairs.get(pair_name)
         cal = self._stereo_cals.get(pair_name)
-        if not pair_cfg or not cal or not cal.ready:
-            self._log(f"{pair_name}: 数据不足")
+        if not pair_cfg or not cal or not self._pair_data_ready(pair_name):
+            self._log(f"{pair_name}: 数据不足，左右内参与有效配对均须达到最少配对数")
             if continue_queue:
                 self._start_next_calibration()
             return
@@ -2238,9 +2419,7 @@ class CalibrationPanel(QWidget):
         lid = pair_cfg.left.camera_id
         rid = pair_cfg.right.camera_id
         intrinsic_flags, stereo_flags = self._calib_strategy_flags()
-        left_cal, right_cal, stereo_cal = self._filtered_calibrators_for_pair(
-            pair_name, lid, rid
-        )
+        left_cal, right_cal, stereo_cal = self._intr_cals[lid], self._intr_cals[rid], cal
 
         self._invalidate_pair_result(pair_name)
         self._set_calibration_busy(True)
@@ -2254,6 +2433,7 @@ class CalibrationPanel(QWidget):
             intrinsic_flags=intrinsic_flags,
             stereo_flags=stereo_flags,
             strategy_name=self._calib_strategy_label(),
+            data_filter_key=self._combo_data_filter.currentData() or "all",
             parent=self,
         )
         worker.log.connect(self._log)
@@ -2279,7 +2459,7 @@ class CalibrationPanel(QWidget):
         self._calib_queue = []
         for name in list(self._sm.stereo_pairs.keys()):
             cal = self._stereo_cals.get(name)
-            if cal and cal.ready:
+            if cal and self._pair_data_ready(name):
                 self._calib_queue.append(name)
         self._start_next_calibration()
 
@@ -2393,6 +2573,10 @@ class CalibrationPanel(QWidget):
         self._start_next_calibration()
 
     def _set_calibration_busy(self, busy: bool):
+        self._ui_operation_busy = busy
+        dialog = getattr(self, '_diagnostic_dialog', None)
+        if busy and dialog is not None:
+            dialog.reject()
         if busy and self._btn_auto.isChecked():
             self._btn_auto.setChecked(False)
         self._btn_capture.setEnabled(not busy)
@@ -2403,12 +2587,15 @@ class CalibrationPanel(QWidget):
         self._btn_undo.setEnabled((not busy) and bool(self._undo_stack))
         self._btn_auto.setEnabled(not busy)
         self._combo_pair.setEnabled(not busy)
+        self._spin_min.setEnabled(not busy)
         self._combo_calib_strategy.setEnabled(not busy)
         self._combo_data_filter.setEnabled(not busy)
+        self._btn_frame_diagnostics.setEnabled(not busy and bool(self._pair_calibs))
         self._btn_calib_all.setEnabled(False if busy else self._btn_calib_all.isEnabled())
         for row in self._pair_rows.values():
             row.btn.setEnabled(False if busy else row.btn.isEnabled())
         self._refresh_aux_readiness()
+        self._refresh_capture_source_ui()
 
     def _show_rect_preview(self, pair_name: str, pair: StereoPairCalibration):
         sync = self._sm.get_sync_pair(pair_name)
@@ -2627,14 +2814,18 @@ class CalibrationPanel(QWidget):
             f"✓ {aux_id}: T_rgb_left_aux 已生成，RMS={extr.rms_error:.4f}px，帧数={extr.frame_count}"
         )
         if self._session is not None:
-            self._session.record_multimodal_result(
-                aux_camera_id=aux_id,
-                modality=modality,
-                board_type=board_cfg.pattern_type.value,
-                valid_pairs=extr.frame_count,
-                rms_error=extr.rms_error,
-                board_config=board_cfg.to_dict(),
-            )
+            try:
+                self._session.record_multimodal_result(
+                    aux_camera_id=aux_id,
+                    modality=modality,
+                    board_type=board_cfg.pattern_type.value,
+                    valid_pairs=extr.frame_count,
+                    rms_error=extr.rms_error,
+                    board_config=board_cfg.to_dict(),
+                )
+            except Exception as exc:
+                logger.exception("Save multimodal result metadata failed: camera=%s", aux_id)
+                self._log(f"{aux_id}: 标定已完成，但会话记录保存失败，结果仍可导出：{exc}")
         self._set_aux_busy(False)
         self.calibration_finished.emit(rig)
 
@@ -2663,6 +2854,8 @@ class CalibrationPanel(QWidget):
         self._btn_capture.setEnabled(not busy)
         self._btn_auto.setEnabled(not busy)
         self._btn_undo.setEnabled((not busy) and bool(self._undo_stack))
+        self._btn_import.setText('正在导入…' if busy else '导入图片')
+        self._refresh_capture_source_ui()
 
     def _set_aux_import_busy(self, busy: bool):
         self._aux_import_busy = busy
@@ -3022,7 +3215,10 @@ class CalibrationPanel(QWidget):
         self._aux_capture_count = 0
         self._aux_observation_board = None
         self._offline_import_records = []
+        self._offline_frame_qualities = {}
         self._offline_lr_swapped = False
+        self._offline_source_folder = None
+        self._pending_import_folder = None
         self._btn_swap_offline.setVisible(False)
         self._btn_swap_offline.setText("交换离线左右图")
         self._quality_report.clear()

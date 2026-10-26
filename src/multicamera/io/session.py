@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import hashlib
+import uuid
+from contextlib import contextmanager
+from threading import RLock
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,11 +18,24 @@ import cv2
 import numpy as np
 
 from ..board.charuco_board import CharucoBoard
-from ..calibration.models import MultiCameraRig
+from ..calibration.models import CameraModel, MultiCameraRig
 from ..perf import perf_timer
 from ..streaming.stream_manager import AuxiliaryCameraConfig, StereoPairConfig
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _staging_directory(**kwargs):
+    """Keep cleanup errors from masking a completed commit or its original failure."""
+    staging = TemporaryDirectory(**kwargs)
+    try:
+        yield staging.name
+    finally:
+        try:
+            staging.cleanup()
+        except Exception:
+            logger.exception("Failed to clean staging directory: %s", staging.name)
 
 
 class CalibrationSession:
@@ -32,6 +49,7 @@ class CalibrationSession:
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
         self._metadata: Dict = {}
+        self._io_lock = RLock()
         self._ensure_dirs()
 
     def _ensure_dirs(self):
@@ -50,16 +68,29 @@ class CalibrationSession:
         pairs: List[StereoPairConfig],
         auxiliary: AuxiliaryCameraConfig | None = None,
         name: str = "",
+        camera_model: str = "pinhole",
     ) -> CalibrationSession:
+        camera_model = CameraModel(camera_model).value
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_name = f"{name}_{timestamp}" if name else timestamp
+        base_dir.mkdir(parents=True, exist_ok=True)
         session_dir = base_dir / session_name
+        suffix = 0
+        while True:
+            try:
+                session_dir.mkdir()
+                break
+            except FileExistsError:
+                suffix += 1
+                session_dir = base_dir / f"{session_name}_{suffix:02d}"
+        session_name = session_dir.name
         session = cls(session_dir)
 
         session._metadata = {
             "name": session_name,
             "created": datetime.now().isoformat(),
             "board": board.to_dict(),
+            "camera_model": camera_model,
             "pairs": [
                 {
                     "name": p.name,
@@ -84,10 +115,19 @@ class CalibrationSession:
 
     @classmethod
     def load(cls, session_dir: Path) -> CalibrationSession:
-        session = cls(session_dir)
+        session_dir = Path(session_dir)
         meta_path = session_dir / cls.METADATA_FILE
-        if meta_path.exists():
-            session._metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not meta_path.is_file():
+            raise ValueError("所选目录不是标定会话：缺少 session.json")
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("session.json 必须包含会话对象")
+        for counter in ("frame_count", "multimodal_frame_count"):
+            value = metadata.get(counter, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"会话计数 {counter} 无效")
+        session = cls(session_dir)
+        session._metadata = metadata
         return session
 
     # ── Image storage ─────────────────────────────────────────
@@ -115,7 +155,7 @@ class CalibrationSession:
         self._metadata["configuration_history"] = [*self._metadata.get("configuration_history", []), revision]
         self._metadata.update(current)
         path = self.session_dir / self.METADATA_FILE
-        with TemporaryDirectory(dir=self.session_dir, ignore_cleanup_errors=True) as staging:
+        with _staging_directory(dir=self.session_dir) as staging:
             staged = Path(staging) / path.name
             staged.write_text(json.dumps(self._metadata, indent=2, ensure_ascii=False), encoding="utf-8")
             staged.replace(path)
@@ -134,22 +174,8 @@ class CalibrationSession:
         pair_dir = self.session_dir / self.IMAGES_DIR / pair_name
         pair_dir.mkdir(parents=True, exist_ok=True)
 
-        left_path = pair_dir / f"left_{frame_idx:04d}.png"
-        right_path = pair_dir / f"right_{frame_idx:04d}.png"
         with perf_timer("save frame pair", threshold_ms=100.0):
-            ok_left = cv2.imwrite(str(left_path), left)
-            ok_right = cv2.imwrite(str(right_path), right)
-        if not ok_left or not ok_right:
-            if ok_left:
-                left_path.unlink(missing_ok=True)
-            if ok_right:
-                right_path.unlink(missing_ok=True)
-            raise OSError(f"Failed to save stereo frame pair to {pair_dir}")
-
-        self._metadata["frame_count"] = max(
-            self._metadata.get("frame_count", 0), frame_idx + 1
-        )
-        self._save_metadata()
+            self._save_image_pair(pair_dir, "left", "right", left, right, frame_idx, "frame_count")
         return frame_idx
 
     def delete_saved_pair_frame(self, pair_name: str, frame_idx: int) -> bool:
@@ -177,6 +203,8 @@ class CalibrationSession:
                 if not pd.is_dir():
                     continue
                 for fp in pd.glob("left_*.png"):
+                    if not fp.with_name(fp.name.replace("left_", "right_", 1)).exists():
+                        continue
                     try:
                         idx = int(fp.stem.replace("left_", ""))
                         mx = max(mx, idx)
@@ -221,21 +249,37 @@ class CalibrationSession:
 
         mm_dir = self.session_dir / self.MULTIMODAL_DIR
         mm_dir.mkdir(parents=True, exist_ok=True)
-        rgb_path = mm_dir / f"rgb_left_{frame_idx:04d}.png"
-        aux_path = mm_dir / f"aux_{frame_idx:04d}.png"
-        ok_rgb = cv2.imwrite(str(rgb_path), rgb_left)
-        ok_aux = cv2.imwrite(str(aux_path), aux)
-        if not ok_rgb or not ok_aux:
-            if ok_rgb:
-                rgb_path.unlink(missing_ok=True)
-            if ok_aux:
-                aux_path.unlink(missing_ok=True)
-            raise OSError(f"Failed to save multimodal frame pair to {mm_dir}")
-        self._metadata["multimodal_frame_count"] = max(
-            self._metadata.get("multimodal_frame_count", 0), frame_idx + 1
-        )
-        self._save_metadata()
+        self._save_image_pair(mm_dir, "rgb_left", "aux", rgb_left, aux, frame_idx, "multimodal_frame_count")
         return frame_idx
+
+    def _save_image_pair(self, directory, first_name, second_name, first, second, index, counter):
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError("图片索引必须为非负整数")
+        targets = [directory / f"{name}_{index:04d}.png" for name in (first_name, second_name)]
+        with self._io_lock:
+            if any(path.exists() for path in targets):
+                raise FileExistsError(f"采图目标已存在，未覆盖历史图片：{targets[0]}")
+            previous = self._metadata.copy()
+            committed = []
+            try:
+                with _staging_directory(prefix=".capture-", dir=directory) as staging:
+                    staged = [Path(staging) / target.name for target in targets]
+                    for path, image in zip(staged, (first, second)):
+                        if not cv2.imwrite(str(path), image):
+                            raise OSError(f"无法保存图片：{path.name}")
+                    for source, target in zip(staged, targets):
+                        source.replace(target)
+                        committed.append(target)
+                    self._metadata[counter] = max(self._metadata.get(counter, 0), index + 1)
+                    self._save_metadata()
+            except Exception:
+                self._metadata = previous
+                for target in committed:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception("Failed to remove uncommitted capture: %s", target)
+                raise
 
     def record_multimodal_result(
         self,
@@ -266,10 +310,10 @@ class CalibrationSession:
     def save_rig(self, rig: MultiCameraRig):
         path = self.session_dir / self.RESULTS_DIR / "rig.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(dir=path.parent) as staging:
+        with _staging_directory(dir=path.parent) as staging:
             tmp = Path(staging) / path.name
             tmp.write_text(
-                json.dumps(rig.to_dict(), indent=2, ensure_ascii=False),
+                json.dumps(rig.to_dict(), indent=2, ensure_ascii=False, allow_nan=False),
                 encoding="utf-8",
             )
             tmp.replace(path)
@@ -278,6 +322,7 @@ class CalibrationSession:
     def save_calibration_results(self, rig: MultiCameraRig) -> tuple[list[Path], list[str]]:
         """Persist the rig first, then export formats independently of each other."""
         from .export import (
+            KalibrDistortionError,
             export_rig_kalibr_yaml,
             export_rig_opencv_standard_yaml,
             export_rig_opencv_yaml,
@@ -304,7 +349,7 @@ class CalibrationSession:
         for filename, exporter, export_rig, kwargs in exports:
             try:
                 # Replace a previous result only after its new export has completed.
-                with TemporaryDirectory(dir=results) as staging:
+                with _staging_directory(dir=results) as staging:
                     tmp = Path(staging) / filename
                     exporter(export_rig, tmp, **kwargs)
                     if not tmp.is_file() or not tmp.stat().st_size:
@@ -314,7 +359,24 @@ class CalibrationSession:
                 saved.append(path)
             except Exception as exc:
                 logger.exception("Automatic calibration export failed: file=%s", filename)
-                errors.append(f"{filename}: {exc}")
+                reason = ('高阶畸变不能无损转换为 Kalibr radtan，请使用 JSON/OpenCV；详细参数见日志'
+                          if isinstance(exc, KalibrDistortionError) else str(exc))
+                errors.append(f"{filename}: {reason}")
+        manifest_path = results / "calibration_manifest.json"
+        try:
+            manifest = {
+                "schema_version": 1, "generation_id": uuid.uuid4().hex,
+                "created": datetime.now().isoformat(), "reference_camera": rig.reference_camera,
+                "pair_names": list(rig.pairs), "errors": list(errors),
+                "files": [{"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                          for path in saved],
+                "note": "Only listed files with matching hashes belong to this generation; other files may be historical.",
+            }
+            self._atomic_json(manifest_path, manifest)
+            saved.append(manifest_path)
+        except Exception as exc:
+            logger.exception("Save calibration manifest failed")
+            errors.append(f"calibration_manifest.json: {exc}")
         return saved, errors
 
     def load_rig(self) -> Optional[MultiCameraRig]:
@@ -336,10 +398,14 @@ class CalibrationSession:
 
     def _save_metadata(self):
         path = self.session_dir / self.METADATA_FILE
-        path.write_text(
-            json.dumps(self._metadata, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        self._atomic_json(path, self._metadata)
+
+    @staticmethod
+    def _atomic_json(path, data):
+        with _staging_directory(prefix=".metadata-", dir=path.parent) as staging:
+            staged = Path(staging) / path.name
+            staged.write_text(json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            staged.replace(path)
 
     def delete(self):
         if self.session_dir.exists():
@@ -366,8 +432,9 @@ class SessionManager:
         pairs: List[StereoPairConfig],
         auxiliary: AuxiliaryCameraConfig | None = None,
         name: str = "",
+        camera_model: str = "pinhole",
     ) -> CalibrationSession:
-        return CalibrationSession.create(self.base_dir, board, pairs, auxiliary, name)
+        return CalibrationSession.create(self.base_dir, board, pairs, auxiliary, name, camera_model)
 
     def delete_session(self, session_name: str):
         session_dir = self.base_dir / session_name

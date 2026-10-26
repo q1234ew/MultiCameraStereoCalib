@@ -98,6 +98,9 @@ class StreamManager(QObject):
 
     # ── Public API ────────────────────────────────────────────
 
+    def is_virtual_pair(self, name: str) -> bool:
+        return name in self._virtual_pairs
+
     def add_stereo_pair(self, pair: StereoPairConfig):
         logger.info(
             "Register stereo pair: name=%s left=%s url=%s right=%s url=%s type=%s",

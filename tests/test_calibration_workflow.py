@@ -191,7 +191,8 @@ def test_failed_json_write_keeps_previous_file(tmp_path, rig, monkeypatch):
     assert path.read_bytes() == previous
 
 
-def test_recalibrate_after_supplement_uses_all_observations(app, window, monkeypatch):
+@pytest.mark.parametrize('undo_disk_error', [False, True])
+def test_recalibrate_after_supplement_uses_all_observations(app, window, monkeypatch, undo_disk_error):
     image, (dl, dr) = seed_observations(window)
     panel = window._calib_panel
     used_counts = []
@@ -224,10 +225,17 @@ def test_recalibrate_after_supplement_uses_all_observations(app, window, monkeyp
     np.testing.assert_allclose(
         session.load_rig().pairs["rgb"].left_intrinsics.camera_matrix[0, 0], 800., atol=.2,
     )
+    if undo_disk_error:
+        def fail_delete(*args):
+            raise PermissionError('capture directory is read-only')
+        monkeypatch.setattr(session, 'delete_saved_pair_frame', fail_delete)
     panel._on_undo_capture()
     assert panel._stereo_cals["rgb"].num_frames == 8
     assert "rgb" not in panel._pair_calibs
     assert panel._pair_rows["rgb"].btn.isEnabled()
+    assert not window._act_export.isEnabled()
+    if undo_disk_error:
+        assert '磁盘图片删除失败' in panel._log_text.toPlainText()
 
 
 def test_batch_recalibrates_completed_pairs_without_new_capture(app, window, monkeypatch):
@@ -262,5 +270,7 @@ def test_preview_failure_does_not_block_save_or_buttons(app, window, monkeypatch
     wait_until(app, lambda: panel._calib_worker is None)
     assert window._current_session.load_rig() is not None
     assert panel._pair_rows["rgb"].btn.isEnabled()
-    assert panel._btn_capture.isEnabled()
+    assert panel._btn_import.isEnabled() and panel._btn_to_calibration.isEnabled()
+    # This fixture is a virtual pair: live capture stays unavailable, not busy.
+    assert not panel._btn_capture.isEnabled()
     assert "simulated preview failure" in panel._log_text.toPlainText()
