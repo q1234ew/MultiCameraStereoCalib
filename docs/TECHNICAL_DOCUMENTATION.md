@@ -1386,3 +1386,5 @@ python -m pytest -q tests/test_guidance_replay.py tests/test_adaptive_guidance.p
 Windows构建第15次运行在回归阶段因回放脚本的中文进度输出失败：重定向标准输出继承 `cp1252`，触发 `UnicodeEncodeError`；该次未进入EXE打包及自检。`replay_capture_guidance.py` 命令行入口现在显式将可重新配置的标准输出与标准错误设为UTF-8，保留中文进度、报告路径和异常。库函数导入不改变宿主进程的流配置；HTML、JSON及Markdown文件继续显式使用UTF-8。
 
 Windows Actions作业同时设置 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`，统一其Python子进程默认文本及标准流编码。通过管道调用回放CLI的程序应按UTF-8解码输出，不能依赖Windows区域代码页。回归主动关闭UTF-8模式并分别指定UTF-8、cp1252和ASCII标准流，验证中文源目录、输出目录、成功进度、错误输出、文件哈希和禁止覆盖行为；不只依赖CI环境变量绕过问题。此修复不改变图像颜色、白平衡、标定算法及结果格式。
+
+构建#16已通过中文输出及报告生成，但在重复运行的错误路径断言失败：`FileExistsError` 在异常信息中使用文件名的 `repr` 表示，Windows反斜杠和路径内引号会转义。回归检查据此匹配 `repr(str(path))`，不将整个stderr做反斜杠替换或Unicode反转义；成功输出中的报告路径仍按原文检查。跨平台用例在任意宿主上启动子进程，分别对POSIX、Windows盘符及UNC路径主动产生真实 `FileExistsError`，包含中文、空格、引号和易与转义序列混淆的目录名。原有异常类型、无编码错误、源文件哈希及报告禁止覆盖检查全部保留。

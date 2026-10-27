@@ -26,6 +26,31 @@ def frame_stream(observations):
             for i, (left, right) in enumerate(zip(observations['L'], observations['R']))]
 
 
+def assert_existing_output_error(stderr, path):
+    assert 'FileExistsError' in stderr
+    assert 'UnicodeEncodeError' not in stderr
+    assert repr(str(path)) in stderr
+
+
+@pytest.mark.parametrize('path', [
+    '/tmp/回放报告',
+    '/tmp/报告 "双目"/camera\'s output',
+    r'C:\Users\tester\回放报告',
+    r'D:\camera data\new\test\回放报告',
+    r'\\server\共享目录\回放报告',
+    r"C:\camera\camera's output\回放报告",
+])
+def test_existing_output_traceback_path_representation(path):
+    result = subprocess.run(
+        [sys.executable, '-c',
+         "import sys; raise FileExistsError(17, 'File exists', sys.argv[1])", path],
+        capture_output=True, encoding='utf-8', timeout=10,
+        env=dict(os.environ, PYTHONIOENCODING='utf-8'),
+    )
+    assert result.returncode != 0
+    assert_existing_output_error(result.stderr, path)
+
+
 def test_replay_only_analyzes_observed_prefix(board, monkeypatch):
     original = replay.analyze_guidance
     seen = []
@@ -99,7 +124,5 @@ def test_cli_preserves_sources_and_does_not_overwrite_output(tmp_path, console_e
     repeated = subprocess.run(command, cwd=root, capture_output=True, encoding='utf-8',
                               env=env, timeout=30)
     assert repeated.returncode != 0
-    assert 'FileExistsError' in repeated.stderr
-    assert 'UnicodeEncodeError' not in repeated.stderr
-    assert str(output.resolve()) in repeated.stderr
+    assert_existing_output_error(repeated.stderr, output.resolve())
     assert (output / 'report.json').read_bytes() == data
