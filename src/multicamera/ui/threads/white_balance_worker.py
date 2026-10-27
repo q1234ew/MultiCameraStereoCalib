@@ -12,13 +12,16 @@ class WhiteBalanceWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, urls, parent=None):
+    def __init__(self, urls, parent=None, *, lock=True):
         super().__init__(parent)
         self.urls = urls
+        self.lock = lock
 
     def run(self):
         try:
-            result = stabilize_and_lock(self.urls, cancelled=self.isInterruptionRequested, progress=self.progress.emit)
+            options = {} if self.lock else {'lock': False}
+            result = stabilize_and_lock(self.urls, cancelled=self.isInterruptionRequested,
+                                        progress=self.progress.emit, **options)
             self.succeeded.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -42,6 +45,8 @@ class WhiteBalanceGuard(QObject):
         self._result = None
         self._error = None
         self._resume = None
+        self._ready_lock = True
+        self._work_lock = True
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._settled)
@@ -69,12 +74,19 @@ class WhiteBalanceGuard(QObject):
         if was_settling:
             self.message.emit('采图已取消；相机已锁定的白平衡保持不变')
 
-    def ensure(self, urls, resume):
+    def ensure(self, urls, resume, *, lock=True):
         targets = list(dict.fromkeys(camera_base(url) for url in urls))
-        if not targets or set(targets) <= self.ready:
+        if not targets:
             return True
         if self.busy:
             return False
+        if self._ready_lock != lock:
+            self.ready.clear()
+        if set(targets) <= self.ready:
+            if not lock:
+                # Automatic mode has a single-use permit, not a persistent lock.
+                self.ready.difference_update(targets)
+            return True
         self.busy = True
         self.stage = '准备白平衡'
         self.started_at = time.monotonic()
@@ -82,13 +94,15 @@ class WhiteBalanceGuard(QObject):
         self._resume = resume
         self._result, self._error = None, None
         self._work_generation = self._generation
-        self.worker = WhiteBalanceWorker(targets, self)
+        self._work_lock = lock
+        self.worker = WhiteBalanceWorker(targets, self, lock=lock)
         self.worker.succeeded.connect(self._succeeded)
         self.worker.failed.connect(self._failed)
         self.worker.progress.connect(self._progress)
         self.worker.finished.connect(self._finished)
         self.busy_changed.emit(True)
-        self.message.emit('RGB 白平衡稳定与锁定中，请保持场景不变；完成后自动采图')
+        self.message.emit(('RGB 白平衡稳定与锁定中' if lock else 'RGB 自动白平衡稳定检查中（不锁定）')
+                          + '，请保持场景不变；完成后继续本次采图')
         self.worker.start()
         return False
 
@@ -117,6 +131,7 @@ class WhiteBalanceGuard(QObject):
             self.completed.emit(False)
             return
         self.ready.update(self._result)
+        self._ready_lock = self._work_lock
         for url in self._result:
             self.manager.discard_frames_for_url(url, settle_seconds=.8)
         self.stage = '等待新画面'
@@ -126,10 +141,15 @@ class WhiteBalanceGuard(QObject):
         resume, self._resume = self._resume, None
         self.busy = False
         self.busy_changed.emit(False)
-        self.message.emit('RGB 白平衡已稳定并锁定；旧预览帧已丢弃')
+        self.message.emit('RGB 白平衡已稳定并锁定；旧预览帧已丢弃' if self._work_lock else
+                          'RGB 自动白平衡已稳定，未锁定；仅允许本次采图，旧预览帧已丢弃')
         self.completed.emit(True)
-        if resume is not None:
-            resume()
+        try:
+            if resume is not None:
+                resume()
+        finally:
+            if not self._work_lock:
+                self.ready.clear()
 
     def shutdown(self):
         self.invalidate()

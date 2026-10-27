@@ -1,16 +1,22 @@
 """QPainter motion geometry, rendering and animation lifecycle."""
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
+from PySide6.QtCore import QRectF
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 
 from multicamera.ui.theme import configure_application_style
 from multicamera.ui.widgets.capture_guide import BoardTilt, CaptureTarget, build_default_sequence
 from multicamera.ui.widgets.stereo_schematic import StereoSchematic, board_point, project_point
+from multicamera.ui.widgets.board_view import (
+    board_framing, board_projection, depth_projection, EDGES, BOARD_CORNERS,
+    oblique_framing, oblique_projection,
+)
 
 
 @pytest.mark.parametrize('tilt,fixed,moving', [
@@ -81,9 +87,11 @@ def test_animation_pause_replay_step_review_and_visibility(app, monkeypatch):
     assert not guide.timer.isActive() and not guide.replay.isEnabled()
 
 
-def test_qpainter_frames_are_nonblank_and_change(app, tmp_path):
+@pytest.mark.parametrize('view', ['board', 'profile', 'spatial'])
+def test_qpainter_frames_are_nonblank_and_change(app, tmp_path, view):
     configure_application_style(app)
     guide = StereoSchematic()
+    guide.view_selector.setCurrentIndex(guide.view_selector.findData(view))
     guide.resize(820, 400)
     guide.set_target(CaptureTarget(1, 1, BoardTilt.TILT_RIGHT))
     guide.show()
@@ -102,9 +110,109 @@ def test_qpainter_frames_are_nonblank_and_change(app, tmp_path):
         guide.grab().save(str(directory / f'stereo-motion-{value}.png'))
     assert guide.canvas.cache_builds == builds
     assert not np.array_equal(frames[0], frames[2])
-    # The starting diagram remains unchanged when only animation progress changes.
-    w = frames[0].shape[1] // 2
-    np.testing.assert_array_equal(frames[0][:, :w], frames[2][:, :w])
+    if view == 'spatial':
+        # The old starting diagram remains unchanged when progress changes.
+        w = frames[0].shape[1] // 2
+        np.testing.assert_array_equal(frames[0][:, :w], frames[2][:, :w])
+
+
+def test_board_view_is_unmirrored_and_has_image_axis_directions():
+    center = board_projection((0., 0., 4.7))
+    assert board_projection((1., 0., 4.7)).x() > center.x()
+    assert board_projection((-1., 0., 4.7)).x() < center.x()
+    assert board_projection((0., -1., 4.7)).y() < center.y()
+    assert board_projection((0., 1., 4.7)).y() > center.y()
+    with pytest.raises(ValueError):
+        board_projection((0., 0., -1.))
+
+
+@pytest.mark.parametrize('tilt', list(EDGES))
+def test_depth_panel_moving_edge_approaches_camera_and_pivot_does_not_move(tilt):
+    target = CaptureTarget(1, 1, tilt)
+    fixed, moving, _, _ = EDGES[tilt]
+    for xy in fixed:
+        a = depth_projection(board_point(*xy, 0, target), tilt)
+        b = depth_projection(board_point(*xy, 1, target), tilt)
+        assert a == b
+    xy = tuple((a + b) / 2 for a, b in zip(*moving))
+    a = depth_projection(board_point(*xy, 0, target), tilt)
+    b = depth_projection(board_point(*xy, 1, target), tilt)
+    if tilt in (BoardTilt.TILT_UP, BoardTilt.TILT_DOWN):
+        assert b.x() < a.x()  # Side view: camera on the left.
+    else:
+        assert b.y() > a.y()  # Top view: camera below the board.
+
+
+def test_view_switch_and_fixed_moving_edge_caption_preserve_animation_state(app):
+    guide = StereoSchematic()
+    guide.set_target(CaptureTarget(1, 1, BoardTilt.TILT_LEFT))
+    guide.show()
+    app.processEvents()
+    assert guide.view_mode == 'board'
+    assert '固定右边' in guide.caption.text() and '左边靠近镜头' in guide.caption.text()
+    guide.pause.setChecked(True)
+    guide.progress = .6
+    guide.view_selector.setCurrentIndex(guide.view_selector.findData('spatial'))
+    assert guide.view_mode == 'spatial'
+    assert guide.progress == .6 and guide.pause.isChecked()
+    guide.view_selector.setCurrentIndex(0)
+    assert guide.progress == .6 and guide.pause.isChecked()
+    guide.set_compact(True)
+    assert guide.view_options.isHidden()
+    guide.expand.setChecked(True)
+    assert not guide.view_options.isHidden()
+    guide.close()
+
+
+def test_depth_view_switch_keeps_front_geometry_target_and_pause(app):
+    guide = StereoSchematic()
+    guide.set_target(CaptureTarget(1, 1, BoardTilt.TILT_DOWN))
+    guide.show()
+    app.processEvents()
+    guide.pause.setChecked(True)
+    guide.progress = .65
+    target = guide.target
+    before = guide.canvas.grab().toImage()
+    guide.view_selector.setCurrentIndex(guide.view_selector.findData('profile'))
+    after = guide.canvas.grab().toImage()
+    assert guide.view_mode == 'profile'
+    assert guide.target is target and guide.progress == .65 and guide.pause.isChecked()
+    # Only the auxiliary pane changes; the main board image is identical.
+    width = int(before.width() * .6)
+    assert before.copy(0, 0, width, before.height()) == after.copy(0, 0, width, after.height())
+    assert before != after
+    guide.close()
+
+
+@pytest.mark.parametrize('scale', ['small', 'medium', 'large'])
+def test_board_framing_keeps_all_planned_motions_inside_view(scale):
+    rect = QRectF(10, 30, 260, 140)
+    for target in build_default_sequence():
+        target = replace(target, scale=scale)
+        def point(x, y, t):
+            return board_point(x, y, t, target)
+        center, focal = board_framing(rect, point)
+        for t in np.linspace(0, 1, 21):
+            for x, y in BOARD_CORNERS[:-1]:
+                assert rect.contains(center + board_projection(point(x, y, t)) * focal)
+
+
+@pytest.mark.parametrize('scale', ['small', 'medium', 'large'])
+def test_oblique_view_fits_board_and_fixed_camera_for_all_targets(scale):
+    rect = QRectF(8, 30, 140, 180)
+    for target in build_default_sequence():
+        target = replace(target, scale=scale)
+        def point(x, y, t):
+            return board_point(x, y, t, target)
+        center, focal = oblique_framing(rect, point)
+        for t in np.linspace(0, 1, 21):
+            for x, y in BOARD_CORNERS[:-1]:
+                assert rect.contains(center + oblique_projection(point(x, y, t)) * focal)
+        for x in (-1.3, 1.3):
+            for y in (-.42, .42):
+                for z in (-.78, .68):
+                    camera = tuple(v * .45 for v in (x, y, z))
+                    assert rect.contains(center + oblique_projection(camera) * focal)
 
 
 def test_scroll_visibility_stops_animation_and_restores_it_without_lost_pause(app):

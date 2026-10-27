@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -78,6 +79,7 @@ class StreamManager(QObject):
     # 双目帧时间戳允许偏差；过小易导致「采集一帧」拿不到同步对、进度与磁盘保存都不触发
     DEFAULT_SYNC_TOLERANCE = 0.35  # 350 ms（嵌入式 MJPEG 左右帧到达 UI 常有抖动）
     DEFAULT_MAX_DECODE_FPS = 20.0
+    MAX_CAPTURE_FRAME_AGE = 2.0
 
     def __init__(
         self,
@@ -224,6 +226,8 @@ class StreamManager(QObject):
 
         if left_entry is None or right_entry is None:
             return None
+        if not all(self._frame_is_fresh(entry) for entry in (left_entry, right_entry)):
+            return None
         if abs(left_entry.timestamp - right_entry.timestamp) > self._sync_tolerance:
             return None
         return left_entry.frame, right_entry.frame
@@ -238,7 +242,37 @@ class StreamManager(QObject):
             right_entry = self._latest_frames.get(pair.right.camera_id)
         if left_entry is None or right_entry is None:
             return None
+        if not all(self._frame_is_fresh(entry) for entry in (left_entry, right_entry)):
+            return None
         return left_entry.frame, right_entry.frame
+
+    @classmethod
+    def _frame_is_fresh(cls, entry: FrameEntry) -> bool:
+        age = time.time() - entry.timestamp
+        return math.isfinite(age) and 0 <= age <= cls.MAX_CAPTURE_FRAME_AGE
+
+    def pair_capture_status(self, group_name: str) -> tuple[str, str]:
+        pair = self._stereo_pairs.get(group_name)
+        if pair is None:
+            return 'missing', '未配置相机组'
+        if group_name in self._virtual_pairs:
+            return 'offline', '离线图像，不代表实时连接'
+        with self._lock:
+            entries = [self._latest_frames.get(cam.camera_id) for cam in (pair.left, pair.right)]
+        for role, entry in zip(('左目', '右目'), entries):
+            if entry is None:
+                return 'waiting', f'{role}等待首帧或已断开'
+            if not self._frame_is_fresh(entry):
+                return 'stale', f'{role}画面已过期，请检查连接'
+        delta = abs(entries[0].timestamp - entries[1].timestamp)
+        if delta > self._sync_tolerance:
+            return 'unpaired', f'左右时间差 {delta * 1000:.0f} ms，手动采集将使用最新帧'
+        return 'ready', f'配对就绪 · 时间差 {delta * 1000:.0f} ms（软件时间戳）'
+
+    def _on_connection_lost(self, camera_id: str, reason: str):
+        with self._lock:
+            self._latest_frames.pop(camera_id, None)
+        self.camera_disconnected.emit(camera_id, reason)
 
     @property
     def sync_tolerance_seconds(self) -> float:
@@ -323,7 +357,7 @@ class StreamManager(QObject):
         )
         grabber.frame_ready.connect(self._on_frame)
         grabber.connection_established.connect(self.camera_connected)
-        grabber.connection_lost.connect(self.camera_disconnected)
+        grabber.connection_lost.connect(self._on_connection_lost)
         grabber.fps_updated.connect(self.fps_updated)
         self._grabbers[cfg.camera_id] = grabber
         logger.info(
@@ -373,6 +407,8 @@ class StreamManager(QObject):
                 right_entry = self._latest_frames.get(pair.right.camera_id)
 
             if left_entry is None or right_entry is None:
+                continue
+            if not all(self._frame_is_fresh(entry) for entry in (left_entry, right_entry)):
                 continue
             if abs(left_entry.timestamp - right_entry.timestamp) <= self._sync_tolerance:
                 self.sync_pair_ready.emit(

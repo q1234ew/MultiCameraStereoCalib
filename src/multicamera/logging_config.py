@@ -136,6 +136,9 @@ def _install_qt_message_handler() -> None:
 def _log_startup_context(log_path: Path) -> None:
     logger = logging.getLogger(__name__)
     logger.info("==== MultiCamera startup ====")
+    from .build_info import build_label
+
+    logger.info('build=%s', build_label())
     logger.info("log_file=%s", log_path)
     logger.info("frozen=%s executable=%s exe_dir=%s", getattr(sys, "frozen", False), sys.executable, exe_dir())
     logger.info("python=%s", sys.version.replace("\n", " "))

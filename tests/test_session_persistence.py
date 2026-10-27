@@ -115,6 +115,8 @@ def test_generation_manifest_distinguishes_historical_exports(session, rig):
     saved, errors = session.save_calibration_results(rig)
     assert not errors
     first = json.loads((saved[-1]).read_text())
+    previous_dir = saved[0].parent
+    previous_files = {path.name: path.read_bytes() for path in saved}
     pair = rig.pairs['rgb']
     rig.pairs['second'] = StereoPairCalibration('second', 'L2', 'R2', pair.left_intrinsics,
                                                pair.right_intrinsics, pair.stereo)
@@ -124,11 +126,63 @@ def test_generation_manifest_distinguishes_historical_exports(session, rig):
     assert manifest['generation_id'] != first['generation_id']
     assert manifest['pair_names'] == ['rgb', 'second']
     assert 'rig_opencv_standard.yml' not in {record['name'] for record in manifest['files']}
-    assert (session.session_dir / 'results/rig_opencv_standard.yml').is_file()
+    assert not (session.result_directory / 'rig_opencv_standard.yml').exists()
     assert 'rig_kalibr.yaml' not in {record['name'] for record in manifest['files']}
+    assert not (session.result_directory / 'rig_kalibr.yaml').exists()
+    assert session.result_directory != previous_dir
+    assert all((previous_dir / name).read_bytes() == content for name, content in previous_files.items())
     for record in manifest['files']:
-        path = session.session_dir / 'results' / record['name']
+        path = session.result_directory / record['name']
         assert hashlib.sha256(path.read_bytes()).hexdigest() == record['sha256']
+
+
+def test_legacy_results_are_readable_but_not_mixed_with_new_batches(session, rig):
+    legacy = session.save_rig(rig)
+    assert session.result_directory == legacy.parent
+    assert session.load_rig().reference_camera == 'left'
+    previous = legacy.read_bytes()
+    saved, errors = session.save_calibration_results(rig)
+    assert not errors
+    assert session.result_directory == saved[0].parent != legacy.parent
+    assert legacy.read_bytes() == previous
+    assert CalibrationSession.load(session.session_dir).result_directory == session.result_directory
+
+
+def test_failed_new_json_does_not_advance_latest_batch(session, rig):
+    session.save_calibration_results(rig)
+    previous = session.result_directory
+    rig.pairs['rgb'].stereo.rms_error = float('nan')
+    with pytest.raises(ValueError):
+        session.save_calibration_results(rig)
+    assert session.result_directory == previous
+    assert session.load_rig().pairs['rgb'].stereo.rms_error == .2
+
+
+def test_latest_pointer_failure_preserves_previous_batch(session, rig, monkeypatch):
+    session.save_calibration_results(rig)
+    previous = session.result_directory
+    original = session._atomic_json
+
+    def fail(path, data):
+        if path.name == 'latest.json':
+            raise OSError('index read-only')
+        return original(path, data)
+
+    monkeypatch.setattr(session, '_atomic_json', fail)
+    rig.pairs['rgb'].stereo.rms_error = .1
+    saved, errors = session.save_calibration_results(rig)
+    assert len(saved) == 5 and all(path.is_file() for path in saved)
+    assert len(errors) == 1 and errors[0].startswith('latest.json:')
+    assert saved[0].parent != previous == session.result_directory
+    assert session.load_rig().pairs['rgb'].stereo.rms_error == .2
+
+
+@pytest.mark.parametrize('name', ['../outside', 'calib_../../outside', 'calib_..\\outside', 'calib_missing'])
+def test_invalid_latest_pointer_does_not_silently_load_legacy(session, rig, name):
+    session.save_rig(rig)
+    session._atomic_json(session.session_dir / 'results/latest.json', {'directory': name})
+    with pytest.raises(ValueError):
+        session.load_rig()
 
 
 def test_rig_json_refuses_nan_without_replacing_previous(session, rig):

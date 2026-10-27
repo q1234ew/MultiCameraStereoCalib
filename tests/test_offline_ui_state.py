@@ -41,6 +41,7 @@ def test_offline_import_preserves_guide_and_selects_correct_source(offline_windo
     assert panel._combo_pair.currentText() == 'offline' and panel.offline_selection
     assert panel._capture_sequence.done_count == 1
     assert not panel._btn_capture.isVisible() and not panel._check_wb.isVisible()
+    assert not panel._combo_wb_mode.isVisible()
     assert not panel._btn_auto.isVisible() and not panel._btn_skip_stereo.isVisible()
     assert not guide.schematic.isVisible() and not guide.schematic.timer.isActive()
     assert '离线' in guide.instruction.text() and '实时' not in guide.compact_summary.text()
@@ -53,6 +54,34 @@ def test_offline_import_preserves_guide_and_selects_correct_source(offline_windo
         assert '离线图像' in view._info.text()
     assert panel._stereo_cals['offline'].min_frames == panel._spin_min.minimum()
     assert not panel._stereo_cals['offline'].ready
+
+
+@pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
+def test_offline_save_status_has_room_for_its_text(offline_window, app, size):
+    win = offline_window
+    win.resize(*size)
+    app.processEvents()
+    label = win._calib_panel._lbl_raw_save
+    assert label.isVisible()
+    assert label.width() >= label.fontMetrics().horizontalAdvance(label.text())
+    assert label.height() >= label.fontMetrics().height()
+    assert label.parentWidget().rect().contains(label.geometry())
+
+
+def test_current_preview_counts_are_distinct_from_cumulative_coverage(offline_window, app):
+    win = offline_window
+    key = win._calib_panel.preview_pairs()[0].key
+    pair = win._calib_panel.preview_pairs()[0]
+    partial = pair.left.copy()
+    partial[:, :partial.shape[1] // 2] = 200
+    win._stream_view.show_review_images(key, {pair.left_id: partial, pair.right_id: pair.right})
+    app.processEvents()
+    win._stereo_capture.refresh()
+    text = win._stereo_capture.compact_summary.text()
+    assert '当前预览角点' in text and '数据集累计' in text
+    assert '缩放检测' in text
+    assert '累计' in win._stereo_capture.coverage_button.toolTip()
+    assert '预览角点' in win._stream_view._views[pair.left_id]._info.text()
 
 
 def test_swap_failure_and_live_return_do_not_destroy_prior_state(offline_window):

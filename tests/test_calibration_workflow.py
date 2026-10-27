@@ -8,7 +8,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import pytest
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QTimer, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QMessageBox
 
 from multicamera.board.detector import DetectionResult
@@ -20,6 +21,7 @@ from multicamera.io import export
 from multicamera.io.session import CalibrationSession
 from multicamera.streaming.stream_manager import CameraConfig, StereoPairConfig
 from multicamera.ui import main_window
+from multicamera.ui.theme import configure_application_style
 
 
 @pytest.fixture
@@ -109,7 +111,7 @@ def test_completion_without_session_saves_readable_files(window, rig):
     session = window._current_session
     assert session is not None
     assert session.load_rig().reference_camera == "left"
-    results = session.session_dir / "results"
+    results = session.result_directory
     for name in ("rig_opencv.yml", "rig_opencv_standard.yml"):
         fs = cv2.FileStorage(str(results / name), cv2.FILE_STORAGE_READ)
         try:
@@ -124,10 +126,14 @@ def test_completion_without_session_saves_readable_files(window, rig):
 def test_repeat_completion_updates_existing_session(window, rig):
     window._on_calib_finished(rig)
     session = window._current_session
+    previous = session.result_directory
+    previous_json = (previous / 'rig.json').read_bytes()
     rig.pairs["rgb"].stereo.rms_error = 0.025
     window._on_calib_finished(rig)
     assert window._current_session is session
     assert session.load_rig().pairs["rgb"].stereo.rms_error == 0.025
+    assert session.result_directory != previous
+    assert (previous / 'rig.json').read_bytes() == previous_json
 
 
 def test_disconnected_pairs_each_get_standard_and_kalibr_files(window, rig):
@@ -137,7 +143,7 @@ def test_disconnected_pairs_each_get_standard_and_kalibr_files(window, rig):
     )
     rig.pairs["rgb2"] = second
     window._on_calib_finished(rig)
-    results = window._current_session.session_dir / "results"
+    results = window._current_session.result_directory
     assert (results / "rig.json").is_file()
     for index, pair_name in enumerate(("rgb", "rgb2"), start=1):
         fs = cv2.FileStorage(
@@ -157,10 +163,56 @@ def test_failed_format_does_not_lose_other_results(window, rig, monkeypatch):
 
     monkeypatch.setattr(export, "export_rig_kalibr_yaml", fail)
     window._on_calib_finished(rig)
-    results = window._current_session.session_dir / "results"
+    results = window._current_session.result_directory
     assert (results / "rig.json").is_file()
     assert (results / "rig_opencv_standard.yml").is_file()
     assert "simulated Kalibr failure" in window._calib_panel._log_text.toPlainText()
+
+
+def test_repeat_partial_export_never_exposes_previous_format_as_current(window, rig, monkeypatch):
+    window._on_calib_finished(rig)
+    old = window._current_session.result_directory
+    old_yaml = (old / 'rig_kalibr.yaml').read_bytes()
+
+    def fail(*args, **kwargs):
+        raise OSError('Kalibr unavailable this generation')
+
+    monkeypatch.setattr(export, 'export_rig_kalibr_yaml', fail)
+    window._on_calib_finished(rig)
+    current = window._current_session.result_directory
+    panel = window._calib_panel
+    assert current == panel._result_directory != old
+    assert not (current / 'rig_kalibr.yaml').exists()
+    assert (old / 'rig_kalibr.yaml').read_bytes() == old_yaml
+    assert (current / 'rig.json').is_file()
+    assert (current / 'rig_opencv_standard.yml').is_file()
+    assert '部分格式未生成' in panel._lbl_result_storage.text()
+    assert str(current.resolve()) in panel._lbl_result_storage.text()
+    assert panel._btn_open_results.isEnabled() and panel._btn_copy_results.isEnabled()
+
+
+@pytest.mark.parametrize('strategy', ['filter', 'optimization'])
+def test_strategy_change_keeps_outdated_history_until_new_result(window, rig, strategy):
+    window._on_calib_finished(rig)
+    panel = window._calib_panel
+    previous = panel._result_directory
+    if strategy == 'filter':
+        panel._combo_data_filter.setCurrentIndex(panel._combo_data_filter.findData('quality'))
+    else:
+        panel._combo_calib_strategy.setCurrentIndex(panel._combo_calib_strategy.findData('joint_refine'))
+    assert window._rig is panel._rig is None
+    assert not window._act_export.isEnabled()
+    assert panel._results_outdated
+    assert panel._previous_result_directory == previous
+    assert '旧结果已过期' in panel._lbl_result_storage.text()
+    assert str(previous.resolve()) in panel._lbl_result_storage.text()
+    panel._clear_calibration_results()  # Repeated changes must not forget the original path.
+    assert panel._previous_result_directory == previous
+    assert (previous / 'rig.json').is_file()
+    window._on_calib_finished(rig)
+    assert not panel._results_outdated
+    assert panel._previous_result_directory is None
+    assert panel._result_directory != previous
 
 
 def test_save_error_keeps_manual_export_available(window, rig, monkeypatch):
@@ -274,3 +326,111 @@ def test_preview_failure_does_not_block_save_or_buttons(app, window, monkeypatch
     # This fixture is a virtual pair: live capture stays unavailable, not busy.
     assert not panel._btn_capture.isEnabled()
     assert "simulated preview failure" in panel._log_text.toPlainText()
+
+
+@pytest.mark.parametrize('action', ['filter', 'strategy', 'model', 'reset'])
+def test_invalidating_results_removes_old_rectification(window, action):
+    panel = window._calib_panel
+    panel._lbl_rect_preview.setPixmap(QPixmap(80, 40))
+    panel._lbl_rect_preview.show()
+    panel._lbl_rect_context.setText('旧针孔结果')
+    panel._lbl_rect_context.show()
+    if action == 'filter':
+        panel._combo_data_filter.setCurrentIndex(panel._combo_data_filter.findData('quality'))
+    elif action == 'strategy':
+        panel._combo_calib_strategy.setCurrentIndex(panel._combo_calib_strategy.findData('joint_refine'))
+    elif action == 'model':
+        panel.apply_recommended_model('fisheye')
+    else:
+        panel._reset_all()
+    assert panel._lbl_rect_preview.pixmap().isNull()
+    assert panel._lbl_rect_preview.isHidden()
+    assert panel._lbl_rect_context.isHidden()
+    assert not panel._lbl_rect_context.text()
+
+
+def test_rectification_preview_uses_only_own_pair_and_rejects_wrong_size(window, rig, monkeypatch):
+    panel = window._calib_panel
+    pair = rig.pairs['rgb']
+    image = np.zeros((480, 640, 3), np.uint8)
+    panel._import_last_pair = (image, image)  # A different historical pair must not be reused.
+    calls = []
+
+    def generate(left, right, stereo, **kwargs):
+        calls.append((left, right))
+        return np.hstack((left, right))
+
+    monkeypatch.setattr(panel._evaluator, 'generate_rectification_preview', generate)
+    panel._show_rect_preview('rgb', pair)
+    assert not calls
+    assert panel._lbl_rect_preview.isHidden()
+    panel._imported_pair_frames = {'rgb': [(image, image)]}
+    panel._show_rect_preview('rgb', pair)
+    assert len(calls) == 1
+    assert not panel._lbl_rect_preview.pixmap().isNull()
+    assert 'rgb · 针孔模型 · 该组最后导入配对' in panel._lbl_rect_context.text()
+    panel._imported_pair_frames['rgb'] = [(image[:100], image)]
+    with pytest.raises(ValueError, match='尺寸'):
+        panel._show_rect_preview('rgb', pair)
+    assert len(calls) == 1
+    assert panel._lbl_rect_preview.pixmap().isNull()
+    assert panel._lbl_rect_context.isHidden()
+
+
+@pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
+def test_toolbar_tools_and_session_remain_accessible_at_all_sizes(window, app, size, tmp_path):
+    configure_application_style(app)
+    window._current_session = CalibrationSession.create(tmp_path, window._board, [])
+    long_name = 'calib_' + 'LongSessionName' * 20
+    window._current_session._metadata['name'] = long_name
+    window.resize(*size)
+    window._sync_toolbar_density()
+    window.show()
+    app.processEvents()
+    toolbar = window._toolbar
+    buttons = [toolbar.widgetForAction(action) for action in (
+        window._act_start_streams, window._act_stop_streams,
+        window._act_config_tb, window._act_rgb_settings_tb,
+    )] + [window._session_button]
+    for button in buttons:
+        assert button.isVisible()
+        assert toolbar.rect().contains(button.geometry())
+        assert button.toolTip()
+    for action in (window._act_config_tb, window._act_rgb_settings_tb):
+        expected = Qt.ToolButtonIconOnly if size[0] < 1200 else Qt.ToolButtonTextBesideIcon
+        assert toolbar.widgetForAction(action).toolButtonStyle() == expected
+    assert window._session_menu.actions() == [window._act_new_session, window._act_load_session]
+    assert long_name in window._session_button.toolTip()
+    assert len(window._session_button.text()) < len(long_name)
+    message = '导出失败：' + '/very_long_directory/' * 30
+    window.statusBar().showMessage(message)
+    assert window.statusBar().currentMessage() == window.statusBar().toolTip() == message
+    window.statusBar().clearMessage()
+    assert window.statusBar().toolTip() == ''
+
+
+@pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
+@pytest.mark.parametrize('phase', ['calibration', 'results'])
+def test_long_result_text_wraps_without_clipping_or_horizontal_scroll(window, rig, app, size, phase):
+    configure_application_style(app)
+    seed_observations(window)
+    panel = window._calib_panel
+    panel._pair_calibs = dict(rig.pairs)
+    panel._sync_pair_states()
+    panel.set_result_model(rig)
+    long_directory = Path('/result_root') / ('calib_' + 'a' * 180)
+    panel.set_result_storage(long_directory, [long_directory / 'rig.json'],
+                             ['rig_kalibr.yaml: ' + '长错误说明' * 40])
+    window.resize(*size)
+    window.show()
+    panel.show_workflow(phase)
+    app.processEvents()
+    app.processEvents()
+    assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
+    labels = ([panel._lbl_result_storage, panel._lbl_result_decision] if phase == 'results'
+              else [panel._pair_rows['rgb']._lbl_status, panel._lbl_calib_hint, panel._lbl_model_choice])
+    for label in labels:
+        assert label.isVisible()
+        assert label.hasHeightForWidth()
+        assert label.height() >= label.heightForWidth(label.width())
+    assert str(long_directory) in panel._lbl_result_storage.text()

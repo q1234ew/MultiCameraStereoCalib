@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QLayout,
     QMessageBox,
     QSplitter,
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..board.charuco_board import CharucoBoard, CharucoBoardConfig
+from ..build_info import build_label
 from ..calibration.models import CameraModel, MultiCameraRig
 from ..io.session import CalibrationSession, SessionManager
 from ..runtime_paths import logo_png_path, logs_dir, sessions_dir
@@ -158,6 +161,7 @@ class MainWindow(QMainWindow):
         self._capture_bottom_layout.addWidget(self._capture_actions)
         workspace.addWidget(self._capture_bottom)
         self._calib_panel._capture_readiness = self._stereo_capture.auto_ready
+        self._calib_panel._capture_validator = self._stereo_capture.validate_capture
         self._capture_layout_active = False
         self._capture_section_layout = self._calib_panel._sections[0].parentWidget().layout()
         self._capture_section_index = self._capture_section_layout.indexOf(self._calib_panel._sections[0])
@@ -249,6 +253,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, '_capture_layout_active'):
             self._sync_capture_density()
+        if hasattr(self, '_toolbar'):
+            self._sync_toolbar_density()
 
     def _sync_capture_density(self):
         compact = self._capture_layout_active and (self.height() < 900 or self.width() < 1150)
@@ -374,7 +380,10 @@ class MainWindow(QMainWindow):
 
     def _init_toolbar(self):
         toolbar = QToolBar("主工具栏")
+        self._toolbar = toolbar
+        toolbar.setObjectName('mainToolbar')
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         toolbar.setIconSize(toolbar.iconSize())
         self.addToolBar(toolbar)
@@ -383,25 +392,27 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet(f"font-size:17px; font-weight:bold; color:{TEXT}; padding:0 10px;")
         toolbar.addWidget(brand)
         self._lbl_connections = QLabel("未连接")
-        self._lbl_connections.setMinimumWidth(118)
-        toolbar.addWidget(self._lbl_connections)
+        self._lbl_connections.setMinimumWidth(100)
 
         self._act_start_streams = self._create_action("连接相机")
         self._act_start_streams.setIcon(standard_icon(self, QStyle.SP_MediaPlay))
+        self._act_start_streams.setToolTip('连接已配置的相机')
         toolbar.addAction(self._act_start_streams)
 
         self._act_stop_streams = self._create_action("断开")
         self._act_stop_streams.setIcon(standard_icon(self, QStyle.SP_MediaStop))
         self._act_stop_streams.setEnabled(False)
+        self._act_stop_streams.setToolTip('断开全部相机')
         toolbar.addAction(self._act_stop_streams)
+        toolbar.widgetForAction(self._act_stop_streams).setToolButtonStyle(Qt.ToolButtonIconOnly)
+        toolbar.addWidget(self._lbl_connections)
 
         toolbar.addSeparator()
 
         self._act_config_tb = self._create_action("相机配置")
         self._act_config_tb.setIcon(standard_icon(self, QStyle.SP_FileDialogDetailedView))
+        self._act_config_tb.setToolTip('配置相机连接、融合相机和标定板')
         toolbar.addAction(self._act_config_tb)
-
-        toolbar.addSeparator()
 
         self._act_gen_board_tb = self._create_action("生成标定板")
 
@@ -409,6 +420,7 @@ class MainWindow(QMainWindow):
         self._act_rgb_settings_tb.setIcon(app_icon('sliders-horizontal'))
         self._act_rgb_settings_tb.setToolTip('同步调整左右 RGB 相机参数')
         toolbar.addAction(self._act_rgb_settings_tb)
+        toolbar.addSeparator()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
@@ -417,12 +429,46 @@ class MainWindow(QMainWindow):
         self._session_button.setIcon(app_icon('folder-open'))
         self._session_button.setText("未创建会话")
         self._session_button.setToolTip("新建采集会话")
+        self._session_button.setAccessibleName('当前会话与会话操作')
+        self._session_button.setPopupMode(QToolButton.MenuButtonPopup)
+        self._session_menu = QMenu(self._session_button)
+        self._session_menu.addAction(self._act_new_session)
+        self._session_menu.addAction(self._act_load_session)
+        self._session_button.setMenu(self._session_menu)
         toolbar.addWidget(self._session_button)
+        self._sync_toolbar_density()
+
+    def _sync_toolbar_density(self):
+        compact = self.width() < 1200
+        style = Qt.ToolButtonIconOnly if compact else Qt.ToolButtonTextBesideIcon
+        for action in (self._act_config_tb, self._act_rgb_settings_tb):
+            button = self._toolbar.widgetForAction(action)
+            button.setToolButtonStyle(style)
+            button.setAccessibleName(action.text())
+        self._session_button.setMinimumWidth(140 if compact else 180)
+        self._session_button.setMaximumWidth(180 if compact else 250)
+        self._refresh_session_button()
+
+    def _refresh_session_button(self):
+        if self._current_session is not None:
+            name = self._current_session.name
+            budget = self._session_button.maximumWidth() - 70
+            self._session_button.setText(self._session_button.fontMetrics().elidedText(name, Qt.ElideMiddle, budget))
+            self._session_button.setToolTip(f'{name}\n{self._current_session.session_dir.resolve()}')
 
     def _init_statusbar(self):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("就绪")
+        self._statusbar.setToolTip(self._statusbar.currentMessage())
+        self._statusbar.messageChanged.connect(self._statusbar.setToolTip)
+        identity = build_label()
+        self._lbl_build = QLabel()
+        self._lbl_build.setMaximumWidth(210)
+        self._lbl_build.setText(self._lbl_build.fontMetrics().elidedText(identity, Qt.ElideMiddle, 200))
+        self._lbl_build.setToolTip(identity + '\n源码修改不等同已发布安装包')
+        self._lbl_build.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._statusbar.addPermanentWidget(self._lbl_build)
 
     def _connect_signals(self):
         self._act_config.triggered.connect(self._on_config)
@@ -455,6 +501,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
         self._calib_panel.configure_aux_requested.connect(lambda: self._on_config(True))
         self._calib_panel.configure_stereo_requested.connect(lambda: self._on_config(False))
+        self._calib_panel.model_choice_requested.connect(self._on_model_choice)
         self._calib_panel.data_source_changed.connect(self._update_connection_summary)
         self._calib_panel.offline_imported.connect(self._gallery.show_first_page)
         self._calib_panel.diagnostic_preview_requested.connect(self._on_gallery_pair_selected)
@@ -549,10 +596,7 @@ class MainWindow(QMainWindow):
         self._lbl_latest_log.setToolTip(message)
         if "失败" in message or "无法连接" in message:
             self._toggle_logs.setChecked(True)
-        if self._current_session is not None:
-            name = self._current_session.name
-            self._session_button.setText(self._session_button.fontMetrics().elidedText(name, Qt.ElideMiddle, 140))
-            self._session_button.setToolTip(str(self._current_session.session_dir.resolve()))
+        self._refresh_session_button()
 
     def _update_connection_summary(self):
         count, expected = len(self._connection_connected), len(self._connection_expected)
@@ -560,6 +604,7 @@ class MainWindow(QMainWindow):
         if not count and not expected and self._calib_panel.offline_selection:
             text = '离线数据'
         self._lbl_connections.setText(text)
+        self._lbl_connections.setToolTip(text)
         color = SUCCESS if count and (not expected or count == expected) else (WARNING if expected else TEXT_DIM)
         self._lbl_connections.setStyleSheet(f"color:{color};")
 
@@ -584,8 +629,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_config(self, auxiliary: bool = False):
         logger.info("Open camera configuration dialog")
-        if self._calib_panel.has_active_operations:
-            QMessageBox.information(self, "配置暂不可修改", "请先停止自动采集，并等待白平衡准备、导入、保存或标定任务完成。")
+        if self._calib_panel.has_active_operations or self._calib_panel.has_failed_saves:
+            QMessageBox.information(self, "配置暂不可修改", "请先停止自动采集，等待后台任务完成；原图保存失败时请重试或撤销对应采集。")
             return
         was_streaming = self._act_stop_streams.isEnabled()
         preview_auxiliary = auxiliary or self._calib_panel._active_step == 2
@@ -926,7 +971,7 @@ class MainWindow(QMainWindow):
                     name="calib",
                     camera_model=self._camera_model.value,
                 )
-                self._calib_panel.set_session(self._current_session)
+                self._calib_panel.set_session(self._current_session, preserve_model_assessment=True)
             saved, errors = self._current_session.save_calibration_results(rig)
         except Exception as exc:
             logger.exception("Automatic calibration result save failed")
@@ -970,6 +1015,11 @@ class MainWindow(QMainWindow):
         self._right_tabs.setCurrentIndex(self._cloud_tab_index)
 
     def _background_tasks_block(self, action: str) -> bool:
+        if self._calib_panel.has_failed_saves:
+            text = f'{action}已拒绝：仍有原图保存失败，请重试保存或撤销对应采集，避免丢失原图。'
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
+            return True
         if not self._calib_panel.has_active_background_tasks():
             return False
         text = (
@@ -980,6 +1030,31 @@ class MainWindow(QMainWindow):
         self._calib_panel.append_log(text)
         logger.warning(text)
         return True
+
+    @Slot(object)
+    def _on_model_choice(self, model):
+        model = CameraModel(model)
+        if self._background_tasks_block('应用推荐模型'):
+            return
+        title = '鱼眼' if model == CameraModel.FISHEYE else '针孔'
+        if QMessageBox.question(
+                self, '确认模型变更',
+                f'将模型改为{title}。该设置影响全部相机组及辅助相机，已有标定结果会失效。\n'
+                '原始图像和检测观测将保留，历史文件不删除；应用后需重新标定。是否继续？',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        session = self._current_session
+        previous = deepcopy(session._metadata) if session is not None else None
+        try:
+            if session is not None:
+                session.record_configuration(self._board, list(self._stream_manager.stereo_pairs.values()),
+                                             self._stream_manager.auxiliary_camera, model.value)
+        except Exception as exc:
+            session._metadata = previous
+            self._calib_panel.append_log(f'模型配置保存失败，未应用：{exc}')
+            return
+        self._camera_model = model
+        self._calib_panel.apply_recommended_model(model)
 
     def closeEvent(self, event):
         if self._background_tasks_block("关闭窗口"):

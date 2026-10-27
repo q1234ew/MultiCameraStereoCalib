@@ -219,6 +219,7 @@ class CameraView(QFrame):
     def __init__(self, camera_id: str, parent=None):
         super().__init__(parent)
         self.camera_id = camera_id
+        self.corner_count = None
         self._display_name = camera_id
         self._expanded = False
         self.setCursor(Qt.PointingHandCursor)
@@ -324,6 +325,7 @@ class CameraView(QFrame):
     def clear_frame(self, info: str = "等待连接..."):
         """Drop cached image data so stale camera frames cannot remain visible."""
         self._last_frame = None
+        self.corner_count = None
         self._last_label_size = None
         self._last_pixmap = None
         self._image_label.clear()
@@ -560,6 +562,9 @@ class MultiStreamView(QWidget):
                       self._multimodal_ids() if self._multimodal_mode else tuple(stereo_order))
         return [cid for cid in candidates if cid in self._views and self._accept_camera(cid)]
 
+    def displayed_corner_counts(self):
+        return {cid: view.corner_count for cid, view in self._views.items()}
+
     def show_review_images(self, key: str, images: Dict[str, np.ndarray]):
         self._expanded_id = None
         self._review_images = {cid: frame for cid, frame in images.items() if self._accept_camera(cid)}
@@ -568,9 +573,10 @@ class MultiStreamView(QWidget):
             view = self._get_or_create_view(cid)
             view.set_display_name(self._camera_label(cid))
             result = self._detect_for_preview(frame)
+            view.corner_count = result.num_corners
             view.update_frame(self._draw_detection(frame, result) if self._show_guide else frame)
             h, w = frame.shape[:2]
-            view.update_info(f"{w}x{h} | 回看 {key} | 角点 {result.num_corners}/{self._preview_corner_count}")
+            view.update_info(f"{w}x{h} | 回看 {key} | 预览角点 {result.num_corners}/{self._preview_corner_count}")
         self._relayout()
         self.review_changed.emit(key, True)
 
@@ -755,13 +761,14 @@ class MultiStreamView(QWidget):
                 self._trackers[camera_id] = CoverageTracker((w, h))
 
             result = self._detect_for_preview(frame)
+            view.corner_count = result.num_corners
             if self._show_guide:
                 display = self._draw_detection(frame, result, include_target=False)
             else:
                 display = frame
 
             view.update_frame(display)
-            suffix = f" | 角点 {result.num_corners}/{self._preview_corner_count}"
+            suffix = f" | 预览角点 {result.num_corners}/{self._preview_corner_count}"
             view.update_info(f"{w}x{h} | 离线图像{suffix}")
         if self._multimodal_mode:
             # Keep both roles visible even when only one offline image is available.
@@ -883,6 +890,7 @@ class MultiStreamView(QWidget):
             result = self._last_detection[camera_id]
 
         display = self._draw_detection(frame, result) if self._show_guide else frame
+        view.corner_count = result.num_corners
 
         view.update_frame(display)
         if self._known_sizes.get(camera_id) != (w, h):
@@ -890,7 +898,7 @@ class MultiStreamView(QWidget):
             self._relayout()
 
         fps = self._fps.get(camera_id, 0)
-        suffix = f" | 角点 {result.num_corners}/{self._preview_corner_count}"
+        suffix = f" | 预览角点 {result.num_corners}/{self._preview_corner_count}"
         view.update_info(f"{w}x{h} | {fps:.1f} fps{suffix}")
 
     def _detect_for_preview(self, frame: np.ndarray) -> DetectionResult:

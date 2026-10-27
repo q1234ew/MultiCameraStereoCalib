@@ -61,6 +61,16 @@ def publish(window, detection, frame):
         guide.observe(cid, detection, frame)
 
 
+def publish_stable(window, detection, frame):
+    """Three distinct preview detections spanning a real stability interval."""
+    clock = [time.monotonic()]
+    window._stereo_capture._clock = lambda: clock[0]
+    window._stereo_capture.samples.clear()
+    for _ in range(3):
+        clock[0] += .35
+        publish(window, detection, frame)
+
+
 def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, tmp_path):
     win = stereo_bench
     panel, guide = win._calib_panel, win._stereo_capture
@@ -140,7 +150,7 @@ def test_auto_waits_for_stability_and_rejects_stale_or_review(stereo_bench, monk
     det, frame, _ = sample(win)
     publish(win, det, frame)
     assert not guide.auto_ready()
-    publish(win, det, frame)
+    publish_stable(win, det, frame)
     assert guide.auto_ready()
     win._calib_panel._capture_sequence.jump_to(9)
     assert not guide.auto_ready()
@@ -156,8 +166,7 @@ def test_auto_waits_for_stability_and_rejects_stale_or_review(stereo_bench, monk
     assert not guide.auto_ready()
     win._calib_panel._on_auto_capture()
     assert events == ['capture']
-    publish(win, det, frame)
-    publish(win, det, frame)
+    publish_stable(win, det, frame)
     win._stream_view.show_review_images('test', {LEFT: frame, RIGHT: frame})
     assert not guide.auto_ready()
     guide.refresh()

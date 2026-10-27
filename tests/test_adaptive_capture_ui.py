@@ -11,7 +11,7 @@ import numpy as np
 from PySide6.QtCore import QThreadPool
 from multicamera.calibration.intrinsic import IntrinsicCalibrator
 
-from test_stereo_capture_ui import sample, publish
+from test_stereo_capture_ui import sample, publish, publish_stable
 from test_multimodal_preview import LEFT, RIGHT
 
 pytest_plugins = ['test_stereo_capture_ui']
@@ -157,8 +157,7 @@ def test_calibrated_adaptive_auto_requires_both_camera_poses(stereo_bench, app):
     pts[:] = (pts - pts.mean(axis=0)) * np.sqrt(.07 / area) + (640, 360)
     win._calib_panel._intrinsics.update({LEFT: deepcopy(intr), RIGHT: deepcopy(intr)})
     guide = activate(win, app)
-    publish(win, det, frame)
-    publish(win, det, frame)
+    publish_stable(win, det, frame)
     for s in guide.samples.values():
         s['sharp'] = True
     assert guide.auto_ready()

@@ -57,6 +57,10 @@ def test_real_fisheye_explicit_compatibility_and_diagnostic_navigation(app, monk
             assert panel._stereo_cals['offline'].frame_common_corner_counts == original_counts
             assert pair.calibration_info['rectification']['status'] == 'ok'
             assert pair.calibration_info['rectification']['rms_px'] < 1.
+            app.processEvents()
+            assert '鱼眼模型' in panel._lbl_rect_context.text()
+            assert not panel._lbl_rect_preview.isHidden()
+            assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
             panel._btn_frame_diagnostics.click()
             dialog = panel._diagnostic_dialog
             dialog._table.sortItems(1, Qt.DescendingOrder)
@@ -72,7 +76,7 @@ def test_real_fisheye_explicit_compatibility_and_diagnostic_navigation(app, monk
             win._stream_view.end_review()
             saved = win._current_session.load_rig().pairs['offline']
             assert saved.calibration_info['selection'] == pair.calibration_info['selection']
-            path = win._current_session.session_dir / 'results/rig_opencv_standard.yml'
+            path = win._current_session.result_directory / 'rig_opencv_standard.yml'
             storage = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
             try:
                 assert storage.getNode('camera_model').string() == 'fisheye'

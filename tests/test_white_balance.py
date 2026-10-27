@@ -6,7 +6,9 @@ import threading
 import numpy as np
 import pytest
 
-from multicamera.streaming.white_balance import WhiteBalancePolicy, camera_base, stabilize_and_lock
+from multicamera.streaming.white_balance import (
+    WhiteBalanceLockError, WhiteBalancePolicy, camera_base, stabilize_and_lock,
+)
 from multicamera.streaming.stream_manager import StreamManager
 from multicamera.ui.threads import white_balance_worker
 
@@ -26,6 +28,7 @@ class Client:
         self.calls, self.modes = [], {}
         self.jump, self.unstable, self.unavailable = jump, unstable, unavailable
         self.samples = 0
+        self.camera_samples = {}
 
     def config(self, base, payload=None):
         if base == self.unavailable:
@@ -38,17 +41,18 @@ class Client:
 
     def chroma(self, base):
         self.samples += 1
+        self.camera_samples[base] = self.camera_samples.get(base, 0) + 1
         if self.unstable:
-            return np.array([.5 if self.samples % 2 else 1., .9])
+            return np.array([.5 if self.camera_samples[base] % 2 else 1., .9])
         return np.array([.5 if self.jump and self.modes[base] == 0 else 1., .9])
 
 
-def run(client, cancelled=lambda: False):
+def run(client, cancelled=lambda: False, *, lock=True):
     clock = Clock()
     return stabilize_and_lock(['http://device/stream', 'http://device:8082/stream'], client,
                               WhiteBalancePolicy(warmup_seconds=.2, timeout_seconds=.8,
                                                  sample_interval=.1, window=2, lock_settle_seconds=.1),
-                              cancelled=cancelled, clock=clock.clock, sleep=clock.sleep)
+                              cancelled=cancelled, clock=clock.clock, sleep=clock.sleep, lock=lock)
 
 
 def test_warmup_freezes_both_sides_without_replaying_temperature():
@@ -75,6 +79,93 @@ def test_camera_base_dedup_and_empty_targets():
     assert camera_base('http://device/prefix/stream?cache=0') == 'http://device/prefix/'
     assert camera_base('http://device:8082/snapshot') == 'http://device:8082/'
     assert stabilize_and_lock([]) == {}
+
+
+def test_lock_jump_reports_explicit_compatibility_mode_and_recovers_both_sides():
+    client = Client(jump=True)
+    with pytest.raises(WhiteBalanceLockError, match='自动稳定（不锁定）'):
+        run(client)
+    assert set(client.modes.values()) == {1}
+
+
+def test_automatic_mode_never_writes_manual_or_stale_temperature():
+    client = Client(jump=True)
+    result = run(client, lock=False)
+    assert len(result) == 2
+    assert all(row['preparation_mode'] == 'automatic' for row in result.values())
+    assert set(client.modes.values()) == {1}
+    assert all(payload == {'white_balance_automatic': 1} for _, payload in client.calls)
+
+
+@pytest.mark.parametrize('problem', ['none', 'unstable', 'cancel'])
+def test_already_automatic_cameras_are_read_only_even_on_failed_prepare(problem):
+    client = Client(unstable=problem == 'unstable')
+    client.modes = {'http://device/': 1, 'http://device:8082/': 1}
+    if problem == 'none':
+        result = run(client, lock=False)
+        assert all(row['preparation_mode'] == 'automatic' for row in result.values())
+    else:
+        with pytest.raises(RuntimeError):
+            run(client, cancelled=lambda: problem == 'cancel' and client.samples > 0, lock=False)
+    assert client.calls == []
+    assert set(client.modes.values()) == {1}
+
+
+def test_only_manual_camera_is_enabled_and_never_disabled_in_automatic_mode():
+    client = Client()
+    client.modes = {'http://device/': 1, 'http://device:8082/': 0}
+    run(client, lock=False)
+    assert client.calls == [('http://device:8082/', {'white_balance_automatic': 1})]
+
+
+@pytest.mark.parametrize('problem', ['unstable', 'second_unavailable', 'cancel'])
+def test_automatic_mode_does_not_bypass_failed_safety_checks(problem):
+    client = Client(unstable=problem == 'unstable',
+                    unavailable='http://device:8082/' if problem == 'second_unavailable' else None)
+    with pytest.raises(RuntimeError):
+        run(client, cancelled=lambda: problem == 'cancel' and client.samples > 0, lock=False)
+
+
+def test_automatic_mode_rejects_color_drift_during_final_recheck():
+    class DriftingClient(Client):
+        def chroma(self, base):
+            value = super().chroma(base)
+            return value + .1 if self.samples > 6 else value
+    with pytest.raises(RuntimeError, match='复核时颜色仍在变化'):
+        run(DriftingClient(), lock=False)
+
+
+def test_guard_automatic_permit_is_single_use_and_mode_bound(app, monkeypatch):
+    manager = StreamManager()
+    guard = white_balance_worker.WhiteBalanceGuard(manager)
+    prepared, resumed, messages = [], [], []
+    def prepare(urls, **kwargs):
+        prepared.append(kwargs.get('lock', True))
+        return dict.fromkeys(urls, {'preparation_mode': 'automatic'})
+    monkeypatch.setattr(white_balance_worker, 'stabilize_and_lock', prepare)
+    monkeypatch.setattr(manager, 'discard_frames_for_url', lambda *args, **kw: None)
+    guard.message.connect(messages.append)
+    urls = ['http://device/stream']
+    def resume():
+        resumed.append(guard.ensure(urls, lambda: None, lock=False))
+    try:
+        guard.ensure(urls, resume, lock=False)
+        wait_until(app, lambda: not guard.busy)
+        assert resumed == [True] and not guard.ready
+        assert prepared == [False]
+        assert '未锁定' in messages[-1]
+        assert not guard.ensure(urls, resume, lock=False)
+        wait_until(app, lambda: not guard.busy)
+        assert resumed == [True, True] and prepared == [False, False]
+        assert not guard.ensure(urls, lambda: None)
+        wait_until(app, lambda: not guard.busy)
+        assert prepared[-1] is True
+    finally:
+        guard.shutdown()
+        if guard.worker is not None:
+            guard.worker.wait(4000)
+            app.processEvents()
+        guard.deleteLater()
 
 
 def wait_until(app, predicate, seconds=3):

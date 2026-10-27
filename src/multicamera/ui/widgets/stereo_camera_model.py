@@ -70,7 +70,7 @@ def visible_faces(eye):
     ), reverse=True)
 
 
-def draw_stereo_camera(painter, project, eye):
+def draw_stereo_camera(painter, project, eye, *, show_roles=True):
     """Draw hardware silhouette, optical axes and role badges without a 3D engine."""
     painter.save()
 
@@ -103,6 +103,9 @@ def draw_stereo_camera(painter, project, eye):
         path(ring((x, y, z + .012), .115), '#51899e', .65, '#102b3b')
         path(ring((x - .065, y - .06, z + .016), .035, 12), '#9bcad5', .4, '#9bcad5')
 
+    if not show_roles:
+        painter.restore()
+        return
     # Keep role badges in screen-space so compact layouts do not shrink the text.
     transform = painter.worldTransform()
     anchors = [transform.map(project((x, .49, .08))) for x, _, _ in LENS_CENTERS]

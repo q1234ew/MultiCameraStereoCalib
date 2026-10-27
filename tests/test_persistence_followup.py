@@ -121,7 +121,7 @@ def test_manifest_failure_returns_successful_outputs(session, rig, monkeypatch, 
     saved, errors = session.save_calibration_results(rig)
     assert len(saved) == 4 and all(path.is_file() for path in saved)
     assert len(errors) == 1 and errors[0].startswith('calibration_manifest.json:')
-    assert not (session.session_dir / 'results/calibration_manifest.json').exists()
+    assert not (saved[0].parent / 'calibration_manifest.json').exists()
 
 
 @pytest.fixture

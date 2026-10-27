@@ -423,7 +423,7 @@ def test_live_aux_capture_requires_white_balance_for_both_rgb_sources(bench, mon
     panel, manager = win._calib_panel, win._stream_manager
     calls = []
     monkeypatch.setattr(manager, 'is_camera_running', lambda camera_id: camera_id in {LEFT, RIGHT})
-    monkeypatch.setattr(panel._white_balance_guard, 'ensure', lambda urls, resume: calls.append((urls, resume)) or False)
+    monkeypatch.setattr(panel._white_balance_guard, 'ensure', lambda urls, resume, **kw: calls.append((urls, resume)) or False)
     before = len(panel._aux_images)
     panel._on_capture_aux()
     assert len(panel._aux_images) == before
@@ -434,6 +434,28 @@ def test_live_aux_capture_requires_white_balance_for_both_rgb_sources(bench, mon
     panel._check_wb.setChecked(False)
     assert panel._prepare_white_balance(manager.stereo_pairs, panel._on_capture)
     assert len(calls) == 1
+
+
+def test_explicit_automatic_white_balance_policy_routes_both_rgb_sources(bench, monkeypatch):
+    win, _, _ = bench
+    panel, manager = win._calib_panel, win._stream_manager
+    calls = []
+    monkeypatch.setattr(manager, 'is_camera_running', lambda cid: cid in {LEFT, RIGHT})
+    monkeypatch.setattr(panel._white_balance_guard, 'ensure',
+                        lambda urls, resume, **kw: calls.append((urls, kw)) or False)
+    assert panel._combo_wb_mode.currentData() == 'automatic'
+    panel._on_capture_aux()
+    assert len(calls) == 1 and calls[0][1] == {'lock': False}
+    assert set(calls[0][0]) == {'http://device.test:8080/left', 'http://device.test:8080/right'}
+    assert '锁定' not in panel._check_wb.text()
+    panel._white_balance_guard.ready.add('http://device/')
+    panel._combo_wb_mode.setCurrentIndex(panel._combo_wb_mode.findData('locked'))
+    assert not panel._white_balance_guard.ready
+    panel._on_white_balance_busy(True)
+    assert not panel._combo_wb_mode.isEnabled()
+    panel._on_white_balance_busy(False)
+    panel._check_wb.setChecked(False)
+    assert not panel._combo_wb_mode.isVisible()
 
 
 def test_white_balance_busy_protects_configuration_and_session_invalidates_ready(bench):

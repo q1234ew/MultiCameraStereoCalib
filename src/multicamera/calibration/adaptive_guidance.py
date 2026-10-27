@@ -62,6 +62,7 @@ class GuidanceRecommendation:
     reason: str
     pose_available: bool
     sample_count: int
+    feasible: bool = True
 
 
 @dataclass
@@ -122,6 +123,14 @@ def _geometry(board, observation):
         return clean, obj, center.copy(), area, H
     except (ValueError, TypeError, AttributeError, IndexError, cv2.error):
         return None
+
+
+def measure_composition(board, observation):
+    """Shared live/history composition; center is the full board's mapped center."""
+    geometry = _geometry(board, observation)
+    if geometry is None:
+        return None
+    return {'center': geometry[2].copy(), 'area': geometry[3]}
 
 
 def _valid_intrinsics(intrinsics, size, model):
@@ -398,10 +407,11 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     scale_text = {'small': '小', 'medium': '中', 'large': '大'}[scale]
     region = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))[row][col]
     status = '已有内参支持，倾角可估计' if pose_available else '冷启动：倾角未验证'
-    reason = f'{region}区域观测不足；补充{tilt_text}、{scale_text}画面占比。{status}。'
+    shortage = '区域观测不足' if min(z[row, col] for z in zones) == 0 else '已有观测，补足姿态组合'
+    reason = f'{region}{shortage}；补充{tilt_text}、{scale_text}画面占比。{status}。'
     if not candidates:
         reason = f'当前分辨率下构图难以兼顾边距和角点间距；请调整分辨率或标定板。{status}。'
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
                '构图仅为几何近似，不保证双目共视；不代表标定完成或全局最优。')
-    rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique))
+    rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique), bool(candidates))
     return GuidanceAnalysis(rec, intrinsics, summary)

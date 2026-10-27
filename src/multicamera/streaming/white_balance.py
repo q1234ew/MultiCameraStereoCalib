@@ -13,6 +13,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+class WhiteBalanceLockError(RuntimeError):
+    """The automatic-to-manual transition changed the measured image color."""
+
+
 def camera_base(url):
     parts = urlsplit(url)
     path = parts.path.rstrip('/')
@@ -72,7 +76,8 @@ class RgbControlClient:
 
 
 def stabilize_and_lock(urls, client=None, policy=None, cancelled=lambda: False,
-                       clock=time.monotonic, sleep=time.sleep, progress=lambda stage: None):
+                       clock=time.monotonic, sleep=time.sleep, progress=lambda stage: None,
+                       lock=True):
     client, policy = client or RgbControlClient(), policy or WhiteBalancePolicy()
     targets = list(dict.fromkeys(camera_base(url) for url in urls))
     if not targets:
@@ -89,8 +94,11 @@ def stabilize_and_lock(urls, client=None, policy=None, cancelled=lambda: False,
             check_cancelled()
             before = client.config(base)
             logger.info('AWB prepare: url=%s before=%s', base, before.get('controls'))
-            touched.append(base)
-            client.config(base, {'white_balance_automatic': 1})
+            if before['controls']['white_balance_automatic']['value'] != 1:
+                touched.append(base)
+                client.config(base, {'white_balance_automatic': 1})
+            else:
+                logger.info('AWB already automatic; skipping mode write: url=%s', base)
         started = clock()
         histories = {base: [] for base in targets}
         last_stage = None
@@ -113,27 +121,51 @@ def stabilize_and_lock(urls, client=None, policy=None, cancelled=lambda: False,
                 break
             sleep(policy.sample_interval)
         references = {base: np.mean(samples, axis=0) for base, samples in histories.items()}
+        if not lock:
+            progress('复核自动白平衡')
+            for base in targets:
+                check_cancelled()
+                result = client.config(base)
+                if result['controls']['white_balance_automatic']['value'] != 1:
+                    raise RuntimeError(f'{base}: 自动白平衡已失效，已拒绝采图')
+                current = client.chroma(base)
+                delta = float(np.max(np.abs(current - references[base])))
+                if not np.isfinite(delta) or delta > policy.stability_tolerance:
+                    raise RuntimeError(f'{base}: 自动白平衡复核时颜色仍在变化，已拒绝采图')
+                result = dict(result, preparation_mode='automatic')
+                results[base] = result
+                logger.info('AWB automatic stable (not locked): url=%s reference=%s current=%s',
+                            base, references[base], current)
+            check_cancelled()
+            return results
         progress('锁定白平衡')
         for base in targets:
             check_cancelled()
             # The reported temperature can be stale while AWB is active. Never replay it.
+            if base not in touched:
+                touched.append(base)
             results[base] = client.config(base, {'white_balance_automatic': 0})
         sleep(policy.lock_settle_seconds)
         progress('复核锁定后颜色')
         for base in targets:
             for _ in range(2):
                 check_cancelled()
-                if np.max(np.abs(client.chroma(base) - references[base])) > policy.lock_tolerance:
-                    raise RuntimeError(f'{base}: 锁定白平衡后颜色跳变，已拒绝采图')
+                current = client.chroma(base)
+                delta = float(np.max(np.abs(current - references[base])))
+                logger.info('AWB lock verification: url=%s reference=%s current=%s delta=%.5f limit=%.5f',
+                            base, references[base], current, delta, policy.lock_tolerance)
+                if not np.isfinite(delta) or delta > policy.lock_tolerance:
+                    raise WhiteBalanceLockError(f'{base}: 锁定白平衡后颜色跳变，已拒绝采图；'
+                                                '可选择“自动稳定（不锁定）”后重新采集')
                 sleep(policy.sample_interval)
             result = client.config(base)
             if result['controls']['white_balance_automatic']['value'] != 0:
                 raise RuntimeError(f'{base}: 白平衡锁定已失效')
-            results[base] = result
+            results[base] = dict(result, preparation_mode='locked')
             logger.info('AWB locked: url=%s reference=%s controls=%s', base, references[base], result.get('controls'))
         return results
     except Exception:
-        progress('恢复自动白平衡')
+        progress('恢复自动白平衡' if touched else '准备失败，未修改白平衡模式')
         for base in touched:
             try:
                 client.config(base, {'white_balance_automatic': 1})

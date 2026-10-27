@@ -146,7 +146,7 @@ def app_stylesheet() -> str:
         color: {TEXT};
         border: 1px solid {BORDER};
         border-radius: 6px;
-        padding: 5px 14px;
+        padding: 5px 10px;
         font-size: 13px;
     }}
     QToolBar QToolButton:hover {{
@@ -200,6 +200,13 @@ def app_stylesheet() -> str:
         background: {BORDER};
         border-radius: 4px;
         min-width: 24px;
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0;
+    }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: transparent;
     }}
 
     /* ── Group box ──────────────────────────────────── */

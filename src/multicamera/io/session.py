@@ -307,8 +307,8 @@ class CalibrationSession:
 
     # ── Calibration results ───────────────────────────────────
 
-    def save_rig(self, rig: MultiCameraRig):
-        path = self.session_dir / self.RESULTS_DIR / "rig.json"
+    def save_rig(self, rig: MultiCameraRig, directory: Path | None = None):
+        path = (directory if directory is not None else self.session_dir / self.RESULTS_DIR) / "rig.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         with _staging_directory(dir=path.parent) as staging:
             tmp = Path(staging) / path.name
@@ -320,7 +320,7 @@ class CalibrationSession:
         return path
 
     def save_calibration_results(self, rig: MultiCameraRig) -> tuple[list[Path], list[str]]:
-        """Persist the rig first, then export formats independently of each other."""
+        """Save an isolated generation, then atomically publish its latest pointer."""
         from .export import (
             KalibrDistortionError,
             export_rig_kalibr_yaml,
@@ -328,9 +328,12 @@ class CalibrationSession:
             export_rig_opencv_yaml,
         )
 
-        saved = [self.save_rig(rig)]
+        generation_id = uuid.uuid4().hex
+        root = self.session_dir / self.RESULTS_DIR
+        results = root / f"calib_{datetime.now():%Y%m%d_%H%M%S}_{generation_id}"
+        results.mkdir()
+        saved = [self.save_rig(rig, directory=results)]
         errors: list[str] = []
-        results = self.session_dir / self.RESULTS_DIR
         exports = [
             ("rig_opencv.yml", export_rig_opencv_yaml, rig, {}),
             ("rig_kalibr.yaml", export_rig_kalibr_yaml, rig, {}),
@@ -348,7 +351,7 @@ class CalibrationSession:
                 ))
         for filename, exporter, export_rig, kwargs in exports:
             try:
-                # Replace a previous result only after its new export has completed.
+                # Publish only successful formats inside this fresh generation.
                 with _staging_directory(dir=results) as staging:
                     tmp = Path(staging) / filename
                     exporter(export_rig, tmp, **kwargs)
@@ -365,22 +368,46 @@ class CalibrationSession:
         manifest_path = results / "calibration_manifest.json"
         try:
             manifest = {
-                "schema_version": 1, "generation_id": uuid.uuid4().hex,
+                "schema_version": 1, "generation_id": generation_id,
                 "created": datetime.now().isoformat(), "reference_camera": rig.reference_camera,
                 "pair_names": list(rig.pairs), "errors": list(errors),
                 "files": [{"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                           for path in saved],
-                "note": "Only listed files with matching hashes belong to this generation; other files may be historical.",
+                "note": "This directory contains only this generation; failed formats are absent.",
             }
             self._atomic_json(manifest_path, manifest)
             saved.append(manifest_path)
         except Exception as exc:
             logger.exception("Save calibration manifest failed")
             errors.append(f"calibration_manifest.json: {exc}")
+        try:
+            self._atomic_json(root / 'latest.json', {
+                'schema_version': 1, 'generation_id': generation_id, 'directory': results.name,
+            })
+        except Exception as exc:
+            logger.exception("Publish latest calibration pointer failed")
+            errors.append(f"latest.json: {exc}（本批次已保存，最新批次索引未更新）")
         return saved, errors
 
+    @property
+    def result_directory(self) -> Path:
+        """Resolve the latest batch, falling back only when no batch pointer exists."""
+        root = self.session_dir / self.RESULTS_DIR
+        pointer = root / 'latest.json'
+        if not pointer.exists():
+            return root
+        data = json.loads(pointer.read_text(encoding='utf-8'))
+        name = data.get('directory') if isinstance(data, dict) else None
+        if (not isinstance(name, str) or not name.startswith('calib_') or
+                '/' in name or '\\' in name or (root / name).resolve().parent != root.resolve()):
+            raise ValueError('最新标定批次索引无效，拒绝回退到历史结果')
+        directory = root / name
+        if not (directory / 'rig.json').is_file():
+            raise ValueError('最新标定批次缺少 rig.json，拒绝回退到历史结果')
+        return directory
+
     def load_rig(self) -> Optional[MultiCameraRig]:
-        path = self.session_dir / self.RESULTS_DIR / "rig.json"
+        path = self.result_directory / "rig.json"
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))

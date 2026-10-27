@@ -8,12 +8,13 @@ import time
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QComboBox, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..theme import ACCENT, BG_MID, BORDER, TEXT_DIM, TEXT_HINT, WARNING, app_icon
 from .board_motion import BoardTilt, TILT_ACTIONS, tilt_point
 from .stereo_camera_model import draw_stereo_camera
+from .board_view import EDGES, paint_board_view
 
 def motion_description(target):
     if target is None:
@@ -67,14 +68,15 @@ class MotionCanvas(QWidget):
         self.setMinimumSize(360, 210)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAccessibleName("固定一体式双目相机与标定板动作对照")
-        self.setToolTip("从镜头前侧观察相机；L/R 为预览相机角色，并非本示意的屏幕左右。双光轴仅示方向，不代表真实视场或基线尺寸。")
+        self.setToolTip("左侧沿相机朝向看板，不镜像。右侧默认固定立体斜视，也可切换俯视/侧视。白色为固定边、黄色为移动边、蓝色虚线为目标；放大构图非真实视场/角度。")
         self.setAccessibleDescription(self.toolTip())
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         key = (self.size().width(), self.size().height(), self.devicePixelRatioF(),
-               self.guide._key, self.compact, self.palette().cacheKey(), self.font().toString())
+               self.guide._key, self.guide.view_mode, self.compact,
+               self.palette().cacheKey(), self.font().toString())
         if key != self._cache_key:
             ratio = self.devicePixelRatioF()
             self._base = QPixmap(round(self.width() * ratio), round(self.height() * ratio))
@@ -83,7 +85,10 @@ class MotionCanvas(QWidget):
             base = QPainter(self._base)
             base.setRenderHint(QPainter.Antialiasing)
             base.setFont(self.font())
-            for rect, moving in self._panes():
+            if self.guide.view_mode != 'spatial':
+                paint_board_view(base, self.rect(), self.guide.target, 0., self._board_point,
+                                 self.compact, 'static', self._depth_mode())
+            for rect, moving in (self._panes() if self.guide.view_mode == 'spatial' else []):
                 base.setPen(QPen(QColor(BORDER), 1))
                 base.setBrush(QColor(BG_MID))
                 base.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
@@ -98,10 +103,20 @@ class MotionCanvas(QWidget):
             self._cache_key = key
             self.cache_builds += 1
         p.drawPixmap(0, 0, self._base)
+        if self.guide.view_mode != 'spatial':
+            paint_board_view(p, self.rect(), self.guide.target, self.guide.progress,
+                             self._board_point, self.compact, depth_mode=self._depth_mode())
+            return
         if self.guide.target is not None:
             for rect, moving in self._panes():
                 if moving:
                     self._draw_scene(p, rect, self.guide.progress, True, 'dynamic')
+
+    def _board_point(self, x, y, progress):
+        return board_point(x, y, progress, self.guide.target)
+
+    def _depth_mode(self):
+        return 'profile' if self.guide.view_mode == 'profile' else 'oblique'
 
     def _panes(self):
         if self.compact:
@@ -182,6 +197,7 @@ class StereoSchematic(QWidget):
     def __init__(self):
         super().__init__()
         self.target = None
+        self.view_mode = 'board'
         self.progress = 0.
         self._key = object()
         self._enabled = False
@@ -225,12 +241,38 @@ class StereoSchematic(QWidget):
         layout.addLayout(toolbar)
         self.canvas = MotionCanvas(self)
         layout.addWidget(self.canvas, 1)
-        self.caption = QLabel("镜头前侧观察 · 左右以左目预览为准\n预设动作 · 非实时测量 · 蓝色虚线为目标，黄色为移动侧")
+        self.caption = QLabel()
         self.caption.setWordWrap(True)
         self.caption.setStyleSheet(f"color:{TEXT_HINT}; font-size:12px;")
-        layout.addWidget(self.caption)
+        self.view_options = QWidget()
+        view_row = QHBoxLayout(self.view_options)
+        view_row.setContentsMargins(0, 0, 0, 0)
+        self.view_selector = QComboBox()
+        self.view_selector.addItem('板面＋立体', 'board')
+        self.view_selector.addItem('板面＋俯/侧', 'profile')
+        self.view_selector.addItem('空间对照', 'spatial')
+        self.view_selector.setAccessibleName('动作示意观察视角')
+        self.view_selector.setToolTip('左侧保持板面视角，右侧可选固定立体斜视或俯视/侧视；空间对照保留原示意')
+        self.view_selector.currentIndexChanged.connect(self._change_view)
+        view_row.addWidget(self.view_selector)
+        view_row.addWidget(self.caption, 1)
+        layout.addWidget(self.view_options)
         self._pause(False)
         self.set_target(None)
+
+    def _change_view(self, _index):
+        self.view_mode = self.view_selector.currentData()
+        self._refresh_caption()
+        self.canvas.update()
+
+    def _refresh_caption(self):
+        if self.view_mode == 'spatial':
+            text = '镜头前侧观察 · 非左目画面方向\n蓝色虚线为目标，黄色为移动侧；尺寸仅示意'
+        else:
+            edges = EDGES.get(self.target.tilt) if self.target is not None else None
+            action = f'固定{edges[2]} · {edges[3]}靠近镜头' if edges else '板面保持朝向镜头'
+            text = action + '\n白色为固定边 · 黄色为移动边 · 蓝色虚线为目标（非实测）'
+        self.caption.setText(text)
 
     def set_target(self, target, *, active=True):
         key = (target.zone_row, target.zone_col, target.tilt, target.scale) if target else None
@@ -239,6 +281,7 @@ class StereoSchematic(QWidget):
             return
         changed = key != self._key
         self.target, self._key = target, key
+        self._refresh_caption()
         self._enabled = enabled
         self.description.setText(motion_description(target))
         self.pause.setEnabled(self._enabled and self.has_motion)
@@ -259,6 +302,7 @@ class StereoSchematic(QWidget):
         self.canvas.setMinimumHeight(150 if compact else 210)
         self.canvas.setMaximumHeight(175 if compact else 16777215)
         self.caption.setVisible(not compact)
+        self.view_options.setVisible(not compact)
         self.canvas.update()
 
     def _sync_timer(self, *args):

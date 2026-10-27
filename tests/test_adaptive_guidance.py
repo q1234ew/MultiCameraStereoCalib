@@ -424,6 +424,7 @@ def test_no_feasible_candidate_has_explicit_warning(board):
         cal.camera_matrix = np.array([[20., 0, 16], [0, 20., 12], [0, 0, 1.]])
         supplied[cam] = cal
     result = analyze(board, {'L': [], 'R': []}, supplied)
+    assert not result.recommendation.feasible
     assert result.recommendation.pose_available
     assert '难以兼顾' in result.recommendation.reason
     assert '不保证双目共视' in result.summary

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import copy
+import math
 
 import cv2
 import numpy as np
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...calibration.models import CameraModel
-from ...calibration.adaptive_guidance import GuidanceObservation, measure_pose
+from ...calibration.adaptive_guidance import GuidanceObservation, measure_pose, measure_composition
 from ..threads.guidance_worker import GuidanceWorker
 from ..theme import ACCENT, BORDER, SUCCESS, TEXT_DIM, WARNING, app_icon
 from .capture_guide import BoardTilt, TILT_LABELS, CaptureTarget, CaptureSequence
@@ -24,10 +25,15 @@ from .stereo_schematic import StereoSchematic, TILT_ACTIONS
 class StereoCaptureWorkspace(QWidget):
     """Hosts existing controls while preserving their ownership and signals."""
 
+    MAX_SAMPLE_AGE = 1.5
+    MIN_STABLE_SECONDS = .6
+    MIN_STABLE_SAMPLES = 3
+
     def __init__(self, panel, stream_view, board):
         super().__init__()
         self.panel, self.view, self.board = panel, stream_view, board
         self.samples = {}
+        self._clock = time.monotonic
         self._context = None
         self._coverage_key = None
         self._coverage_summary = []
@@ -213,7 +219,7 @@ class StereoCaptureWorkspace(QWidget):
         intr = self.panel._intrinsics.get(camera_id)
         if intr is None and self._analysis and self._analysis_key == key:
             intr = self._analysis.intrinsics.get(camera_id)
-        if intr is None:
+        if intr is None or intr.model != self.panel._camera_model:
             return None
         det = sample['detection']
         cache_key = (id(intr), id(det))
@@ -227,6 +233,8 @@ class StereoCaptureWorkspace(QWidget):
         return pose
 
     def _adaptive_aligned(self, pairs, samples, target):
+        if self._analysis is not None and not self._analysis.recommendation.feasible:
+            return False, '无可用构图，请调整分辨率或标定板'
         if not target or not samples or not all(s['valid'] for s in samples):
             return False, '等待双路检测'
         if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
@@ -275,51 +283,77 @@ class StereoCaptureWorkspace(QWidget):
     def observe(self, camera_id, detection, frame):
         if not self.isVisible() or self.view.review_key:
             return
+        self._refresh_sample_context()
         previous = self.samples.get(camera_id)
-        sample = {"time": time.monotonic(), "valid": detection.valid, "detection": detection}
-        if detection.valid:
+        now = self._clock()
+        sample = self._detection_sample(detection, frame)
+        sample['time'] = now
+        if sample['valid']:
             pts = detection.charuco_corners.reshape(-1, 2)
             w, h = detection.image_size
-            sample["center"] = pts.mean(axis=0) / (w, h)
-            sample['area'] = float(cv2.contourArea(cv2.convexHull(pts.astype(np.float32)))) / (w * h)
-            x, y, rw, rh = cv2.boundingRect(pts.astype(np.float32))
-            roi = frame[max(y, 0):min(y + rh, h), max(x, 0):min(x + rw, w)]
-            if roi.size:
-                scale = min(1., 320 / max(roi.shape[:2]))
-                small = cv2.resize(roi, None, fx=scale, fy=scale) if scale < 1 else roi
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
-                sample["sharp"] = float(cv2.Laplacian(gray, cv2.CV_64F).var()) >= 50
-            stable = False
-            if previous and previous["valid"] and sample["time"] - previous["time"] < 1.5:
-                old = previous["detection"]
+            anchor = {'ids': detection.charuco_ids.copy(), 'corners': pts.copy(), 'size': (w, h)}
+            since, count = now, 1
+            if (previous and previous['valid'] and
+                    0 < now - previous['time'] < self.MAX_SAMPLE_AGE):
+                old = previous['anchor']
                 common, old_idx, new_idx = np.intersect1d(
-                    old.charuco_ids.ravel(), detection.charuco_ids.ravel(), return_indices=True,
+                    old['ids'].ravel(), detection.charuco_ids.ravel(), return_indices=True,
                 )
-                if len(common) >= 6 and old.image_size == detection.image_size:
-                    delta = old.charuco_corners.reshape(-1, 2)[old_idx] - pts[new_idx]
-                    stable = float(np.max(np.linalg.norm(delta, axis=1))) / max(w, h) < .008
-            sample["stable"] = stable
+                if (len(common) >= max(6, .6 * max(len(old['ids']), len(pts)))
+                        and old['size'] == detection.image_size):
+                    delta = old['corners'][old_idx] - pts[new_idx]
+                    if float(np.max(np.linalg.norm(delta, axis=1))) / max(w, h) < .008:
+                        anchor, since, count = old, previous['stable_since'], previous['stable_count'] + 1
+            sample.update(anchor=anchor, stable_since=since, stable_count=count,
+                          stable=count >= self.MIN_STABLE_SAMPLES and now - since >= self.MIN_STABLE_SECONDS)
             cal = self.panel._intr_cals.get(camera_id)
             sample['similar'] = cal.find_similar_detection(detection) if cal is not None else None
         self.samples[camera_id] = sample
         self.refresh()
 
+    def _detection_sample(self, detection, frame):
+        result = {'valid': False, 'detection': detection, 'sharp': False, 'stable': False}
+        if not detection.valid or frame.shape[1::-1] != tuple(detection.image_size):
+            return result
+        geometry = measure_composition(self.panel._board, GuidanceObservation(
+            detection.charuco_corners, detection.charuco_ids, detection.image_size, 'preview'))
+        if geometry is None:
+            return result
+        result.update(geometry, valid=True)
+        pts = detection.charuco_corners.reshape(-1, 2)
+        w, h = detection.image_size
+        x, y, rw, rh = cv2.boundingRect(pts.astype(np.float32))
+        roi = frame[max(y, 0):min(y + rh, h), max(x, 0):min(x + rw, w)]
+        if roi.size:
+            scale = min(1., 320 / max(roi.shape[:2]))
+            small = cv2.resize(roi, None, fx=scale, fy=scale) if scale < 1 else roi
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+            result['sharp'] = float(cv2.Laplacian(gray, cv2.CV_64F).var()) >= 50
+        return result
+
     def _current_samples(self):
         names = self.panel._selected_pairs()
         pairs = [self.panel._sm.stereo_pairs[n] for n in names if n in self.panel._sm.stereo_pairs]
         samples = []
-        now = time.monotonic()
+        now = self._clock()
         for pair in pairs:
             for camera in (pair.left, pair.right):
                 sample = self.samples.get(camera.camera_id)
                 entry = self.panel._sm.get_latest_frame(camera.camera_id)
-                if (sample is None or now - sample["time"] > 1.5 or entry is None
-                        or time.time() - entry[1] > 1.5):
+                if (sample is None or entry is None or
+                        not math.isfinite(now - sample['time']) or
+                        not 0 <= now - sample['time'] <= self.MAX_SAMPLE_AGE or
+                        not math.isfinite(time.time() - entry[1]) or
+                        not 0 <= time.time() - entry[1] <= self.MAX_SAMPLE_AGE):
                     return pairs, []
                 samples.append(sample)
         return pairs, samples
 
     def auto_ready(self):
+        if (self.panel._pending_save_tokens or self.panel._failed_save_jobs or self.panel._save_workers
+                or self.panel._save_queue or self.panel._model_worker or self.panel._calib_worker
+                or self.panel._stereo_import_worker or self.panel._aux_dataset_busy()):
+            return False
         _, samples = self._current_samples()
         target = self._target()
         if self.adaptive:
@@ -346,6 +380,55 @@ class StereoCaptureWorkspace(QWidget):
                     for name in self.panel._selected_pairs())
         )
 
+    def validate_capture(self, name, left, right, det_left, det_right):
+        """Recheck already-detected raw images before any observation or save mutation."""
+        if not self.auto_ready():
+            return False, '实时采集条件已变化'
+        pair = self.panel._sm.stereo_pairs.get(name)
+        if pair is None or name not in self.panel._selected_pairs():
+            return False, '采集相机组已变化'
+        samples = [self._detection_sample(detection, image) for detection, image in
+                   ((det_left, left), (det_right, right))]
+        if not all(s['valid'] for s in samples):
+            return False, '原图板点不足或几何无效'
+        if det_left.image_size != det_right.image_size:
+            return False, '左右原图分辨率不一致'
+        if not all(s['sharp'] for s in samples):
+            return False, '原图清晰度不足'
+        for camera, detection in zip((pair.left, pair.right), (det_left, det_right)):
+            previous = self.samples.get(camera.camera_id)
+            if previous is None:
+                return False, '缺少当前稳定检测'
+            old = previous['detection']
+            common, a, b = np.intersect1d(old.charuco_ids.ravel(), detection.charuco_ids.ravel(),
+                                        return_indices=True)
+            if (old.image_size != detection.image_size or
+                    len(common) < max(6, .6 * max(old.num_corners, detection.num_corners))):
+                return False, '原图与预览可见板点不一致'
+            delta = old.charuco_corners.reshape(-1, 2)[a] - detection.charuco_corners.reshape(-1, 2)[b]
+            if np.max(np.linalg.norm(delta, axis=1)) / max(detection.image_size) >= .008:
+                return False, '原图相对稳定预览已移动'
+        target = self._target()
+        if self.adaptive:
+            accepted, reason = self._adaptive_aligned([pair], samples, target)
+            if not accepted:
+                return False, '原图' + reason
+        elif not target or target.tilt != BoardTilt.FRONT or not all(
+                np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16 for s in samples):
+            return False, '原图位置偏离建议区域'
+        duplicate = []
+        for camera, detection in zip((pair.left, pair.right), (det_left, det_right)):
+            cal = self.panel._intr_cals.get(camera.camera_id)
+            if cal is not None and cal._image_size not in (None, detection.image_size):
+                return False, '原图分辨率与已采数据不一致'
+            duplicate.append(cal is not None and cal.find_similar_detection(detection) is not None)
+        stereo = self.panel._stereo_cals.get(name)
+        if stereo is not None and stereo._image_size not in (None, det_left.image_size):
+            return False, '原图分辨率与双目观测不一致'
+        if all(duplicate):
+            return False, '原图接近已有构图，请改变位置、大小或倾角'
+        return True, ''
+
     def _pose_text(self, camera_id, sample):
         intr = self.panel._intrinsics.get(camera_id)
         key, _ = self._guidance_context()
@@ -360,28 +443,21 @@ class StereoCaptureWorkspace(QWidget):
         det = sample["detection"]
         if det.image_size != intr.image_size:
             return "图像尺寸与内参不匹配\n请重新标定或恢复分辨率"
-        if self.adaptive and self._pose_measurement(camera_id, sample) is None:
+        pose = self._pose_measurement(camera_id, sample)
+        if pose is None:
             return "姿态估计不可用\n请检查内参、可见角点或调整姿态"
-        try:
-            ids = det.charuco_ids.ravel()
-            objects = self.board.object_points[ids]
-            points = det.charuco_corners
-            K, dist = intr.camera_matrix, intr.dist_coeffs
-            if intr.model == CameraModel.FISHEYE:
-                points = cv2.fisheye.undistortPoints(points, K, dist)
-                K, dist = np.eye(3), None
-            ok, rvec, tvec = cv2.solvePnP(objects, points, K, dist)
-            if not ok or not np.isfinite(tvec).all() or tvec[2, 0] <= 0:
-                raise ValueError("Invalid pose")
-            normal = cv2.Rodrigues(rvec)[0][:, 2]
-            if normal[2] < 0:
-                normal = -normal
-            yaw = np.degrees(np.arctan2(normal[0], normal[2]))
-            pitch = np.degrees(np.arctan2(normal[1], normal[2]))
-            prefix = '临时内参估计\n' if temporary else ''
-            return prefix + f"板原点深度  {tvec[2, 0]:.2f} m\n左右倾  {yaw:.1f}°\n上下倾  {pitch:.1f}°"
-        except (cv2.error, ValueError, IndexError):
-            return "姿态估计不可用\n请增加可见角点或调整姿态"
+        prefix = '临时内参估计\n' if temporary else ''
+        return prefix + (f"板中心深度  {pose['depth']:.2f} m\n"
+                         f"左右倾  {pose['yaw']:.1f}°\n上下倾  {pose['pitch']:.1f}°")
+
+    def _refresh_sample_context(self):
+        context = (id(self.panel._board), id(self.panel._session), self.panel._camera_model,
+                   tuple((name, pair.left.url, pair.right.url, id(pair))
+                         for name, pair in self.panel._selected_pairs().items()), self.view.review_key)
+        if context != self._context:
+            self.samples.clear()
+            self._context = context
+        self.board = self.panel._board
 
     def refresh(self):
         options = [self.panel._combo_pair.itemText(i) for i in range(self.panel._combo_pair.count())]
@@ -391,11 +467,7 @@ class StereoCaptureWorkspace(QWidget):
             self.pair.addItems(options)
         self.pair.setCurrentText(self.panel._combo_pair.currentText())
         self.pair.blockSignals(False)
-        context = (id(self.panel._board), tuple(self.panel._selected_pairs()), self.view.review_key)
-        if context != self._context:
-            self.samples.clear()
-            self._context = context
-        self.board = self.panel._board
+        self._refresh_sample_context()
         offline = self.panel.offline_selection
         self.guide_mode.setEnabled(not offline)
         key = self._request_guidance() if self.adaptive and not self.view.review_key else None
@@ -452,11 +524,11 @@ class StereoCaptureWorkspace(QWidget):
             "基础画面检查（不含姿态）\n\n"
             f"双路可见：{'已检测' if visible else '等待检测'}\n"
             f"清晰度：{'良好' if sharp else '待检查'}\n"
-            f"运动稳定：{'稳定' if stable else '请保持静止'}\n"
+            f"运动稳定：{'稳定' if stable else '请保持静止至少 0.6 秒'}\n"
             f"目标位置：{'接近建议区域' if aligned else '待对齐'}"
         )
         self.status.setStyleSheet(f"color:{SUCCESS if visible and sharp and stable and aligned else TEXT_DIM};")
-        self.status.setToolTip("预览阈值仅辅助采图，不是硬件同步或标定精度证明；目标位置不验证倾角")
+        self.status.setToolTip("稳定要求至少3次检测并持续0.6秒，且相对窗口首帧无明显累计位移。预览阈值不是硬件同步或精度证明；基础位置检查不验证倾角。")
         if not using_adaptive and not offline and not self.view.review_key and target and target.tilt != BoardTilt.FRONT:
             self.reason.setText(f"固定计划建议 · {TILT_LABELS[target.tilt]} · 倾角步骤请手动采集")
         self.pose_status.setText("姿态：待人工确认" if visible and not self.view.review_key else "姿态：待实时检测")
@@ -477,7 +549,7 @@ class StereoCaptureWorkspace(QWidget):
         self.advice.setVisible(duplicate or not self._compact)
         left = pairs[0].left.camera_id if pairs else None
         self.pose.setText("当前姿态（相对左相机）\n\n" + self._pose_text(left, samples[0] if samples else None))
-        self.pose.setToolTip("深度为板坐标原点的相机 Z 值；左右倾正值为右边近，上下倾正值为下边近；不包含画面内旋转")
+        self.pose.setToolTip("深度为整板角点中心的相机 Z 值；左右倾正值为右边近，上下倾正值为下边近；不包含画面内旋转")
         if offline:
             self.pose.setText('离线观测\n\n不进行实时运动检查')
             self.pose_status.setText('姿态覆盖：未验证')
@@ -498,21 +570,29 @@ class StereoCaptureWorkspace(QWidget):
         self.compact_summary.setText(
             f"可见 {'✓' if visible else '待检测'} · 清晰 {'✓' if sharp else '待检查'} · "
             f"稳定 {'✓' if stable else '待检查'}\n{self.pose_status.text()}\n"
-            "角点完整度/视场网格\n" + '  '.join(self._coverage_summary)
+            "数据集累计：板角点 ID / 视场网格\n" + '  '.join(self._coverage_summary)
         )
         self.compact_summary.setToolTip(self.pose.text() + '\n' + self.status.text())
         if offline:
+            counts = self.view.displayed_corner_counts()
+            current = '  '.join(
+                f'{label} {counts.get(camera.camera_id) if counts.get(camera.camera_id) is not None else "未显示"}'
+                f'/{self.board.num_corners}' for label, camera in cameras
+            )
             self.compact_summary.setText(
                 f'离线观测 {loaded} 对\n{self.panel._lbl_capture_count.text()}\n'
-                '姿态覆盖未验证\n角点完整度/视场网格\n' + '  '.join(self._coverage_summary)
+                '姿态覆盖未验证\n当前预览角点（缩放检测）\n' + current +
+                '\n数据集累计：板角点 ID / 视场网格\n' + '  '.join(self._coverage_summary)
             )
+            self.status.setText(self.compact_summary.text())
         self.coverage_button.setToolTip(
             '  '.join(self._coverage_summary) +
-            "\n角点完整度：出现过的板角点 ID 比例；视场网格：4×4 图像网格有角点的占比，不是姿态覆盖率",
+            "\n数据集累计：所有已采图出现过的板角点 ID 比例 / 4×4 视场网格占比。"
+            "不是当前帧完整度或姿态覆盖率；当前预览角点可能因缩放检测少于原图检测。",
         )
         self.coverage_button.setText(
             "数据分析 · " + self.panel._lbl_capture_count.text() if self._compact else
-            "角点完整度/视场网格  ·  " + "  |  ".join(
+            "累计板角点 ID / 视场网格  ·  " + "  |  ".join(
                 [self.panel._lbl_capture_count.text(), *self._coverage_summary],
             )
         )
