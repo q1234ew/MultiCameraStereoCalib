@@ -1380,3 +1380,9 @@ python -m pytest -q tests/test_guidance_replay.py tests/test_adaptive_guidance.p
 专项测试位于 `tests/test_adaptive_workflow_followup.py` 与 `tests/test_aux_workflow_followup.py`，覆盖非法时间、部分板中心、累计移动、会话/源切换、原图拒收、取帧竞态、成功保存/撤销、失败重试/推荐重算及多组批次。Qt界面测试在1000×680、1280×800、1440×1024运行真实控件，图像和流来自受控输入，不访问设备。
 
 实际素材可用 `.venv/bin/python scripts/replay_capture_guidance.py --input data/pairs --output <新目录> --model fisheye` 逐帧回放。每一步只使用此前观测，报告记录原图哈希并在结束复查；不修改源图片、会话或标定结果。回放没有实时运动、网络抖动及设备曝光过程，不能代替真机自动采集、Windows最终EXE、高DPI及硬件精度验收。本轮不涉及点云优化。
+
+### 32.6 Windows命令行输出编码
+
+Windows构建第15次运行在回归阶段因回放脚本的中文进度输出失败：重定向标准输出继承 `cp1252`，触发 `UnicodeEncodeError`；该次未进入EXE打包及自检。`replay_capture_guidance.py` 命令行入口现在显式将可重新配置的标准输出与标准错误设为UTF-8，保留中文进度、报告路径和异常。库函数导入不改变宿主进程的流配置；HTML、JSON及Markdown文件继续显式使用UTF-8。
+
+Windows Actions作业同时设置 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`，统一其Python子进程默认文本及标准流编码。通过管道调用回放CLI的程序应按UTF-8解码输出，不能依赖Windows区域代码页。回归主动关闭UTF-8模式并分别指定UTF-8、cp1252和ASCII标准流，验证中文源目录、输出目录、成功进度、错误输出、文件哈希和禁止覆盖行为；不只依赖CI环境变量绕过问题。此修复不改变图像颜色、白平衡、标定算法及结果格式。

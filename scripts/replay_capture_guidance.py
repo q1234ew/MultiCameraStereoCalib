@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
@@ -72,6 +73,10 @@ def run(source, output, board, model):
 
 
 def main():
+    # Windows redirected streams can otherwise inherit an ANSI code page.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, default=Path('data/pairs'))
     parser.add_argument('--output', type=Path, required=True)

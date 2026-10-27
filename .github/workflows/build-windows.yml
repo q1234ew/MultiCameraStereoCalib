@@ -26,6 +26,9 @@ jobs:
   build-windows:
     name: Build Windows app
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     permissions:
       contents: write
     concurrency:
