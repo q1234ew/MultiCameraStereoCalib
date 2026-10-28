@@ -20,6 +20,7 @@ class FrameSaveWorker(QThread):
         right,
         frame_idx: int,
         parent=None,
+        quality=None,
     ):
         super().__init__(parent)
         self.token = token
@@ -28,9 +29,12 @@ class FrameSaveWorker(QThread):
         self.left = left
         self.right = right
         self.frame_idx = frame_idx
+        self.quality = quality
 
     def run(self):
         try:
+            if self.quality is not None:
+                self.session.save_capture_review(self.pair_name, self.frame_idx, self.quality)
             saved_idx = self.session.save_frame_pair(
                 self.pair_name,
                 self.left,

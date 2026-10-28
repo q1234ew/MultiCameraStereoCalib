@@ -567,6 +567,8 @@ class MainWindow(QMainWindow):
                 {current.left_id: current.left, current.right_id: current.right}
             ):
                 self._stream_view.end_review()
+            else:
+                self._show_review_pair(current)
         self._gallery.set_pairs(pairs)
 
     @Slot(str, bool)
@@ -580,7 +582,20 @@ class MainWindow(QMainWindow):
     @Slot(str, object)
     def _on_gallery_pair_selected(self, key, images):
         self._calib_panel.select_offline_preview(key)
-        self._stream_view.show_review_images(key, images)
+        pair = next((p for p in self._calib_panel.preview_pairs() if p.key == key), None)
+        if pair is not None:
+            self._show_review_pair(pair)
+        else:
+            self._stream_view.show_review_images(key, images)
+
+    def _show_review_pair(self, pair):
+        recorded = pair.left_detection is not None and pair.right_detection is not None
+        self._stream_view.show_review_images(
+            pair.key, {pair.left_id: pair.left, pair.right_id: pair.right},
+            detections={pair.left_id: pair.left_detection, pair.right_id: pair.right_detection} if recorded else None,
+            detection_origin=pair.detection_origin if recorded else '预览重检',
+            corner_total=pair.corner_total,
+            save_state=' · '.join(filter(None, (pair.save_state, pair.quality_state))))
 
     @Slot(bool)
     def _toggle_log_panel(self, expanded):

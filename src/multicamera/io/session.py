@@ -178,6 +178,12 @@ class CalibrationSession:
             self._save_image_pair(pair_dir, "left", "right", left, right, frame_idx, "frame_count")
         return frame_idx
 
+    def save_capture_review(self, pair_name: str, frame_idx: int, review: dict) -> None:
+        """Persist admission separately from successful image-save counters."""
+        folder = self.session_dir / self.IMAGES_DIR / pair_name
+        folder.mkdir(parents=True, exist_ok=True)
+        self._atomic_json(folder / f'quality_{frame_idx:04d}.json', review)
+
     def delete_saved_pair_frame(self, pair_name: str, frame_idx: int) -> bool:
         """删除某组指定索引的左右 PNG；并依据磁盘重新计算 ``frame_count``。"""
         pair_dir = self.session_dir / self.IMAGES_DIR / pair_name
@@ -190,6 +196,8 @@ class CalibrationSession:
         if rf.exists():
             rf.unlink()
             removed = True
+        # Retain admission evidence if either image cannot be removed (e.g. Windows locks).
+        (pair_dir / f'quality_{frame_idx:04d}.json').unlink(missing_ok=True)
         if removed:
             self._recompute_frame_count_from_disk()
             self._save_metadata()

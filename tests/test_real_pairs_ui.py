@@ -14,6 +14,14 @@ from PySide6.QtWidgets import QFileDialog, QDialog, QDialogButtonBox
 from multicamera.ui import main_window
 from multicamera.ui.theme import configure_application_style
 from multicamera.ui.widgets.export_dialog import ExportDialog
+from multicamera.ui.threads.import_worker import _discover_stereo_pairs
+
+
+def source_image_hashes(source):
+    paths = {path for _, left, right in _discover_stereo_pairs(str(source))
+             for path in (left, right)}
+    assert paths, 'No paired source images were included in the integrity check'
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
 
 def wait_for(app, predicate, timeout=90000):
@@ -37,8 +45,7 @@ def wait_for(app, predicate, timeout=90000):
 def test_real_pairs_import_review_calibrate_export(app, monkeypatch, tmp_path):
     source = Path(os.environ['MULTICAMERA_REAL_PAIR_DIR']).resolve()
     assert source.is_dir()
-    files = sorted([*source.glob('*_left.png'), *source.glob('*_right.png')])
-    original_hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+    original_hashes = source_image_hashes(source)
     configure_application_style(app)
     monkeypatch.setattr(main_window, 'sessions_dir', lambda: tmp_path / 'sessions')
     monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *args: str(source))
@@ -162,7 +169,7 @@ def test_real_pairs_import_review_calibrate_export(app, monkeypatch, tmp_path):
         assert win._rig is previous and panel._offline_source_folder == source
         assert win._toggle_logs.isChecked() and '离线导入失败' in panel._log_text.toPlainText()
         shot('09-import-error-preserves-data')
-        assert original_hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+        assert original_hashes == source_image_hashes(source)
         (directory / 'observations.json').write_text(json.dumps(snapshots, ensure_ascii=False, indent=2))
     finally:
         if dialog is not None:

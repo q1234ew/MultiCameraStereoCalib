@@ -82,7 +82,9 @@ def seed_observations(window, count=8):
     }
     panel._stereo_cals["rgb"] = StereoCalibrator(panel._board, min_frames=5)
     panel._fqs = {"left": [], "right": []}
-    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    # Solver detections are simulated below; captures still need a nonblank photo fixture.
+    texture = cv2.resize(panel._board.generate_image(pixel_size=40), (640, 480))
+    image = cv2.cvtColor(texture, cv2.COLOR_GRAY2BGR)
     k = np.array([[800., 0., 320.], [0., 800., 240.], [0., 0., 1.]])
     ids = np.arange(panel._board.num_corners, dtype=np.int32).reshape(-1, 1)
     records = []

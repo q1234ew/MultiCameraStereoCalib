@@ -21,6 +21,9 @@ def motion_description(target):
         return "暂无采图动作"
     if target.tilt in TILT_ACTIONS:
         return TILT_ACTIONS[target.tilt][1]
+    if target.scale != 'medium':
+        move = '向镜头靠近' if target.scale == 'large' else '远离镜头'
+        return f'保持当前高度，{move}；双路完整可见，到位后静止'
     if (target.zone_row, target.zone_col) == (1, 1):
         return "板面正对镜头，放在画面中央并保持静止"
     return "按左目预览方向平移至建议区域，保持板面朝向"
@@ -35,8 +38,11 @@ def board_point(x, y, progress, target):
     # Tilt demonstrations start at the suggested image position; they do not
     # combine a translation with a rotation around a supposedly fixed edge.
     shift = progress if tilt == BoardTilt.FRONT else 1.
-    scale = {'small': .7, 'medium': 1., 'large': 1.25}.get(getattr(target, 'scale', 'medium'), 1.)
-    return x * scale + (target.zone_col - 1) * 1.25 * shift, y * scale + (target.zone_row - 1) * .8 * shift, z
+    # The board is a fixed-size object: vary camera-axis distance, not its dimensions.
+    depth_shift = {'small': 1.6, 'medium': 0., 'large': -1.}.get(target.scale, 0.)
+    depth_shift *= progress if tilt == BoardTilt.FRONT else 1.
+    return (x + (target.zone_col - 1) * 1.25 * shift,
+            y + (target.zone_row - 1) * .8 * shift, z + depth_shift)
 
 
 VIEW_EYE = (6., -6., 10.)

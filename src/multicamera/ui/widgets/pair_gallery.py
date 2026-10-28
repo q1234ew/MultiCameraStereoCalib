@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QStyle, QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..theme import BG_DARK, TEXT_DIM, standard_icon
+from ..theme import BG_DARK, TEXT_DIM, standard_icon, app_icon
 
 
 @dataclass
@@ -21,6 +21,22 @@ class PreviewPair:
     right_id: str
     left: np.ndarray
     right: np.ndarray
+    left_detection: object = None
+    right_detection: object = None
+    detection_origin: str = '预览重检'
+    corner_total: int | None = None
+    save_token: str | None = None
+    save_state: str = ''
+    quality_state: str = ''
+    quality_reasons: tuple[str, ...] = ()
+
+    def result_text(self):
+        def count(detection):
+            return (getattr(detection, 'num_corners', getattr(detection, 'num_points', 0))
+                    if detection is not None else '—')
+        return (f'{self.key} · {self.detection_origin} L={count(self.left_detection)} '
+                f'R={count(self.right_detection)} · {self.save_state} · {self.quality_state} '
+                + '；'.join(self.quality_reasons))
 
 
 class PairGallery(QWidget):
@@ -49,6 +65,14 @@ class PairGallery(QWidget):
         self._count = QLabel("0 组")
         self._count.setStyleSheet(f"color:{TEXT_DIM};")
         header.addWidget(self._count)
+        self._latest_capture = QToolButton()
+        self._latest_capture.setIcon(app_icon('camera'))
+        self._latest_capture.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._latest_capture.setText('查看最近采图')
+        self._latest_capture.setAccessibleName('查看最近采图原图与检测结果')
+        self._latest_capture.clicked.connect(self._select_latest_capture)
+        self._latest_capture.hide()
+        header.addWidget(self._latest_capture)
         header.addStretch()
         outer.addLayout(header)
         self._body = QWidget()
@@ -92,6 +116,9 @@ class PairGallery(QWidget):
     def set_pairs(self, pairs: list[PreviewPair]):
         if len(pairs) == len(self._pairs) and all(
             new.key == old.key and new.left is old.left and new.right is old.right
+            and new.save_state == old.save_state and new.detection_origin == old.detection_origin
+            and new.quality_state == old.quality_state and new.quality_reasons == old.quality_reasons
+            and new.left_detection is old.left_detection and new.right_detection is old.right_detection
             for new, old in zip(pairs, self._pairs)
         ):
             return
@@ -108,6 +135,13 @@ class PairGallery(QWidget):
         else:
             self._start = min(self._start, max(0, len(self._pairs) - self._page_size))
         self._count.setText(f"{len(self._pairs)} 组")
+        latest = next((p for p in reversed(self._pairs) if p.detection_origin == '采图原图'), None)
+        self._latest_capture.setVisible(latest is not None)
+        self._latest_capture.setToolTip(latest.result_text() if latest else '')
+        if latest is not None:
+            left = getattr(latest.left_detection, 'num_corners', getattr(latest.left_detection, 'num_points', 0))
+            right = getattr(latest.right_detection, 'num_corners', getattr(latest.right_detection, 'num_points', 0))
+            self._latest_capture.setText(f'最近采图 {latest.key.rsplit(" ", 1)[-1]} · L{left}/R{right} · {latest.quality_state} · {latest.save_state}')
         self._body.setVisible(bool(self._pairs) and self._toggle.isChecked())
         self._refresh_page()
 
@@ -153,7 +187,7 @@ class PairGallery(QWidget):
                     visible.add(pair.key)
                     item = QListWidgetItem(icon, pair.key)
                     item.setData(Qt.UserRole, index)
-                    item.setToolTip(f"{pair.left_id} + {pair.right_id} · {pair.key}")
+                    item.setToolTip(f"{pair.left_id} + {pair.right_id}\n{pair.result_text()}")
                     self._list.addItem(item)
                     item.setSelected(pair.key == self._selected_key)
         self._previous.setEnabled(self._start > 0)
@@ -184,3 +218,12 @@ class PairGallery(QWidget):
         pair = self._pairs[index]
         self._selected_key = pair.key
         self.pair_selected.emit(pair.key, {pair.left_id: pair.left, pair.right_id: pair.right})
+
+    def _select_latest_capture(self):
+        pair = next((p for p in reversed(self._pairs) if p.detection_origin == '采图原图'), None)
+        if pair is not None:
+            self._selected_key = pair.key
+            index = next(i for i, value in enumerate(self._pairs) if value is pair)
+            self._start = max(0, index - self._page_size + 1)
+            self._refresh_page()
+            self.pair_selected.emit(pair.key, {pair.left_id: pair.left, pair.right_id: pair.right})

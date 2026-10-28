@@ -435,11 +435,13 @@ class MultiStreamView(QWidget):
     comparison_visible_changed = Signal(bool)
     review_changed = Signal(str, bool)
     preview_detected = Signal(str, object, object)
+    preview_detection_expired = Signal(str)
 
     UI_FPS_CAP = 15
     DETECT_FPS_CAP = 2.0
     DETECT_MAX_WIDTH = 960
     MAX_PREVIEW_FRAME_AGE_SEC = 0.35
+    MAX_DETECTION_AGE_SEC = .75
 
     def __init__(
         self,
@@ -462,6 +464,8 @@ class MultiStreamView(QWidget):
         self._last_render_ts: Dict[str, float] = {}
         self._last_detect_ts: Dict[str, float] = {}
         self._last_detection: Dict[str, DetectionResult] = {}
+        self._preview_frames: Dict[str, np.ndarray] = {}
+        self._review_detection_origin = '预览重检'
         self._min_interval = 1.0 / self.UI_FPS_CAP
         self._detect_min_interval = 1.0 / self.DETECT_FPS_CAP
         self._expanded_id: Optional[str] = None
@@ -487,6 +491,10 @@ class MultiStreamView(QWidget):
         self._layout_refresh_timer = QTimer(self)
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_tile_pixmaps_after_layout)
+        self._detection_expiry_timer = QTimer(self)
+        self._detection_expiry_timer.setInterval(100)
+        self._detection_expiry_timer.timeout.connect(self._expire_preview_detections)
+        self._detection_expiry_timer.start()
 
         self._stream_manager.frame_received.connect(self._on_frame)
         self._stream_manager.camera_connected.connect(self._on_connected)
@@ -501,6 +509,7 @@ class MultiStreamView(QWidget):
         self._trackers.clear()
         self._last_detection.clear()
         self._last_detect_ts.clear()
+        self._preview_frames.clear()
         self._mode_trackers.clear()
 
     def set_capture_sequence(self, seq: Optional[CaptureSequence]):
@@ -565,18 +574,35 @@ class MultiStreamView(QWidget):
     def displayed_corner_counts(self):
         return {cid: view.corner_count for cid, view in self._views.items()}
 
-    def show_review_images(self, key: str, images: Dict[str, np.ndarray]):
+    @property
+    def review_detection_origin(self):
+        return self._review_detection_origin
+
+    def show_review_images(self, key: str, images: Dict[str, np.ndarray], *, detections=None,
+                           detection_origin='预览重检', corner_total=None, save_state=''):
         self._expanded_id = None
         self._review_images = {cid: frame for cid, frame in images.items() if self._accept_camera(cid)}
         self._review_key = key
+        self._review_detection_origin = detection_origin
         for cid, frame in self._review_images.items():
             view = self._get_or_create_view(cid)
             view.set_display_name(self._camera_label(cid))
-            result = self._detect_for_preview(frame)
+            raw = detections.get(cid) if detections is not None else None
+            if isinstance(raw, PlanarDetectionResult):
+                result = DetectionResult(
+                    raw.image_points.reshape(-1, 1, 2) if raw.valid else None,
+                    np.arange(raw.num_points, dtype=np.int32)[:, None] if raw.valid else None,
+                    [], None, raw.image_size)
+            else:
+                result = raw if raw is not None else self._detect_for_preview(frame)
             view.corner_count = result.num_corners
-            view.update_frame(self._draw_detection(frame, result) if self._show_guide else frame)
+            view.update_frame(self._draw_detection(frame, result, include_target=False) if self._show_guide else frame)
             h, w = frame.shape[:2]
-            view.update_info(f"{w}x{h} | 回看 {key} | 预览角点 {result.num_corners}/{self._preview_corner_count}")
+            total = corner_total if corner_total is not None else self._preview_corner_count
+            label = '预览角点（重检）' if detection_origin == '预览重检' else f'{detection_origin}角点'
+            view.update_info(f'{w}x{h} | 回看 {key} | {label} {result.num_corners}/{total}'
+                             + (f' | {save_state}' if save_state else ''))
+            view._info.setToolTip(view._info.text())
         self._relayout()
         self.review_changed.emit(key, True)
 
@@ -631,6 +657,7 @@ class MultiStreamView(QWidget):
             else:
                 self._trackers.clear()
             self._last_detection.clear()
+            self._preview_frames.clear()
             self._last_detect_ts.clear()
             self._last_render_ts.clear()
             self._expanded_id = None
@@ -748,6 +775,7 @@ class MultiStreamView(QWidget):
                 self._remove_view(camera_id, relayout=False)
 
         for camera_id, frame in images.items():
+            self._preview_frames.pop(camera_id, None)
             if camera_id not in visible_ids:
                 continue
             view = self._get_or_create_view(camera_id)
@@ -829,6 +857,7 @@ class MultiStreamView(QWidget):
         self._last_render_ts.clear()
         self._last_detect_ts.clear()
         self._last_detection.clear()
+        self._preview_frames.clear()
         self._expanded_id = None
         self._connection_state.clear()
         self._static_images.clear()
@@ -848,6 +877,7 @@ class MultiStreamView(QWidget):
             self._last_render_ts.pop(camera_id, None)
             self._last_detect_ts.pop(camera_id, None)
             self._last_detection.pop(camera_id, None)
+            self._preview_frames.pop(camera_id, None)
 
     def reset_trackers(self):
         self._trackers.clear()
@@ -881,7 +911,8 @@ class MultiStreamView(QWidget):
             self._trackers[camera_id] = CoverageTracker((w, h))
 
         last_detect = self._last_detect_ts.get(camera_id, 0.0)
-        if now - last_detect >= self._detect_min_interval or camera_id not in self._last_detection:
+        fresh = now - last_detect >= self._detect_min_interval or camera_id not in self._last_detection
+        if fresh:
             self._last_detect_ts[camera_id] = now
             result = self._detect_for_preview(frame)
             self._last_detection[camera_id] = result
@@ -889,7 +920,10 @@ class MultiStreamView(QWidget):
         else:
             result = self._last_detection[camera_id]
 
-        display = self._draw_detection(frame, result) if self._show_guide else frame
+        # Cached detections belong to an older image: keep target guides, not old corner dots.
+        overlay = result if fresh else DetectionResult(None, None, [], None, (w, h))
+        display = self._draw_detection(frame, overlay) if self._show_guide else frame
+        self._preview_frames[camera_id] = frame
         view.corner_count = result.num_corners
 
         view.update_frame(display)
@@ -898,8 +932,29 @@ class MultiStreamView(QWidget):
             self._relayout()
 
         fps = self._fps.get(camera_id, 0)
-        suffix = f" | 预览角点 {result.num_corners}/{self._preview_corner_count}"
+        age = max(0., now - self._last_detect_ts[camera_id])
+        source = '本帧预览角点' if fresh else '上次预览角点'
+        suffix = f' | {source} {result.num_corners}/{self._preview_corner_count}'
+        if not fresh:
+            suffix += f' · {age * 1000:.0f}ms前（非本帧）'
         view.update_info(f"{w}x{h} | {fps:.1f} fps{suffix}")
+
+    def _expire_preview_detections(self):
+        if self._review_images is not None or not self.isVisible():
+            return
+        now = time.monotonic()
+        for cid, stamp in list(self._last_detect_ts.items()):
+            if now - stamp <= self.MAX_DETECTION_AGE_SEC:
+                continue
+            frame, view = self._preview_frames.get(cid), self._views.get(cid)
+            if frame is None or view is None or cid not in self._last_detection:
+                continue
+            self._last_detection.pop(cid, None)
+            self.preview_detection_expired.emit(cid)
+            view.corner_count = None
+            empty = DetectionResult(None, None, [], None, frame.shape[1::-1])
+            view.update_frame(self._draw_detection(frame, empty) if self._show_guide else frame)
+            view.update_info('预览检测已过期 · 等待新帧检测')
 
     def _detect_for_preview(self, frame: np.ndarray) -> DetectionResult:
         h, w = frame.shape[:2]
@@ -951,13 +1006,14 @@ class MultiStreamView(QWidget):
         prefix = "无法连接" if reason not in {"已断开", "已移除", "重新连接"} else "断开"
         self._connection_state[camera_id] = (False, f"{prefix}: {reason}")
         self._last_detection.pop(camera_id, None)
+        self._preview_frames.pop(camera_id, None)
         self._known_sizes.pop(camera_id, None)
         self._last_detect_ts.pop(camera_id, None)
         view = self._views.get(camera_id)
         if view:
             view.set_connected(False)
             if self._review_images is not None and camera_id in self._review_images:
-                view.update_info(f"回看 {self._review_key} | 实时{prefix}: {reason}")
+                view.setToolTip(f'回看 {self._review_key}\n实时{prefix}: {reason}')
                 return
             view.clear_frame(f"{prefix}: {reason}")
             view.setToolTip(f"相机: {camera_id}\n状态: {prefix}\n原因: {reason}")
@@ -1008,6 +1064,7 @@ class MultiStreamView(QWidget):
         self._last_render_ts.pop(camera_id, None)
         self._last_detect_ts.pop(camera_id, None)
         self._last_detection.pop(camera_id, None)
+        self._preview_frames.pop(camera_id, None)
         if self._expanded_id == camera_id:
             self._expanded_id = None
         if relayout:

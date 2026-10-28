@@ -205,9 +205,11 @@ def test_both_cameras_affect_shortages(board):
     assert ag._zone(ga[1][2]) != ag._zone(gb[1][2])
     assert ag._scale(ga[1][3]) != ag._scale(gb[1][3])
     ra, rb = analyze(board, a).recommendation, analyze(board, b).recommendation
-    # Bootstrap keeps the same physical height; the second eye still changes target size.
+    # The bounded medium-distance bootstrap stays central; both eyes affect evidence.
     assert (ra.zone_row, ra.zone_col) == (rb.zone_row, rb.zone_col) == (1, 1)
-    assert ra.scale != rb.scale
+    assert ra.scale == rb.scale == 'medium'
+    assert ra.reason != rb.reason
+    assert analyze(board, a).summary != analyze(board, b).summary
     # Swap roles: a symmetric aggregate must give the same next target.
     swapped = {'L': b['R'], 'R': b['L']}
     assert analyze(board, b).recommendation == analyze(board, swapped).recommendation

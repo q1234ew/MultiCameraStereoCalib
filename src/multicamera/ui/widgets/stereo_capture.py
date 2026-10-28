@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
 )
 
 from ...calibration.models import CameraModel
-from ...calibration.adaptive_guidance import GuidanceObservation, measure_pose, measure_composition
+from ...calibration.adaptive_guidance import (
+    DISTANCE_LABELS, GuidanceObservation, evaluate_distance, measure_pose, measure_composition,
+    _candidate_feasible,
+)
 from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
 from ..theme import ACCENT, BORDER, SUCCESS, TEXT_DIM, WARNING, app_icon
@@ -47,6 +50,10 @@ class StereoCaptureWorkspace(QWidget):
         self._requested_key = None
         self._guidance_worker = None
         self._guidance_error = ''
+        self._distance_override = None
+        self._distance_scope = None
+        self._distance_session = None
+        self._instruction_stage = 'waiting'
         self._adaptive_sequence = CaptureSequence([CaptureTarget(1, 1, BoardTilt.FRONT)])
         self.banner = QWidget()
         banner = QHBoxLayout(self.banner)
@@ -114,6 +121,30 @@ class StereoCaptureWorkspace(QWidget):
         self.advice.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         outer.addWidget(self.advice)
 
+        self.distance_tools = QWidget()
+        distance_row = QHBoxLayout(self.distance_tools)
+        distance_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_near = QToolButton()
+        self.btn_far = QToolButton()
+        for button, text, scale in ((self.btn_near, '补近距离', 'large'),
+                                    (self.btn_far, '补远距离', 'small')):
+            button.setText(text)
+            button.setIcon(app_icon('camera'))
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            button.setAccessibleName(text)
+            button.setToolTip(f'在中央正面补采{DISTANCE_LABELS[scale]}；保留全部原图验收和自动采集门禁')
+            button.clicked.connect(lambda checked=False, s=scale: self._start_distance_capture(s))
+            distance_row.addWidget(button)
+        self.btn_resume_guidance = QToolButton()
+        self.btn_resume_guidance.setText('返回推荐')
+        self.btn_resume_guidance.setIcon(app_icon('rotate-ccw'))
+        self.btn_resume_guidance.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_resume_guidance.setToolTip('结束指定距离补采，返回基于现有数据的自适应推荐')
+        self.btn_resume_guidance.clicked.connect(self._resume_guidance)
+        distance_row.addWidget(self.btn_resume_guidance)
+        distance_row.addStretch()
+        outer.insertWidget(0, self.distance_tools)
+
         self.coverage_button = QToolButton()
         self.coverage_button.setCheckable(True)
         self.coverage_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -131,6 +162,7 @@ class StereoCaptureWorkspace(QWidget):
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.refresh)
         stream_view.preview_detected.connect(self.observe)
+        stream_view.preview_detection_expired.connect(self._expire_sample)
         panel.data_source_changed.connect(self.refresh)
         panel._seq_widget.user_navigated.connect(self._manual_navigation)
         self.refresh()
@@ -141,6 +173,48 @@ class StereoCaptureWorkspace(QWidget):
 
     def _manual_navigation(self):
         self.guide_mode.setCurrentIndex(1)
+
+    def _distance_sizes(self):
+        sizes = []
+        for pair in self.panel._selected_pairs().values():
+            for camera in (pair.left, pair.right):
+                frame = self.panel._sm.get_latest_frame(camera.camera_id)
+                cal = self.panel._intr_cals.get(camera.camera_id)
+                intr = self.panel._intrinsics.get(camera.camera_id)
+                size = (frame[0].shape[1::-1] if frame is not None else
+                        cal._image_size if cal is not None and cal._image_size else
+                        intr.image_size if intr is not None else None)
+                if size:
+                    sizes.append(size)
+        return sizes
+
+    def _distance_available(self, scale):
+        return _candidate_feasible(self.board, (1, 1, 'front', scale), self._distance_sizes())
+
+    def _apply_guidance_target(self):
+        if self._distance_override:
+            target = CaptureTarget(1, 1, BoardTilt.FRONT, scale=self._distance_override)
+        elif self._analysis is not None:
+            rec = self._analysis.recommendation
+            tilts = dict(zip(('front', 'left', 'right', 'up', 'down'), BoardTilt))
+            target = CaptureTarget(rec.zone_row, rec.zone_col, tilts[rec.tilt], scale=rec.scale)
+        else:
+            return
+        self._adaptive_sequence = CaptureSequence([target])
+
+    def _start_distance_capture(self, scale):
+        button = self.btn_near if scale == 'large' else self.btn_far
+        if not button.isEnabled() or not self.distance_tools.isVisible():
+            return
+        self._distance_override = scale
+        self._apply_guidance_target()
+        logger.info('Explicit distance capture selected: scale=%s', scale)
+        self.refresh()
+
+    def _resume_guidance(self):
+        self._distance_override = None
+        self._apply_guidance_target()
+        self.refresh()
 
     def _guidance_context(self):
         names = list(self.panel._selected_pairs())
@@ -204,10 +278,7 @@ class StereoCaptureWorkspace(QWidget):
             self._guidance_error = error
             if result is not None:
                 rec = result.recommendation
-                tilts = dict(zip(('front', 'left', 'right', 'up', 'down'), BoardTilt))
-                self._adaptive_sequence = CaptureSequence([
-                    CaptureTarget(rec.zone_row, rec.zone_col, tilts[rec.tilt], scale=rec.scale),
-                ])
+                self._apply_guidance_target()
                 logger.info('Capture guidance updated: pair=%s samples=%s target=%s/%s/%s/%s '
                             'pose_available=%s feasible=%s', context[0], rec.sample_count,
                             rec.zone_row, rec.zone_col, rec.tilt, rec.scale,
@@ -216,6 +287,8 @@ class StereoCaptureWorkspace(QWidget):
 
     def _target(self):
         key, _ = self._guidance_context()
+        if self.adaptive and key is not None and self._distance_override:
+            return self._adaptive_sequence.current
         if self.adaptive and key is not None and self._analysis_key == key and self._analysis:
             return self._adaptive_sequence.current
         return self.panel._capture_sequence.current
@@ -240,18 +313,31 @@ class StereoCaptureWorkspace(QWidget):
         sample['pose_key'], sample['pose'] = cache_key, pose
         return pose
 
+    def _distance_status(self, pairs, samples, target):
+        if not target or not samples or not all(s['valid'] for s in samples):
+            return False, '等待双路距离检测'
+        cameras = [camera for pair in pairs for camera in (pair.left, pair.right)]
+        poses = [self._pose_measurement(camera.camera_id, sample)
+                 for camera, sample in zip(cameras, samples)]
+        if len(poses) != len(samples):
+            return False, '等待双路距离检测'
+        ready, text, _, _ = evaluate_distance(
+            target.scale, [dict(sample, pose=pose) for sample, pose in zip(samples, poses)])
+        return ready, text
+
     def _adaptive_aligned(self, pairs, samples, target):
-        if self._analysis is not None and not self._analysis.recommendation.feasible:
+        feasible = (self._distance_available(self._distance_override) if self._distance_override else
+                    self._analysis is None or self._analysis.recommendation.feasible)
+        if not feasible:
             return False, '无可用构图，请调整分辨率或标定板'
         if not target or not samples or not all(s['valid'] for s in samples):
             return False, '等待双路检测'
+        distance_ready, distance_message = self._distance_status(pairs, samples, target)
+        if not distance_ready:
+            return False, distance_message
         if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
                    for s in samples):
             return False, '位置待对齐'
-        low, high = {'small': (.012, .04), 'medium': (.04, .12), 'large': (.12, .45)}[target.scale]
-        if not all(low <= s.get('area', 0) <= high for s in samples):
-            values = ' / '.join(f'{s.get("area", 0):.1%}' for s in samples)
-            return False, f'板点占比 {values}；目标 {low:.1%}–{high:.0%}'
         poses = [self._pose_measurement(camera.camera_id, sample)
                  for pair, offset in zip(pairs, range(0, len(samples), 2))
                  for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
@@ -320,6 +406,11 @@ class StereoCaptureWorkspace(QWidget):
                           stable=count >= self.MIN_STABLE_SAMPLES and now - since >= self.MIN_STABLE_SECONDS)
         self.samples[camera_id] = sample
         self.refresh()
+
+    def _expire_sample(self, camera_id):
+        self.samples.pop(camera_id, None)
+        if self.isVisible():
+            self.refresh()
 
     def _detection_sample(self, detection, frame):
         result = {'valid': False, 'detection': detection, 'sharp': False, 'stable': False}
@@ -482,6 +573,20 @@ class StereoCaptureWorkspace(QWidget):
                          f"左右倾  {pose['yaw']:.1f}°\n上下倾  {pose['pitch']:.1f}°")
 
     def _refresh_sample_context(self):
+        scope = (id(self.panel._board), self.panel._camera_model,
+                 tuple((name, pair.left.camera_id, pair.right.camera_id,
+                        pair.left.url, pair.right.url, id(pair))
+                       for name, pair in self.panel._selected_pairs().items()))
+        if (scope != self._distance_scope or not self.adaptive or self.panel._active_step != 0
+                or self.panel._workflow_phase != 'capture'
+                or (self._distance_session is not None
+                    and self._distance_session is not self.panel._session)):
+            had_override = self._distance_override is not None
+            self._distance_override = None
+            if had_override:
+                self._apply_guidance_target()
+        self._distance_scope = scope
+        self._distance_session = self.panel._session
         context = (id(self.panel._board), id(self.panel._session), self.panel._camera_model,
                    tuple((name, pair.left.url, pair.right.url, id(pair))
                          for name, pair in self.panel._selected_pairs().items()), self.view.review_key)
@@ -489,6 +594,52 @@ class StereoCaptureWorkspace(QWidget):
             self.samples.clear()
             self._context = context
         self.board = self.panel._board
+
+    def _primary_action(self, pairs, samples, target, duplicate):
+        """Order one actionable instruction without relaxing any capture gate."""
+        if self.panel._pending_save_tokens or self.panel._save_workers or self.panel._save_queue:
+            return 'saving', '保持当前位置，等待原图保存完成'
+        if self.panel._failed_save_jobs:
+            return 'saving', '先重试保存失败的原图，或撤销该次采集'
+        if self.panel._white_balance_guard.busy:
+            return 'preparation', '保持当前位置，等待相机参数稳定'
+        if (self.panel._model_worker or self.panel._calib_worker or self.panel._stereo_import_worker
+                or self.panel._aux_dataset_busy()):
+            return 'preparation', '保持当前位置，等待当前任务完成'
+        feasible = (self._distance_available(self._distance_override) if self._distance_override else
+                    self._analysis.recommendation.feasible)
+        if not feasible:
+            return 'blocked', '当前距离构图不可用，请检查分辨率和标定板'
+        if not samples or not all(s['valid'] for s in samples):
+            return 'visibility', '让标定板同时进入左右画面'
+        ready, message = self._distance_status(pairs, samples, target)
+        if not ready:
+            if '判断冲突' in message:
+                return 'distance', '先检查左右共视，暂停前后移动'
+            if '靠近' in message:
+                return 'distance', '向镜头靠近，保持当前高度'
+            if '远离' in message:
+                return 'distance', '远离镜头，保持当前高度'
+            return 'distance', '保持板面朝向，等待双路距离检测'
+        if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
+                   for s in samples):
+            positions = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))
+            return 'position', f'平移至画面{positions[target.zone_row][target.zone_col]}，保持前后距离'
+        aligned, message = self._adaptive_aligned(pairs, samples, target)
+        if not aligned:
+            if '待内参' in message:
+                return 'tilt', '按示意调整板面朝向，手动采集基础样本'
+            action = TILT_ACTIONS.get(target.tilt)
+            return 'tilt', action[0] if action else '将板面转正，保持前后距离'
+        if not all(s.get('sharp') for s in samples):
+            return 'quality', '检查对焦与光照，保持板面位置'
+        if not all(s.get('stable') for s in samples):
+            return 'stability', '保持静止至少 0.6 秒'
+        if duplicate:
+            return 'duplicate', '稍微改变板面朝向，避免重复构图'
+        if any(self.panel._sm.get_sync_pair(name) is None for name in self.panel._selected_pairs()):
+            return 'pairing', '等待左右帧满足软件时间配对'
+        return 'ready', '保持静止，可以采集'
 
     def refresh(self):
         options = [self.panel._combo_pair.itemText(i) for i in range(self.panel._combo_pair.count())]
@@ -499,14 +650,33 @@ class StereoCaptureWorkspace(QWidget):
         self.pair.setCurrentText(self.panel._combo_pair.currentText())
         self.pair.blockSignals(False)
         self._refresh_sample_context()
+        self.reason.setToolTip('')
         offline = self.panel.offline_selection
         self.guide_mode.setEnabled(not offline)
         key = self._request_guidance() if self.adaptive and not self.view.review_key else None
         using_adaptive = bool(self.adaptive and key is not None and self._analysis
                               and self._analysis_key == key)
+        using_override = bool(self.adaptive and key is not None and self._distance_override)
+        self._instruction_stage = ('review' if self.view.review_key else
+                                   'offline' if offline else 'fixed')
+        live = (self.adaptive and not offline and not self.view.review_key and key is not None
+                and self.panel._active_step == 0 and self.panel._workflow_phase == 'capture')
+        self.distance_tools.setVisible(live)
+        busy = bool(self.panel._pending_save_tokens or self.panel._failed_save_jobs
+                    or self.panel._save_workers or self.panel._save_queue
+                    or self.panel._white_balance_guard.busy or self.panel._model_worker
+                    or self.panel._calib_worker or self.panel._stereo_import_worker
+                    or self.panel._aux_dataset_busy() or self._guidance_worker is not None)
+        for button, scale in ((self.btn_near, 'large'), (self.btn_far, 'small')):
+            available = live and using_adaptive and not busy and self._distance_available(scale)
+            button.setEnabled(available)
+            button.setToolTip(
+                f'中央正面补采{DISTANCE_LABELS[scale]}；保持原图验收，完成后可返回推荐' if available else
+                '仅单组实时自适应采集可用；请结束回看、等待任务完成，并确认分辨率能满足角点间距')
+        self.btn_resume_guidance.setVisible(self._distance_override is not None)
         target = self._target()
         if not offline and self.panel._active_step == 0:
-            self.view.set_capture_sequence(self._adaptive_sequence if using_adaptive
+            self.view.set_capture_sequence(self._adaptive_sequence if using_adaptive or using_override
                                            else self.panel._capture_sequence)
         self.panel._seq_widget.setVisible(not offline and not using_adaptive)
         self.schematic.set_target(target, active=not bool(self.view.review_key) and not offline)
@@ -533,10 +703,12 @@ class StereoCaptureWorkspace(QWidget):
             self.reason.setText("浏览结束不代表标定质量达标")
         if not offline and not self.view.review_key and self.adaptive:
             if using_adaptive:
-                scale_text = {'small': '缩小画面占比', 'medium': '保持适中大小',
-                              'large': '增大画面占比'}[target.scale]
-                self.instruction.setText(self.instruction.text() + f'；{scale_text}')
-                self.reason.setText(self._analysis.recommendation.reason)
+                self.instruction.setText(self.instruction.text() + f'；{DISTANCE_LABELS[target.scale]}')
+                if self._analysis.recommendation.repairing_distance:
+                    self.instruction.setText(self.instruction.text() + ' · 距离补采')
+                self.reason.setText(
+                    f'指定补采：中央正面 · {DISTANCE_LABELS[target.scale]}'
+                    if self._distance_override else self._analysis.recommendation.reason)
             elif key is None:
                 self.reason.setText('多组同时采集沿用固定计划；选择单组可用自适应引导')
             elif self._guidance_error:
@@ -545,6 +717,9 @@ class StereoCaptureWorkspace(QWidget):
             else:
                 self.reason.setText('正在分析已采配对，暂不自动采集')
         pairs, samples = self._current_samples()
+        if using_adaptive and not offline and not self.view.review_key:
+            _, distance_message = self._distance_status(pairs, samples, target)
+            self.reason.setToolTip(self.reason.text() + '\n' + distance_message)
         visible = bool(samples) and all(s["valid"] for s in samples)
         sharp = visible and all(s.get("sharp") for s in samples)
         stable = visible and all(s.get("stable") for s in samples)
@@ -580,6 +755,26 @@ class StereoCaptureWorkspace(QWidget):
         )
         if using_adaptive and not duplicate:
             self.advice.setText(self._analysis.summary)
+        if using_adaptive and not self.view.review_key and not offline:
+            self._instruction_stage, action = self._primary_action(pairs, samples, target, duplicate)
+            self.instruction.setText(action)
+            prefix = ('指定补采' if self._distance_override else
+                      '距离补采' if self._analysis.recommendation.repairing_distance else '自适应推荐')
+            evidence = ('已有内参支持，倾角可估计' if self._analysis.recommendation.pose_available
+                        else '冷启动：倾角未验证')
+            complete = (self._distance_override is not None and self._distance_override
+                        not in self._analysis.recommendation.missing_distances)
+            subtitle = '本档数量已补足，可返回推荐' if complete else evidence
+            self.reason.setText(f'{prefix} · {DISTANCE_LABELS[target.scale]}\n{subtitle}')
+            if self._distance_override:
+                label = DISTANCE_LABELS[self._distance_override]
+                self.advice.setText(f'指定补采：{label} · '
+                                    + ('本档数量已补足，可返回推荐' if complete else '继续补拍，或返回推荐')
+                                    + '；仍需原图质量及标定后评估。\n' + self._analysis.summary)
+        elif live and not using_adaptive:
+            self._instruction_stage = 'analysis'
+            self.instruction.setText('正在更新采图建议，请保持当前位置' if not self._guidance_error else
+                                     '自适应分析不可用，请检查固定计划')
         self.advice.setStyleSheet(f"color:{WARNING if duplicate else TEXT_DIM}; font-size:12px;")
         self.advice.setVisible(duplicate or not self._compact)
         left = pairs[0].left.camera_id if pairs else None
@@ -610,13 +805,16 @@ class StereoCaptureWorkspace(QWidget):
         self.compact_summary.setToolTip(self.pose.text() + '\n' + self.status.text())
         if offline:
             counts = self.view.displayed_corner_counts()
+            origin = self.view.review_detection_origin if self.view.review_key else '缩放检测'
+            if origin == '预览重检':
+                origin += '，缩放检测'
             current = '  '.join(
                 f'{label} {counts.get(camera.camera_id) if counts.get(camera.camera_id) is not None else "未显示"}'
                 f'/{self.board.num_corners}' for label, camera in cameras
             )
             self.compact_summary.setText(
                 f'离线观测 {loaded} 对\n{self.panel._lbl_capture_count.text()}\n'
-                '姿态覆盖未验证\n当前预览角点（缩放检测）\n' + current +
+                f'姿态覆盖未验证\n当前预览角点（{origin}）\n' + current +
                 '\n数据集累计：板角点 ID / 视场网格\n' + '  '.join(self._coverage_summary)
             )
             self.status.setText(self.compact_summary.text())

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import traceback
@@ -52,6 +53,13 @@ class StereoImageImportWorker(QThread):
             imported = []
             skipped = 0
             for idx, lp, rp in pairs:
+                review_path = lp.with_name(lp.stem.replace('left_', 'quality_', 1) + '.json')
+                if lp.name.startswith('left_') and review_path.exists():
+                    review = json.loads(review_path.read_text(encoding='utf-8'))
+                    if review.get('state') != '可采纳':
+                        skipped += 1
+                        self.log.emit(f'[{idx}] {review.get("state", "待复核")}：未纳入导入标定数据；原图保留')
+                        continue
                 img_l = cv2.imread(str(lp))
                 img_r = cv2.imread(str(rp))
                 if img_l is None or img_r is None:
@@ -69,7 +77,7 @@ class StereoImageImportWorker(QThread):
                 self.failed.emit("未能加载任何有效图片对，请检查图片格式或文件是否损坏")
                 return
             if skipped:
-                self.log.emit(f"跳过 {skipped} 对无法读取的图片")
+                self.log.emit(f"跳过 {skipped} 对未通过采图验收或无法读取的图片")
             self.finished_ok.emit(imported)
         except Exception as exc:
             self.failed.emit(f"{exc}\n{traceback.format_exc(limit=3)}")

@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 import cv2
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -55,6 +57,7 @@ from ...calibration.assessment import (
     Grade,
 )
 from ...calibration.intrinsic import IntrinsicCalibrator
+from ...calibration.capture_quality import assess_stereo_capture
 from ...calibration.models import (
     AuxCameraCalibration,
     CameraIntrinsics,
@@ -480,6 +483,8 @@ class CalibrationPanel(QWidget):
         self._active_step = 0
         self._workflow_phase = "capture"
         self._live_preview_indices: dict[str, list[tuple[int, int, str]]] = {}
+        self._capture_reviews: dict[str, list[PreviewPair]] = {}
+        self._aux_reviews: list[PreviewPair] = []
         self._result_directory = None
         self._result_files = []
         self._result_errors = []
@@ -640,6 +645,7 @@ class CalibrationPanel(QWidget):
         else:
             for name in impact.changed_pairs:
                 self._live_preview_indices.pop(name, None)
+                self._capture_reviews.pop(name, None)
                 self._stereo_cals.pop(name, None)
                 self._pair_calibs.pop(name, None)
                 self._pair_capture_press_count.pop(name, None)
@@ -664,6 +670,7 @@ class CalibrationPanel(QWidget):
             if impact.reset_aux:
                 self._aux_pairs.clear()
                 self._aux_images.clear()
+                self._aux_reviews.clear()
                 self._aux_intrinsics = None
                 self._aux_capture_count = 0
                 self._aux_saved_count = 0
@@ -721,6 +728,8 @@ class CalibrationPanel(QWidget):
 
     def preview_pairs(self) -> list[PreviewPair]:
         if self._active_step == 2:
+            if self._aux_reviews:
+                return list(self._aux_reviews)
             left, right = self._rgb_left_camera_id() or "RGB_L", self._aux_camera_id()
             return [PreviewPair(f"融合 {index + 1:04d}", left, right, rgb, aux)
                     for index, (rgb, aux) in enumerate(self._aux_images)]
@@ -730,8 +739,18 @@ class CalibrationPanel(QWidget):
             if imported is not None:
                 labels = [str(record[0]) for record in self._offline_import_records] if name == 'offline' else []
                 pairs.extend(PreviewPair(f"{name} {labels[i] if i < len(labels) else f'{i + 1:04d}'}",
-                                        cfg.left.camera_id, cfg.right.camera_id, left, right)
+                                        cfg.left.camera_id, cfg.right.camera_id, left, right,
+                                        *self._offline_review_detections(i), '导入原图',
+                                        self._board.num_corners, save_state='源目录原图')
                              for i, (left, right) in enumerate(imported))
+                continue
+            if name in self._capture_reviews:
+                for review in self._capture_reviews[name]:
+                    token = review.save_token
+                    state = ('保存失败' if token in self._failed_save_jobs else
+                             '保存中' if token in self._pending_save_tokens else
+                             '已保存' if token in self._saved_capture_tokens else review.save_state)
+                    pairs.append(replace(review, save_state=state))
                 continue
             left_cal, right_cal = self._intr_cals.get(cfg.left.camera_id), self._intr_cals.get(cfg.right.camera_id)
             if left_cal is None or right_cal is None:
@@ -743,6 +762,12 @@ class CalibrationPanel(QWidget):
                                              cfg.left.camera_id, cfg.right.camera_id,
                                              left_cal.stored_images[left], right_cal.stored_images[right]))
         return pairs
+
+    def _offline_review_detections(self, index):
+        if index >= len(self._offline_import_records):
+            return None, None
+        left, right = self._offline_import_records[index][3:5]
+        return (right, left) if self._offline_lr_swapped else (left, right)
 
     def _refresh_preview_pairs(self):
         self.preview_pairs_changed.emit(self.preview_pairs())
@@ -1366,6 +1391,27 @@ class CalibrationPanel(QWidget):
         self._lbl_capture_readiness.setTextFormat(Qt.PlainText)
         self._lbl_capture_readiness.setStyleSheet(f'color:{TEXT_DIM}; background:transparent; font-size:12px;')
         info.addWidget(self._lbl_capture_readiness)
+        self._combo_capture_quality = QComboBox()
+        self._combo_capture_quality.addItem('验收：自动（允许部分角点）', 'automatic')
+        self._combo_capture_quality.addItem('验收：完整角点', 'strict')
+        self._combo_capture_quality.setAccessibleName('双目采图验收策略')
+        self._combo_capture_quality.setToolTip('按原图检查共同角点、分布、板面清晰度和亮度、时间配对及当前模型兼容性。仅用于 RGB 双目实时采图，不自动切换模型。')
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(self._combo_capture_quality, 1)
+        self._btn_capture_decision_details = QToolButton()
+        self._btn_capture_decision_details.setIcon(app_icon('list-checks'))
+        self._btn_capture_decision_details.setAccessibleName('验收详情')
+        self._btn_capture_decision_details.setToolTip('查看最近采图的完整验收原因和结果')
+        self._btn_capture_decision_details.clicked.connect(lambda: QMessageBox.information(
+            self, '采图验收详情', self._lbl_capture_decision.toolTip()))
+        quality_row.addWidget(self._btn_capture_decision_details)
+        info.addLayout(quality_row)
+        self._lbl_capture_decision = QLabel()
+        self._lbl_capture_decision.setWordWrap(True)
+        self._lbl_capture_decision.setTextFormat(Qt.PlainText)
+        self._lbl_capture_decision.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_capture_decision.setToolTip('保存成功不代表通过标定验收；待复核和拒收不计入有效样本，可重拍或撤销。')
+        info.addWidget(self._lbl_capture_decision)
         self._btn_retry_save = QToolButton()
         self._btn_retry_save.setText('重试保存原图')
         self._btn_retry_save.setIcon(app_icon('rotate-ccw'))
@@ -1932,6 +1978,9 @@ class CalibrationPanel(QWidget):
         for control in (self._btn_capture, self._btn_auto, self._btn_undo, self._btn_skip_stereo):
             control.setVisible(not offline)
         self._check_wb.setVisible(capture and not offline)
+        self._combo_capture_quality.setVisible(capture and not offline and self._active_step != 2)
+        self._btn_capture_decision_details.setVisible(capture and not offline and self._active_step != 2)
+        self._lbl_capture_decision.setVisible(capture and not offline and self._active_step != 2)
         self._combo_wb_mode.setVisible(capture and not offline and self._check_wb.isChecked())
         if offline and self._btn_auto.isChecked():
             self._btn_auto.setChecked(False)
@@ -1981,6 +2030,7 @@ class CalibrationPanel(QWidget):
         pair_name: str,
         left: np.ndarray,
         right: np.ndarray,
+        quality=None,
     ) -> tuple[Optional[int], Optional[str]]:
         if self._session is None:
             return None, None
@@ -1991,7 +2041,7 @@ class CalibrationPanel(QWidget):
         token = uuid.uuid4().hex
         self._pending_save_tokens.add(token)
         self._save_sessions[token] = self._session
-        job = (token, pair_name, left.copy(), right.copy(), frame_idx)
+        job = (token, pair_name, left.copy(), right.copy(), quality, frame_idx)
         self._save_jobs[token] = job
         self._save_queue.append(job)
         self._start_next_frame_save()
@@ -2001,7 +2051,7 @@ class CalibrationPanel(QWidget):
     def _start_next_frame_save(self):
         if self._save_workers or not self._save_queue or self._session is None:
             return
-        token, pair_name, left, right, frame_idx = self._save_queue.pop(0)
+        token, pair_name, left, right, quality, frame_idx = self._save_queue.pop(0)
         if token in self._canceled_save_tokens:
             self._pending_save_tokens.discard(token)
             self._canceled_save_tokens.discard(token)
@@ -2018,6 +2068,7 @@ class CalibrationPanel(QWidget):
             right,
             frame_idx,
             parent=self,
+            quality=quality,
         )
         worker.saved.connect(self._on_frame_save_finished)
         worker.failed.connect(self._on_frame_save_failed)
@@ -2041,12 +2092,20 @@ class CalibrationPanel(QWidget):
                     self._log(f"{pair_name}: 撤销图片失败（帧 {frame_idx}）— {exc}")
         elif session is not None and session is self._session:
             self._saved_capture_tokens.add(token)
+            self._set_review_save_state(token, '已保存')
             self._guidance_failed_saves.discard((id(session), pair_name, f'{frame_idx:04d}'))
             self._log(f'{pair_name}: 原图已落盘（帧 {frame_idx}）')
         self._start_next_frame_save()
         self._refresh_disk_hint()
         self._sync_pair_states()
         self._update_capture_stats()
+        self._refresh_preview_pairs()
+
+    def _set_review_save_state(self, token, state):
+        for reviews in self._capture_reviews.values():
+            for review in reviews:
+                if review.save_token == token:
+                    review.save_state = state
 
     @Slot(str, str, int, str)
     def _on_frame_save_failed(self, token: str, pair_name: str, frame_idx: int, reason: str):
@@ -2063,6 +2122,7 @@ class CalibrationPanel(QWidget):
             return
         if job is not None and session is self._session:
             self._failed_save_jobs[token] = (session, job)
+            self._set_review_save_state(token, '保存失败')
         self._log(f"{pair_name}: 保存图片失败（帧 {frame_idx}）— {reason}")
         self._guidance_failed_saves.add((id(session), pair_name, f"{frame_idx:04d}"))
         self._start_next_frame_save()
@@ -2070,6 +2130,7 @@ class CalibrationPanel(QWidget):
         self._refresh_disk_hint()
         self._sync_pair_states()
         self._update_capture_stats()
+        self._refresh_preview_pairs()
 
     def _retry_failed_saves(self):
         if self.has_active_background_tasks():
@@ -2086,8 +2147,12 @@ class CalibrationPanel(QWidget):
         self._start_next_frame_save()
         self._refresh_disk_hint()
         self._sync_pair_states()
+        self._refresh_preview_pairs()
 
     def _undo_apply_entry(self, e: _UndoCaptureEntry) -> None:
+        reviews = self._capture_reviews.get(e.pair_name, [])
+        if reviews:
+            reviews.pop()
         self._failed_save_jobs.pop(e.save_token, None)
         self._saved_capture_tokens.discard(e.save_token)
         if e.session_frame_idx is not None:
@@ -2136,6 +2201,7 @@ class CalibrationPanel(QWidget):
         self._update_capture_stats()
         self._sync_pair_states()
         self._log("已撤销上一帧采集")
+        self._lbl_capture_decision.setText('已撤销上一帧；有效样本及采图引导已重新计算')
         self._refresh_preview_pairs()
         self._refresh_disk_hint()
 
@@ -2194,7 +2260,7 @@ class CalibrationPanel(QWidget):
                 tol_ms = self._sm.sync_tolerance_seconds * 1000.0
                 relaxed_note = (
                     f"{name}: 左右帧未满足严格同步（≤{tol_ms:.0f}ms），"
-                    "已改用各自最新帧；进度仍会累计。"
+                    "已改用各自最新帧；只保留原图，不计有效样本。"
                 )
             left, right = pair_frames
             lid = pair_cfg.left.camera_id
@@ -2215,44 +2281,68 @@ class CalibrationPanel(QWidget):
                 self._fqs[rid] = []
                 self._rebuild_pair_rows()
 
-            det_l = det_r = None
+            try:
+                det_l = self._intr_cals[lid].detector.detect(left)
+                det_r = self._intr_cals[rid].detector.detect(right)
+            except Exception as exc:
+                logger.exception('Raw capture detection failed: pair=%s', name)
+                self._lbl_capture_decision.setText(f'{name} · 拒收 · 原图检测异常：{exc}；未保存')
+                self._log(self._lbl_capture_decision.text())
+                continue
             if automatic:
                 validator = getattr(self, '_capture_validator', None)
                 if validator is None:
+                    self._lbl_capture_decision.setText('拒收 · 自动采集缺少原图验收；未保存')
+                    self._lbl_capture_decision.setToolTip(self._lbl_capture_decision.text())
                     self._log(f'{name}: 自动采集缺少原图验收，已跳过')
                     continue
                 try:
-                    det_l = self._intr_cals[lid].detector.detect(left)
-                    det_r = self._intr_cals[rid].detector.detect(right)
                     accepted, reason = validator(name, left, right, det_l, det_r)
                 except Exception as exc:
                     logger.exception('Automatic raw capture validation failed: pair=%s', name)
+                    self._lbl_capture_decision.setText('拒收 · 原图验收异常；未保存，详见验收详情')
+                    self._lbl_capture_decision.setToolTip(f'{name}: {exc}')
                     self._log(f'{name}: 自动采集原图验收异常 — {exc}；未保存或推进计数')
                     continue
                 if not accepted:
+                    self._lbl_capture_decision.setText(f'{name} · 拒收 · {reason}；未保存、未计入有效样本')
                     self._log(f'{name}: 自动采集原图未通过 — {reason}；未保存或推进计数')
                     continue
-            prepared.append((name, lid, rid, left, right, det_l, det_r, relaxed_note))
+            decision = assess_stereo_capture(
+                self._board, self._camera_model, left, right, det_l, det_r,
+                strict=self._combo_capture_quality.currentData() == 'strict',
+                synchronized=not relaxed_note,
+                expected_size=self._stereo_cals[name]._image_size,
+                previous_common_counts=self._stereo_cals[name].frame_common_corner_counts,
+                expected_intrinsic_sizes=(self._intr_cals[lid]._image_size,
+                                          self._intr_cals[rid]._image_size),
+            )
+            if automatic and not decision.accepted:
+                message = f'{name} · {decision.text()}；未自动保存、未计入有效样本，请调整后重拍'
+                if self._lbl_capture_decision.toolTip() != message:
+                    self._log(message)
+                self._lbl_capture_decision.setText(
+                    f'{decision.state} · 未计入有效样本\n{decision.reasons[0]}（详见验收详情）')
+                self._lbl_capture_decision.setToolTip(message)
+                continue
+            prepared.append((name, lid, rid, left, right, det_l, det_r, relaxed_note, decision))
 
         # Validate the whole batch before queued saves or new observations change readiness.
-        for name, lid, rid, left, right, det_l, det_r, relaxed_note in prepared:
+        for name, lid, rid, left, right, det_l, det_r, relaxed_note, decision in prepared:
             n_ib_l = self._intr_cals[lid].num_frames
             n_ib_r = self._intr_cals[rid].num_frames
             n_sb = self._stereo_cals[name].num_frames
             source_id = (f"{self._next_session_frame_idx:04d}" if self._next_session_frame_idx is not None
                          else str(self._pair_capture_press_count.get(name, 0) + 1))
-            if automatic:
+            if decision.accepted:
                 self._intr_cals[lid].add_detection(det_l, image=left, frame_id=source_id)
                 self._intr_cals[rid].add_detection(det_r, image=right, frame_id=source_id)
-            else:
-                det_l = self._intr_cals[lid].add_frame(left, frame_id=source_id)
-                det_r = self._intr_cals[rid].add_frame(right, frame_id=source_id)
             similar_l = self._intr_cals[lid].find_similar_detection(
                 det_l, exclude_last=self._intr_cals[lid].num_frames > n_ib_l,
-            )
+            ) if decision.accepted else None
             similar_r = self._intr_cals[rid].find_similar_detection(
                 det_r, exclude_last=self._intr_cals[rid].num_frames > n_ib_r,
-            )
+            ) if decision.accepted else None
             if (similar_l is not None and similar_r is not None
                     and self._intr_cals[lid].frame_ids[similar_l]
                     == self._intr_cals[rid].frame_ids[similar_r]):
@@ -2260,7 +2350,8 @@ class CalibrationPanel(QWidget):
                     f"{name}: 重复构图提醒 — 左图近似样本 {similar_l + 1}，"
                     f"右图近似样本 {similar_r + 1}；本次仍保留，建议改变位置、大小或倾角"
                 )
-            self._store_stereo_detection(name, det_l, det_r, source=source_id)
+            if decision.accepted:
+                self._store_stereo_detection(name, det_l, det_r, source=source_id)
             if (self._stereo_cals[name].num_frames > n_sb and
                     self._intr_cals[lid].num_frames > n_ib_l and self._intr_cals[rid].num_frames > n_ib_r):
                 self._live_preview_indices.setdefault(name, []).append((
@@ -2276,13 +2367,40 @@ class CalibrationPanel(QWidget):
             fi = len(self._fqs[lid])
             fq_l = self._assessor.assess_frame(left, det_l.num_corners, fi)
             fq_r = self._assessor.assess_frame(right, det_r.num_corners, fi)
-            self._fqs[lid].append(fq_l)
-            self._fqs[rid].append(fq_r)
+            if decision.accepted:
+                self._fqs[lid].append(fq_l)
+                self._fqs[rid].append(fq_r)
 
             sess_idx = None
             save_token = None
             if self._session:
-                sess_idx, save_token = self._start_frame_save(name, left, right)
+                sess_idx, save_token = self._start_frame_save(name, left, right, quality={
+                    'schema_version': 1, 'board': self._board.to_dict(),
+                    'state': decision.state, 'reasons': list(decision.reasons),
+                    'left_corners': det_l.num_corners, 'right_corners': det_r.num_corners,
+                    'common_corners': decision.common_count,
+                    'policy': self._combo_capture_quality.currentData(),
+                    'camera_model': self._camera_model.value,
+                })
+
+            # Share the already-owned calibration image where accepted; snapshot rejected images too.
+            review_left = (self._intr_cals[lid].stored_images[-1]
+                           if self._intr_cals[lid].num_frames > n_ib_l else left.copy())
+            review_right = (self._intr_cals[rid].stored_images[-1]
+                            if self._intr_cals[rid].num_frames > n_ib_r else right.copy())
+            self._capture_reviews.setdefault(name, []).append(PreviewPair(
+                f'{name} {source_id}', lid, rid, review_left, review_right,
+                deepcopy(det_l), deepcopy(det_r), '采图原图', self._board.num_corners, save_token,
+                save_state='保存中' if save_token else '仅内存原图',
+                quality_state=decision.state, quality_reasons=decision.reasons))
+            self._lbl_capture_decision.setText(
+                f'[{source_id}] {decision.state} · L={det_l.num_corners} / R={det_r.num_corners}'
+                f' · 共同 {decision.common_count}\n'
+                + ('计入有效样本；精度待标定后评估' if decision.accepted else
+                   '未计入有效样本：' + decision.reasons[0]
+                   + f'（共{len(decision.reasons)}项，见验收详情）'))
+            self._lbl_capture_decision.setToolTip(
+                f'{name} [{source_id}] · {decision.text()}\n可查看最近采图原图或撤销；保存状态与验收状态分开显示。')
 
             if relaxed_note:
                 self._log(relaxed_note)
@@ -2296,11 +2414,9 @@ class CalibrationPanel(QWidget):
             self.frame_captured.emit(rid, det_r)
 
             sc = self._stereo_cals[name]
-            ql = "OK" if fq_l.usable else "⚠"
-            qr = "OK" if fq_r.usable else "⚠"
             self._log(
-                f"{name} [{source_id}]: L={det_l.num_corners}[{ql}] "
-                f"R={det_r.num_corners}[{qr}] 帧{sc.num_frames}"
+                f"{name} [{source_id}]: L={det_l.num_corners} "
+                f"R={det_r.num_corners} · {decision.text()} · 有效配对 {sc.num_frames}"
             )
 
             batch_entries.append(
@@ -2324,7 +2440,7 @@ class CalibrationPanel(QWidget):
             return
 
         advanced_guide = False
-        if not self._capture_sequence.finished:
+        if any(entry.pop_stereo for entry in batch_entries) and not self._capture_sequence.finished:
             self._capture_sequence.advance()
             advanced_guide = True
             self._seq_widget.refresh()
@@ -2492,6 +2608,7 @@ class CalibrationPanel(QWidget):
 
     def _reset_offline_pair(self, pair_name: str, lid: str, rid: str, min_f: int):
         self._live_preview_indices.pop(pair_name, None)
+        self._capture_reviews.pop(pair_name, None)
         from ...streaming.stream_manager import CameraConfig, StereoPairConfig
 
         if pair_name in self._sm.stereo_pairs:
@@ -2533,7 +2650,8 @@ class CalibrationPanel(QWidget):
     def select_offline_preview(self, key: str):
         for index, record in enumerate(self._offline_import_records):
             if key == f'offline {record[0]}':
-                self._show_imported_frame(index)
+                self._import_view_idx = index
+                self._update_import_nav_label()
                 break
 
     def _update_import_nav_label(self):
@@ -2590,6 +2708,10 @@ class CalibrationPanel(QWidget):
         mn_st = min(stereo_ns) if stereo_ns else 0
         prefix = '待落盘数据 · 有效配对' if self._pending_save_tokens or self._failed_save_jobs else '有效配对'
         self._lbl_capture_count.setText(f'{prefix} {mn_st} / {min_f}')
+        if mn_st >= min_f:
+            self._lbl_capture_count.setText(
+                f'{prefix} {mn_st} / {min_f} · 已达建议数量，可继续补拍；不代表精度达标')
+        self._lbl_capture_count.setWordWrap(True)
         self._cap_progress.setValue(min(mn_st, min_f))
         self._cap_progress.setVisible(mn_st > 0)
         self._cap_progress.setToolTip(f'采集记录 {mc} · 有效配对 {mn_st} · 目标 {min_f}')
@@ -3169,6 +3291,10 @@ class CalibrationPanel(QWidget):
                 return
             self._aux_saved_count += 1
         self._aux_images.append((rgb_frame.copy(), aux_frame.copy()))
+        self._aux_reviews.append(PreviewPair(
+            f'融合 {idx}', rgb_left_id, aux.camera_id, *self._aux_images[-1],
+            deepcopy(rgb_det), deepcopy(aux_det), '采图原图', board_cfg.cols * board_cfg.rows,
+            save_state='已保存' if self._session is not None else '仅内存原图'))
 
         if rgb_det.valid and aux_det.valid:
             self._invalidate_aux_result()
@@ -3223,6 +3349,7 @@ class CalibrationPanel(QWidget):
         self._invalidate_aux_result()
         self._aux_pairs.clear()
         self._aux_images.clear()
+        self._aux_reviews.clear()
         self._aux_capture_count = 0
         self._aux_saved_count = 0
         self._aux_imported_count = len(img_pairs)
@@ -3231,6 +3358,10 @@ class CalibrationPanel(QWidget):
 
         for key, rgb, aux, rgb_det, aux_det in img_pairs:
             self._aux_images.append((rgb, aux))
+            self._aux_reviews.append(PreviewPair(
+                f'融合 {key}', self._rgb_left_camera_id() or 'RGB_L', self._aux_camera_id(),
+                rgb, aux, deepcopy(rgb_det), deepcopy(aux_det), '导入原图',
+                board_cfg.cols * board_cfg.rows, save_state='源目录原图'))
             if rgb_det.valid and aux_det.valid:
                 self._aux_pairs.append((key, rgb_det, aux_det))
                 self._log(f"  [{key}] RGB_L={rgb_det.num_points} AUX={aux_det.num_points}")
@@ -3744,6 +3875,8 @@ class CalibrationPanel(QWidget):
         self._results_outdated = False
         self._previous_result_directory = None
         self._live_preview_indices.clear()
+        self._capture_reviews.clear()
+        self._aux_reviews.clear()
         self._intr_cals.clear()
         self._intrinsics.clear()
         self._stereo_cals.clear()

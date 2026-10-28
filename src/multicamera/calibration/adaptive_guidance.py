@@ -25,6 +25,13 @@ from .observations import prepare_observation, similar_composition
 
 SCALE_AREA_THRESHOLDS = (.04, .12)
 SCALE_AREA_TARGETS = {'small': .025, 'medium': .07, 'large': .16}
+SCALE_AREA_RANGES = {'small': (.012, .04), 'medium': (.04, .12), 'large': (.12, .45)}
+DISTANCE_LABELS = {'small': '远距离', 'medium': '中距离', 'large': '近距离'}
+# Request budgets bound cold-start stages; they are not verified distance coverage.
+CENTRAL_DISTANCE_PLAN = ('medium',) * 3 + ('large',) * 2 + ('small',) * 2
+DISTANCE_SAMPLE_GOALS = {'medium': 3, 'large': 2, 'small': 2}
+MAX_DISTANCE_REPAIR_REQUESTS = 4
+MAX_DISTANCE_REPAIR_PER_SCALE = 2
 CANDIDATE_IMAGE_MARGIN = .04
 MIN_CORNER_SPACING_PX = 6.
 CANDIDATE_TILT_DEGREES = 25.
@@ -62,6 +69,8 @@ class GuidanceRecommendation:
     pose_available: bool
     sample_count: int
     feasible: bool = True
+    repairing_distance: bool = False
+    missing_distances: tuple[str, ...] = ()
 
 
 @dataclass
@@ -129,7 +138,44 @@ def measure_composition(board, observation):
     geometry = _geometry(board, observation)
     if geometry is None:
         return None
-    return {'center': geometry[2].copy(), 'area': geometry[3]}
+    full_area = _hull_area(np.asarray(board.object_points)[:, :2])
+    fraction = _hull_area(geometry[1][:, :2]) / full_area
+    return {'center': geometry[2].copy(), 'area': geometry[3],
+            'distance_area': geometry[3] / fraction}
+
+
+def distance_feedback(scale, areas):
+    """Both eyes must agree; never average opposing distance instructions."""
+    low, high = SCALE_AREA_RANGES[scale]
+    label = DISTANCE_LABELS[scale]
+    if not areas or not all(np.isfinite(a) and a > 0 for a in areas):
+        return False, f'{label} · 等待双路距离检测'
+    smaller = any(a < low for a in areas)
+    larger = any(a >= high if scale != 'large' else a > high for a in areas)
+    if smaller and larger:
+        action = '双路距离判断冲突，先检查共视和相机配置，不要继续前后移动'
+    elif smaller:
+        action = '向镜头靠近，增大板面；保持当前高度'
+    elif larger:
+        action = '远离镜头，缩小板面；保持当前高度'
+    else:
+        action = '距离到位，保持前后距离'
+    values = ' / '.join(f'{a:.1%}' for a in areas)
+    return not (smaller or larger), f'{label} · {action} · 等效板面占比 {values}；目标 {low:.1%}–{high:.0%}'
+
+
+def evaluate_distance(scale, measurements):
+    """One distance policy for live UI, raw validation, offline replay and coverage."""
+    if not measurements or not all(m.get('valid', m.get('geometry_valid', False))
+                                   for m in measurements):
+        return False, '等待双路距离检测', [], 'unavailable'
+    poses = [m.get('pose') for m in measurements]
+    reliable = all(p is not None and 'distance_area' in p for p in poses)
+    areas = ([p['distance_area'] for p in poses] if reliable else
+             [m.get('distance_area', m.get('area', 0)) for m in measurements])
+    ready, text = distance_feedback(scale, areas)
+    source = 'PnP深度等效' if reliable else '占比近似，非实测距离；先保持板面朝向'
+    return ready, f'{text}（{source}）', areas, 'pnp' if reliable else 'composition'
 
 
 def _valid_intrinsics(intrinsics, size, model):
@@ -196,9 +242,12 @@ def measure_pose(board, observation, intrinsics) -> dict | None:
         if not np.isfinite(rms) or rms > MAX_REPROJECTION_RMS:
             return None
         normal = R[:, 2] * (1 if R[2, 2] > 0 else -1)
+        depth = float(np.mean(transformed[:, 2]))
+        frontal_area = (_hull_area(all_points[:, :2]) * K[0, 0] * K[1, 1]
+                        / (np.prod(clean.image_size) * depth ** 2))
         return dict(yaw=float(np.degrees(np.arctan2(normal[0], normal[2]))),
                     pitch=float(np.degrees(np.arctan2(normal[1], normal[2]))),
-                    depth=float(np.mean(transformed[:, 2])), area=area, center=center)
+                    depth=depth, area=area, center=center, distance_area=float(frontal_area))
     except (ValueError, TypeError, cv2.error):
         return None
 
@@ -373,22 +422,39 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         target = candidates[0]
     pose_available = len(intrinsics) == 2
     verified = 0
+    paired_distances = Counter()
+    repair_requests = Counter()
+    repairing_distance = False
     requests, zone_requests, tilt_requests = Counter(), Counter(), Counter()
     for count, pair in enumerate(unique, 1):
+        previous_target = target
+        if repairing_distance:
+            repair_requests[target[3]] += 1
         requests[target] += 1
         zone_requests[target[:2]] += 1
         tilt_requests[target[2]] += 1
         poses = [measure_pose(board, g[0], intrinsics.get(camera))
                  for camera, g in zip(cameras, pair)]
         verified += int(all(p is not None for p in poses))
+        pair_scales = []
+        pair_areas = []
+        # Do not mix one camera's PnP with the other camera's fallback scale.
+        reliable_distance = all(p is not None and 'distance_area' in p for p in poses)
         for i, g in enumerate(pair):
-            zone, scale = _zone(g[2]), _scale(g[3])
+            fraction = _hull_area(g[1][:, :2]) / _hull_area(np.asarray(board.object_points)[:, :2])
+            distance_area = (poses[i]['distance_area'] if reliable_distance else g[3] / fraction)
+            zone, scale = _zone(g[2]), _scale(distance_area)
+            pair_scales.append(scale)
+            pair_areas.append(distance_area)
             zones[i][zone] += 1
             scales[i][scale] += 1
             if poses[i] is not None:
                 tilt = _tilt(poses[i])
                 tilts[i][tilt] += 1
                 joint[(*zone, tilt, scale)] += 1
+        if (pair_scales[0] == pair_scales[1]
+                and distance_feedback(pair_scales[0], pair_areas)[0]):
+            paired_distances[pair_scales[0]] += 1
         def score(candidate):
             r, c, t, s = candidate
             coverage = sum(sc[s] + .7 * ti[t]
@@ -403,14 +469,34 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         if alternatives:
             available_zones = {c[:2] for c in alternatives}
             remaining = [z for z in zone_order if z in available_zones
-                         and zone_requests[z] < (6 if z == (1, 1) else 2)]
+                         and zone_requests[z] < (len(CENTRAL_DISTANCE_PLAN) if z == (1, 1) else 2)]
             if remaining:
                 zone = remaining[0]
             else:
                 active_row = target[0]
                 zone = min(available_zones, key=lambda z: (
                     sum(hist[z] for hist in zones), abs(z[0] - active_row), zone_order.index(z)))
-            target = min((c for c in alternatives if c[:2] == zone), key=score)
+            local = [c for c in alternatives if c[:2] == zone]
+            if zone == (1, 1) and zone_requests[zone] < len(CENTRAL_DISTANCE_PLAN):
+                desired = CENTRAL_DISTANCE_PLAN[zone_requests[zone]]
+                at_distance = [c for c in local if c[3] == desired]
+                if at_distance:
+                    local = at_distance
+            target = min(local, key=score)
+        repairing_distance = False
+        if (zone_requests[(1, 1)] >= len(CENTRAL_DISTANCE_PLAN)
+                and sum(repair_requests.values()) < MAX_DISTANCE_REPAIR_REQUESTS):
+            missing = [s for s in ('large', 'small', 'medium')
+                       if paired_distances[s] < DISTANCE_SAMPLE_GOALS[s]]
+            repair_candidates = [c for c in candidates if c[:2] == (1, 1)
+                                 and c[3] in missing and c != previous_target
+                                 and repair_requests[c[3]] < MAX_DISTANCE_REPAIR_PER_SCALE]
+            if repair_candidates:
+                # Group distance moves, but cap ignored gaps; vary tilt within a group.
+                target = min(repair_candidates, key=lambda c: (
+                    missing.index(c[3]), paired_distances[c[3]] / DISTANCE_SAMPLE_GOALS[c[3]],
+                    score(c)))
+                repairing_distance = True
     row, col, tilt, scale = target
     tilt_text = {'front': '正对', 'left': '左边近倾斜', 'right': '右边近倾斜',
                  'up': '上边近倾斜', 'down': '下边近倾斜'}[tilt]
@@ -418,11 +504,31 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     region = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))[row][col]
     status = '已有内参支持，倾角可估计' if pose_available else '冷启动：倾角未验证'
     shortage = '区域观测不足' if min(z[row, col] for z in zones) == 0 else '已有观测，补足姿态组合'
-    reason = f'{region}{shortage}；补充{tilt_text}、{scale_text}画面占比。{status}。'
+    reason = (f'{region}{shortage}；补充{tilt_text}、{scale_text}画面占比'
+              f'（{DISTANCE_LABELS[scale]}）。{status}。')
+    if repairing_distance:
+        reason = '距离缺口补采：' + reason
     if not candidates:
         reason = f'当前分辨率下构图难以兼顾边距和角点间距；请调整分辨率或标定板。{status}。'
+    distances = ' / '.join(f'{DISTANCE_LABELS[s]} {paired_distances[s]}'
+                           for s in ('large', 'medium', 'small'))
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
-               '同高度先变姿态；已建议不计姿态覆盖。'
+               '中央中→近→远，再同高度补边缘；已建议不计姿态或距离覆盖。'
+               f'双路同档距离样本：{distances}。'
                '构图仅为几何近似，不保证双目共视；不代表标定完成或全局最优。')
-    rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique), bool(candidates))
+    unavailable = [s for s in _SCALES if not any(c[:2] == (1, 1) and c[3] == s for c in candidates)]
+    if unavailable:
+        summary += ' 当前分辨率下受限：' + '、'.join(DISTANCE_LABELS[s] for s in unavailable) + '；不计为已完成。'
+    missing = tuple(s for s in ('large', 'medium', 'small')
+                    if paired_distances[s] < DISTANCE_SAMPLE_GOALS[s])
+    if missing:
+        summary += ' 距离待补：' + '、'.join(DISTANCE_LABELS[s] for s in missing) + '。'
+        feasible_missing = [s for s in missing if s not in unavailable]
+        exhausted = (sum(repair_requests.values()) >= MAX_DISTANCE_REPAIR_REQUESTS
+                     or (feasible_missing and all(repair_requests[s] >= MAX_DISTANCE_REPAIR_PER_SCALE
+                                                 for s in feasible_missing)))
+        if exhausted:
+            summary += '本轮补采建议已达上限，先完成分区；缺口未清零，不代表距离采集完成。'
+    rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique),
+                                 bool(candidates), repairing_distance, missing)
     return GuidanceAnalysis(rec, intrinsics, summary)
