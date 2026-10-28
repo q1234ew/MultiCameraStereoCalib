@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import copy
 import math
+import logging
 
 import cv2
 import numpy as np
@@ -16,10 +17,13 @@ from PySide6.QtWidgets import (
 
 from ...calibration.models import CameraModel
 from ...calibration.adaptive_guidance import GuidanceObservation, measure_pose, measure_composition
+from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
 from ..theme import ACCENT, BORDER, SUCCESS, TEXT_DIM, WARNING, app_icon
 from .capture_guide import BoardTilt, TILT_LABELS, CaptureTarget, CaptureSequence
 from .stereo_schematic import StereoSchematic, TILT_ACTIONS
+
+logger = logging.getLogger(__name__)
 
 
 class StereoCaptureWorkspace(QWidget):
@@ -194,7 +198,7 @@ class StereoCaptureWorkspace(QWidget):
     @Slot(object, object, str)
     def _guidance_completed(self, key, result, error):
         self._guidance_worker = None
-        current_key, _ = self._guidance_context()
+        current_key, context = self._guidance_context()
         if current_key == key:
             self._analysis, self._analysis_key = result, key
             self._guidance_error = error
@@ -204,6 +208,10 @@ class StereoCaptureWorkspace(QWidget):
                 self._adaptive_sequence = CaptureSequence([
                     CaptureTarget(rec.zone_row, rec.zone_col, tilts[rec.tilt], scale=rec.scale),
                 ])
+                logger.info('Capture guidance updated: pair=%s samples=%s target=%s/%s/%s/%s '
+                            'pose_available=%s feasible=%s', context[0], rec.sample_count,
+                            rec.zone_row, rec.zone_col, rec.tilt, rec.scale,
+                            rec.pose_available, rec.feasible)
         self.refresh()
 
     def _target(self):
@@ -242,7 +250,8 @@ class StereoCaptureWorkspace(QWidget):
             return False, '位置待对齐'
         low, high = {'small': (.012, .04), 'medium': (.04, .12), 'large': (.12, .45)}[target.scale]
         if not all(low <= s.get('area', 0) <= high for s in samples):
-            return False, '画面占比待调整'
+            values = ' / '.join(f'{s.get("area", 0):.1%}' for s in samples)
+            return False, f'板点占比 {values}；目标 {low:.1%}–{high:.0%}'
         poses = [self._pose_measurement(camera.camera_id, sample)
                  for pair, offset in zip(pairs, range(0, len(samples), 2))
                  for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
@@ -259,7 +268,10 @@ class StereoCaptureWorkspace(QWidget):
                 BoardTilt.TILT_DOWN: (pitch, yaw, 1),
             }[target.tilt]
             return 15 <= sign * primary <= 40 and abs(secondary) < 20
-        return (True, '姿态接近建议范围') if all(matches(p) for p in poses) else (False, '倾角或方向待调整')
+        if all(matches(p) for p in poses):
+            return True, '姿态接近建议范围'
+        angles = ' / '.join(f'左右 {p["yaw"]:+.0f}°、上下 {p["pitch"]:+.0f}°' for p in poses)
+        return False, f'倾角待调整：{angles}；倾斜目标15–40°，正面小于15°'
 
     def _select_pair(self, text):
         if text:
@@ -306,8 +318,6 @@ class StereoCaptureWorkspace(QWidget):
                         anchor, since, count = old, previous['stable_since'], previous['stable_count'] + 1
             sample.update(anchor=anchor, stable_since=since, stable_count=count,
                           stable=count >= self.MIN_STABLE_SAMPLES and now - since >= self.MIN_STABLE_SECONDS)
-            cal = self.panel._intr_cals.get(camera_id)
-            sample['similar'] = cal.find_similar_detection(detection) if cal is not None else None
         self.samples[camera_id] = sample
         self.refresh()
 
@@ -349,6 +359,28 @@ class StereoCaptureWorkspace(QWidget):
                 samples.append(sample)
         return pairs, samples
 
+    def _duplicate_source(self, pair, detections):
+        if not all(d is not None and d.valid for d in detections):
+            return None
+        cals = [self.panel._intr_cals.get(c.camera_id) for c in (pair.left, pair.right)]
+        if any(c is None for c in cals):
+            return None
+        for li, ri, source in reversed(self.panel._live_preview_indices.get(pair.name, [])):
+            if (id(self.panel._session), pair.name, str(source)) in self.panel._guidance_failed_saves:
+                continue
+            if any(i >= cal.num_frames for i, cal in zip((li, ri), cals)):
+                continue
+            if all(similar_composition(cal._all_corners[i], cal._all_ids[i], cal._image_size,
+                                       d.charuco_corners, d.charuco_ids, d.image_size)
+                   for i, cal, d in zip((li, ri), cals, detections)):
+                return str(source)
+        return None
+
+    def _duplicate_matches(self, pairs, samples):
+        return [(pair.name, source) for offset, pair in enumerate(pairs)
+                if len(samples) >= 2 * offset + 2 and (source := self._duplicate_source(
+                    pair, [s['detection'] for s in samples[2 * offset:2 * offset + 2]])) is not None]
+
     def auto_ready(self):
         if (self.panel._pending_save_tokens or self.panel._failed_save_jobs or self.panel._save_workers
                 or self.panel._save_queue or self.panel._model_worker or self.panel._calib_worker
@@ -366,7 +398,7 @@ class StereoCaptureWorkspace(QWidget):
                     and self._guidance_worker is None
                     and all(s['valid'] and s.get('sharp') and s.get('stable') for s in samples)
                     and self._adaptive_aligned(pairs, samples, target)[0]
-                    and not all(s.get('similar') is not None for s in samples)
+                    and not self._duplicate_matches(pairs, samples)
                     and all(self.panel._sm.get_sync_pair(name) is not None
                             for name in self.panel._selected_pairs())
                 )
@@ -416,17 +448,16 @@ class StereoCaptureWorkspace(QWidget):
         elif not target or target.tilt != BoardTilt.FRONT or not all(
                 np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16 for s in samples):
             return False, '原图位置偏离建议区域'
-        duplicate = []
         for camera, detection in zip((pair.left, pair.right), (det_left, det_right)):
             cal = self.panel._intr_cals.get(camera.camera_id)
             if cal is not None and cal._image_size not in (None, detection.image_size):
                 return False, '原图分辨率与已采数据不一致'
-            duplicate.append(cal is not None and cal.find_similar_detection(detection) is not None)
         stereo = self.panel._stereo_cals.get(name)
         if stereo is not None and stereo._image_size not in (None, det_left.image_size):
             return False, '原图分辨率与双目观测不一致'
-        if all(duplicate):
-            return False, '原图接近已有构图，请改变位置、大小或倾角'
+        source = self._duplicate_source(pair, (det_left, det_right))
+        if source is not None:
+            return False, f'原图接近已采配对 {source}，请改变位置、大小或倾角'
         return True, ''
 
     def _pose_text(self, camera_id, sample):
@@ -520,6 +551,8 @@ class StereoCaptureWorkspace(QWidget):
         aligned = bool(visible and target) and all(
             np.linalg.norm(s["center"] - (target.norm_cx, target.norm_cy)) < .16 for s in samples
         )
+        if using_adaptive and aligned and not self.view.review_key:
+            self.instruction.setText(self.instruction.text().replace('移至', '保持在'))
         self.status.setText(
             "基础画面检查（不含姿态）\n\n"
             f"双路可见：{'已检测' if visible else '等待检测'}\n"
@@ -538,9 +571,11 @@ class StereoCaptureWorkspace(QWidget):
             self.pose_status.setText(message)
             self.pose_status.setStyleSheet(f'color:{SUCCESS if reached else WARNING};')
             self.pose_status.setToolTip('经验验收范围，不代表精度合格；双路位置、角点凸包占比及倾角共同检查')
-        duplicate = visible and all(s.get('similar') is not None for s in samples)
+        matches = self._duplicate_matches(pairs, samples) if visible else []
+        duplicate = bool(matches)
         self.advice.setText(
-            "重复构图提醒：当前双路画面接近已有样本，建议改变位置、大小或倾角"
+            '近似已采配对：' + '、'.join(f'{name} {source}' for name, source in matches)
+            + '；建议明显改变倾角或占比，手动采集仍可保留'
             if duplicate else "姿态分布尚未自动评估；建议补拍不同位置、大小和倾角"
         )
         if using_adaptive and not duplicate:

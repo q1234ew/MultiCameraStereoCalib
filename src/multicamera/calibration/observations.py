@@ -8,6 +8,23 @@ from ..board.charuco_board import CharucoBoard
 from ..board.detector import DetectionResult
 
 
+def similar_composition(corners_a, ids_a, size_a, corners_b, ids_b, size_b):
+    """Require sub-board-scale displacement, not merely a small image displacement."""
+    if tuple(size_a) != tuple(size_b):
+        return False
+    _, a, b = np.intersect1d(np.asarray(ids_a).ravel(), np.asarray(ids_b).ravel(),
+                            return_indices=True)
+    if len(a) < max(6, .6 * max(len(ids_a), len(ids_b))):
+        return False
+    pa, pb = np.asarray(corners_a).reshape(-1, 2)[a], np.asarray(corners_b).reshape(-1, 2)[b]
+    if not np.isfinite(pa).all() or not np.isfinite(pb).all():
+        return False
+    footprint = min(np.linalg.norm(np.ptp(pa, axis=0)), np.linalg.norm(np.ptp(pb, axis=0)))
+    threshold = min(.005 * max(size_a), .006 * footprint)
+    rms = np.sqrt(np.mean(np.sum((pa - pb) ** 2, axis=1)))
+    return bool(threshold > 0 and rms < threshold)
+
+
 def prepare_observation(
     detection: DetectionResult,
     board: CharucoBoard,

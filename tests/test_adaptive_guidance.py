@@ -205,7 +205,9 @@ def test_both_cameras_affect_shortages(board):
     assert ag._zone(ga[1][2]) != ag._zone(gb[1][2])
     assert ag._scale(ga[1][3]) != ag._scale(gb[1][3])
     ra, rb = analyze(board, a).recommendation, analyze(board, b).recommendation
-    assert (ra.zone_row, ra.zone_col) != (rb.zone_row, rb.zone_col)
+    # Bootstrap keeps the same physical height; the second eye still changes target size.
+    assert (ra.zone_row, ra.zone_col) == (rb.zone_row, rb.zone_col) == (1, 1)
+    assert ra.scale != rb.scale
     # Swap roles: a symmetric aggregate must give the same next target.
     swapped = {'L': b['R'], 'R': b['L']}
     assert analyze(board, b).recommendation == analyze(board, swapped).recommendation
@@ -373,13 +375,13 @@ def test_corner_footprint_reduces_size(board, tilt):
     assert ag._candidate_feasible(board, (1, 1, tilt, 'large'), sizes)
 
 
-def test_actual_corner_recommendation_uses_small_area(board):
+def test_bootstrap_keeps_center_before_requesting_corner_coverage(board):
     result = analyze(board, paired(board))
     rec = result.recommendation
-    assert (rec.zone_row, rec.zone_col) == (0, 0)
-    assert rec.scale == 'small'
-    assert '左上区域观测不足' in rec.reason
-    assert '小画面占比' in rec.reason and '冷启动' in rec.reason
+    assert (rec.zone_row, rec.zone_col) == (1, 1)
+    assert rec.scale == 'medium'
+    assert '中央已有观测' in rec.reason
+    assert '中画面占比' in rec.reason and '冷启动' in rec.reason
     assert len(rec.reason) < 65
     assert '几何近似' in result.summary and '不保证双目共视' in result.summary
 

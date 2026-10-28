@@ -20,7 +20,7 @@ import numpy as np
 from ..board.detector import DetectionResult
 from .intrinsic import IntrinsicCalibrator
 from .models import CameraIntrinsics, CameraModel
-from .observations import prepare_observation
+from .observations import prepare_observation, similar_composition
 
 
 SCALE_AREA_THRESHOLDS = (.04, .12)
@@ -35,7 +35,6 @@ MAX_REPROJECTION_RMS = 3.
 BOOTSTRAP_MIN_VIEWS = 6
 BOOTSTRAP_MAX_VIEWS = 30
 BOOTSTRAP_MAX_RMS = 2.5
-DUPLICATE_RMS_FRACTION = .005
 _TILTS = ('front', 'left', 'right', 'up', 'down')
 _SCALES = ('medium', 'small', 'large')
 
@@ -205,13 +204,7 @@ def measure_pose(board, observation, intrinsics) -> dict | None:
 
 
 def _similar(a, b):
-    if a.image_size != b.image_size:
-        return False
-    _, ia, ib = np.intersect1d(a.ids.ravel(), b.ids.ravel(), return_indices=True)
-    if len(ia) < max(6, .6 * max(len(a.ids), len(b.ids))):
-        return False
-    delta = a.corners.reshape(-1, 2)[ia] - b.corners.reshape(-1, 2)[ib]
-    return np.sqrt(np.mean(np.sum(delta ** 2, axis=1))) / max(a.image_size) < DUPLICATE_RMS_FRACTION
+    return similar_composition(a.corners, a.ids, a.image_size, b.corners, b.ids, b.image_size)
 
 
 def _bootstrap(board, model, geometries):
@@ -363,7 +356,8 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             if estimate is not None:
                 intrinsics[camera] = estimate
     zones, scales, tilts, joint = [Counter(), Counter()], [Counter(), Counter()], [Counter(), Counter()], Counter()
-    zone_order = [(1, 1), (0, 0), (0, 2), (2, 0), (2, 2), (0, 1), (1, 0), (1, 2), (2, 1)]
+    # Group heights: centre, middle row, upper row, lower row. No alternating corners.
+    zone_order = [(1, 1), (1, 0), (1, 2), (0, 2), (0, 1), (0, 0), (2, 0), (2, 1), (2, 2)]
     image_sizes = []
     for i, camera in enumerate(cameras):
         if unique:
@@ -379,7 +373,11 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         target = candidates[0]
     pose_available = len(intrinsics) == 2
     verified = 0
+    requests, zone_requests, tilt_requests = Counter(), Counter(), Counter()
     for count, pair in enumerate(unique, 1):
+        requests[target] += 1
+        zone_requests[target[:2]] += 1
+        tilt_requests[target[2]] += 1
         poses = [measure_pose(board, g[0], intrinsics.get(camera))
                  for camera, g in zip(cameras, pair)]
         verified += int(all(p is not None for p in poses))
@@ -393,14 +391,26 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                 joint[(*zone, tilt, scale)] += 1
         def score(candidate):
             r, c, t, s = candidate
-            coverage = sum(3 * z[r, c] + sc[s] + .7 * ti[t]
+            coverage = sum(sc[s] + .7 * ti[t]
                            for z, sc, ti in zip(zones, scales, tilts))
-            # Unverified poses receive no pose credit; cycle explicit bootstrap requests.
             provisional = 0 if pose_available or t == _TILTS[count % len(_TILTS)] else 2
-            return coverage + .7 * joint[candidate] + provisional
+            local_tilt_requests = sum(n for (rr, cc, tt, ss), n in requests.items()
+                                      if (rr, cc, tt) == (r, c, t))
+            # Requests guide scheduling only: they never count as verified pose coverage.
+            return (coverage + .7 * joint[candidate] + provisional
+                    + 3 * local_tilt_requests + 1.5 * tilt_requests[t] + .5 * requests[candidate])
         alternatives = [c for c in candidates if c != target]
         if alternatives:
-            target = min(alternatives, key=score)
+            available_zones = {c[:2] for c in alternatives}
+            remaining = [z for z in zone_order if z in available_zones
+                         and zone_requests[z] < (6 if z == (1, 1) else 2)]
+            if remaining:
+                zone = remaining[0]
+            else:
+                active_row = target[0]
+                zone = min(available_zones, key=lambda z: (
+                    sum(hist[z] for hist in zones), abs(z[0] - active_row), zone_order.index(z)))
+            target = min((c for c in alternatives if c[:2] == zone), key=score)
     row, col, tilt, scale = target
     tilt_text = {'front': '正对', 'left': '左边近倾斜', 'right': '右边近倾斜',
                  'up': '上边近倾斜', 'down': '下边近倾斜'}[tilt]
@@ -412,6 +422,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     if not candidates:
         reason = f'当前分辨率下构图难以兼顾边距和角点间距；请调整分辨率或标定板。{status}。'
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
+               '同高度先变姿态；已建议不计姿态覆盖。'
                '构图仅为几何近似，不保证双目共视；不代表标定完成或全局最优。')
     rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique), bool(candidates))
     return GuidanceAnalysis(rec, intrinsics, summary)

@@ -18,7 +18,7 @@ def _measurement(board, observation, intrinsics):
     if geometry is None:
         return {'geometry_valid': False, 'pose': None}
     clean = geometry[0]
-    center = clean.corners.reshape(-1, 2).mean(axis=0) / clean.image_size
+    center = geometry[2]
     pose = measure_pose(board, clean, intrinsics)
     if pose is not None:
         pose = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in pose.items()}

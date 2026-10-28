@@ -2253,7 +2253,9 @@ class CalibrationPanel(QWidget):
             similar_r = self._intr_cals[rid].find_similar_detection(
                 det_r, exclude_last=self._intr_cals[rid].num_frames > n_ib_r,
             )
-            if similar_l is not None and similar_r is not None:
+            if (similar_l is not None and similar_r is not None
+                    and self._intr_cals[lid].frame_ids[similar_l]
+                    == self._intr_cals[rid].frame_ids[similar_r]):
                 self._log(
                     f"{name}: 重复构图提醒 — 左图近似样本 {similar_l + 1}，"
                     f"右图近似样本 {similar_r + 1}；本次仍保留，建议改变位置、大小或倾角"

@@ -12,7 +12,7 @@ from ..board.charuco_board import CharucoBoard
 from ..board.detector import CharucoDetector, DetectionResult
 from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel
-from .observations import prepare_observation
+from .observations import prepare_observation, similar_composition
 
 logger = logging.getLogger(__name__)
 
@@ -312,16 +312,10 @@ class IntrinsicCalibrator:
         if not detection.valid or detection.image_size != self._image_size:
             return None
         stop = self.num_frames - int(exclude_last)
-        ids = detection.charuco_ids.ravel()
-        points = detection.charuco_corners.reshape(-1, 2)
         for index in range(stop - 1, max(-1, stop - 51), -1):
-            old_ids = self._all_ids[index].ravel()
-            common, old_idx, new_idx = np.intersect1d(old_ids, ids, return_indices=True)
-            if len(common) < max(6, .6 * max(len(ids), len(old_ids))):
-                continue
-            delta = self._all_corners[index].reshape(-1, 2)[old_idx] - points[new_idx]
-            rms = np.sqrt(np.mean(np.sum(delta ** 2, axis=1))) / max(detection.image_size)
-            if np.isfinite(rms) and rms < .01:
+            if similar_composition(
+                    self._all_corners[index], self._all_ids[index], self._image_size,
+                    detection.charuco_corners, detection.charuco_ids, detection.image_size):
                 return index
         return None
 
