@@ -357,7 +357,7 @@ def app_stylesheet() -> str:
         padding: 4px 8px;
     }}
     QTableWidget::item:selected {{
-        background: {ACCENT};
+        background: {PRIMARY};
         color: white;
     }}
     /* Tables embed scrollbars — slightly brighter track/handle than global bars */

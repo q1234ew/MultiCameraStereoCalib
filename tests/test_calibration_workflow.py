@@ -189,7 +189,8 @@ def test_repeat_partial_export_never_exposes_previous_format_as_current(window, 
     assert (current / 'rig.json').is_file()
     assert (current / 'rig_opencv_standard.yml').is_file()
     assert '部分格式未生成' in panel._lbl_result_storage.text()
-    assert str(current.resolve()) in panel._lbl_result_storage.text()
+    assert str(current.resolve()) in panel._lbl_result_storage.toolTip()
+    assert str(old.resolve()) not in panel._lbl_result_storage.toolTip()
     assert panel._btn_open_results.isEnabled() and panel._btn_copy_results.isEnabled()
 
 
@@ -435,4 +436,5 @@ def test_long_result_text_wraps_without_clipping_or_horizontal_scroll(window, ri
         assert label.isVisible()
         assert label.hasHeightForWidth()
         assert label.height() >= label.heightForWidth(label.width())
-    assert str(long_directory) in panel._lbl_result_storage.text()
+    assert str(long_directory.resolve()) in panel._lbl_result_storage.toolTip()
+    assert str(long_directory) not in panel._lbl_result_storage.text()

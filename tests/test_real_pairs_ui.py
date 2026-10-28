@@ -105,6 +105,10 @@ def test_real_pairs_import_review_calibrate_export(app, monkeypatch, tmp_path):
         assert win._stream_view.review_key
         selected_index = panel._import_view_idx
         assert win._stream_view.review_key == f'offline {panel._offline_import_records[selected_index][0]}'
+        summary = win._stereo_capture.compact_summary.text()
+        assert '导入原图' in summary
+        for label, detection in zip(('左目', '右目'), panel._offline_review_detections(selected_index)):
+            assert f'{label} {detection.num_corners}/{win._board.num_corners}' in summary
         shot('03-review')
         win._btn_end_review.click()
         panel._btn_swap_offline.click()

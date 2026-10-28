@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QTimer, Signal, Slot, QRectF
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal, Slot, QRectF
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -188,7 +188,7 @@ class _PreviewLabel(QLabel):
     """
 
     def minimumSizeHint(self) -> QSize:
-        return QSize(160, 120)
+        return QSize(160, 1)
 
     def sizeHint(self) -> QSize:
         return QSize(320, 240)
@@ -271,7 +271,8 @@ class CameraView(QFrame):
         self._image_label = _PreviewLabel()
         self._image_label.setAlignment(Qt.AlignCenter)
         self._image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._image_label.setMinimumSize(160, 120)
+        self._image_label.setMinimumSize(160, 1)
+        self._image_label.installEventFilter(self)
         self._image_label.setStyleSheet(
             f"background: {BG_DARK}; border-radius: 4px;"
         )
@@ -289,7 +290,16 @@ class CameraView(QFrame):
             f" background: transparent;"
         )
         self._info.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._info.installEventFilter(self)
         layout.addWidget(self._info)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Resize:
+            if watched is self._image_label:
+                self._render_cached_frame()
+            elif watched is self._info:
+                self._info.setMinimumHeight(max(24, self._info.heightForWidth(event.size().width())))
+        return super().eventFilter(watched, event)
 
     def set_expanded_mode(self, expanded: bool):
         """标题提示：放大模式下再次点击可恢复并排。"""
@@ -360,6 +370,8 @@ class CameraView(QFrame):
 
     def update_info(self, text: str):
         self._info.setText(text)
+        self._info.setToolTip(text)
+        self._info.setMinimumHeight(max(24, self._info.heightForWidth(self._info.width())))
         color = DANGER if "无法连接" in text or "失败" in text else TEXT_DIM
         if color != self._info_color:
             self._info_color = color
@@ -606,18 +618,20 @@ class MultiStreamView(QWidget):
         self._relayout()
         self.review_changed.emit(key, True)
 
-    def _cancel_review(self):
+    def _cancel_review(self, *, notify=True):
         self._review_images = None
         self._review_key = ""
-        self.review_changed.emit("", False)
+        if notify:
+            self.review_changed.emit("", False)
 
     def end_review(self):
         if self._review_images is None:
             return
-        self._cancel_review()
+        self._cancel_review(notify=False)
         self._last_render_ts.clear()
         self._last_detect_ts.clear()
         self.set_multimodal_mode(self._multimodal_mode, self._rgb_left_id, force_refresh=True)
+        self.review_changed.emit("", False)
 
     def close_preview(self, camera_id: str):
         if camera_id not in self._views:

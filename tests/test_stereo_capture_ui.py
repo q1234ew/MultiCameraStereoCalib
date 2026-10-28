@@ -7,13 +7,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest
 
 from multicamera.board.detector import DetectionResult
 from multicamera.calibration.models import CameraIntrinsics
 from multicamera.streaming.stream_manager import FrameEntry
 from multicamera.ui import main_window
 from multicamera.ui.theme import configure_application_style
+from multicamera.ui.widgets.pair_gallery import PreviewPair
 from test_multimodal_preview import LEFT, RIGHT, configure
 
 
@@ -102,6 +104,7 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
         for cid in (LEFT, RIGHT):
             win._stream_view._on_frame(cid, frame, time.time())
         app.processEvents()
+        app.processEvents()
         button = panel._btn_capture
         assert button.isVisible()
         for control in (button, panel._btn_import, panel._btn_to_calibration, panel._btn_undo):
@@ -110,6 +113,20 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
             assert control.height() >= control.minimumSizeHint().height()
         assert guide.instruction.height() >= guide.instruction.fontMetrics().height()
         assert win._preview_scroll.horizontalScrollBar().maximum() == 0
+        assert win._preview_scroll.verticalScrollBar().maximum() == 0
+        assert win._guide_scroll.horizontalScrollBar().maximum() == 0
+        viewport = win._preview_scroll.viewport()
+        for tile in win._stream_view._views.values():
+            if tile.isVisible():
+                assert viewport.rect().contains(tile.mapTo(viewport, tile.rect().topLeft()))
+                assert viewport.rect().contains(tile.mapTo(viewport, tile.rect().bottomRight()))
+                assert tile._image_label.geometry().bottom() < tile._info.geometry().top()
+                pixmap = tile._image_label.pixmap()
+                if pixmap is not None and not pixmap.isNull():
+                    assert pixmap.height() <= tile._image_label.height()
+                    assert pixmap.width() <= tile._image_label.width()
+        assert win._capture_bottom.height() <= (
+            win._gallery.height() + panel._action_footer.height() + 12)
         if width == 1280:
             viewport = win._preview_scroll.viewport()
             canvas = guide.schematic.canvas
@@ -121,10 +138,73 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
     guide.refresh()
     guide.schematic.pause.setChecked(True)
     guide.schematic.progress = .65
-    win._preview_scroll.ensureWidgetVisible(guide.schematic.canvas)
+    win._guide_scroll.ensureWidgetVisible(guide.schematic.canvas)
     app.processEvents()
     assert '右边缘靠近镜头' in guide.instruction.text()
     win.grab().save(str(directory / 'stereo-capture-motion-scrolled.png'))
+
+
+def test_gallery_and_logs_keep_preview_visible_and_restore_inline(stereo_bench, app, tmp_path):
+    win = stereo_bench
+    _, frame, _ = sample(win)
+    pairs = [PreviewPair(f'rgb {i:04d}', LEFT, RIGHT, frame, frame) for i in range(4)]
+    win._on_preview_pairs_changed(pairs)
+    for cid in (LEFT, RIGHT):
+        win._stream_view._on_frame(cid, frame, time.time())
+    directory = Path(os.environ.get('MULTICAMERA_UI_QA_DIR', tmp_path))
+    directory.mkdir(parents=True, exist_ok=True)
+    win._gallery._toggle.setChecked(True)
+    win._toggle_logs.setChecked(True)
+    for size in ((1000, 680), (1280, 800), (1440, 1024), (1000, 680)):
+        win.resize(*size)
+        app.processEvents()
+        app.processEvents()
+        assert win._preview_scroll.verticalScrollBar().maximum() == 0
+        viewport = win._preview_scroll.viewport()
+        for cid in (LEFT, RIGHT):
+            tile = win._stream_view._views[cid]
+            assert viewport.rect().contains(tile.mapTo(viewport, tile.rect().bottomRight()))
+        assert win._calib_panel._footer_info.parentWidget().rect().contains(
+            win._calib_panel._footer_info.geometry())
+        for key, widget in (('gallery', win._gallery._body), ('logs', win._logs_widget)):
+            dialog = win._aux_panel_dialogs[key]
+            assert dialog.isVisible() == (size[1] < 900)
+            assert widget.isVisible()
+            if size[1] < 900:
+                assert widget.parentWidget() is dialog
+                dialog.grab().save(str(directory / f'{key}-tool-{size[0]}.png'))
+        win.grab().save(str(directory / f'capture-panels-{size[0]}.png'))
+    QTest.keyClick(win._aux_panel_dialogs['gallery'], Qt.Key_Escape)
+    assert not win._gallery._toggle.isChecked()
+    assert win._toggle_logs.isChecked()
+    win._gallery._toggle.setChecked(True)
+    assert win._aux_panel_dialogs['gallery'].isVisible()
+    assert len(win._gallery._pairs) == 4
+    win._aux_panel_dialogs['logs'].close()
+    assert not win._toggle_logs.isChecked()
+
+
+def test_expanded_schematic_fits_sidebar_without_horizontal_scroll(stereo_bench, app, tmp_path):
+    win = stereo_bench
+    guide = win._stereo_capture
+    directory = Path(os.environ.get('MULTICAMERA_UI_QA_DIR', tmp_path))
+    directory.mkdir(parents=True, exist_ok=True)
+    for size in ((1000, 680), (1280, 800), (1440, 1024)):
+        win.resize(*size)
+        guide.schematic.expand.setChecked(True)
+        app.processEvents()
+        app.processEvents()
+        assert win._guide_scroll.horizontalScrollBar().maximum() == 0
+        win._guide_scroll.ensureWidgetVisible(guide.schematic.expand)
+        app.processEvents()
+        viewport = win._guide_scroll.viewport()
+        button = guide.schematic.expand
+        assert viewport.rect().contains(button.mapTo(viewport, button.rect().bottomRight()))
+        assert '收起' in button.toolTip()
+        assert not guide.schematic.view_options.isHidden()
+        win.grab().save(str(directory / f'expanded-schematic-{size[0]}.png'))
+        guide.schematic.expand.setChecked(False)
+        assert '展开' in button.toolTip()
 
 
 def test_pose_uses_calibrated_pnp_not_example_values(stereo_bench):

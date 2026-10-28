@@ -87,6 +87,23 @@ def test_animation_pause_replay_step_review_and_visibility(app, monkeypatch):
     assert not guide.timer.isActive() and not guide.replay.isEnabled()
 
 
+@pytest.mark.parametrize('scale', ['small', 'medium', 'large'])
+@pytest.mark.parametrize('motion,sign', [('approach', -1), ('retreat', 1)])
+def test_explicit_distance_motion_uses_action_not_target_scale(app, scale, motion, sign):
+    guide = StereoSchematic()
+    target = CaptureTarget(1, 1, BoardTilt.FRONT, scale=scale)
+    guide.set_target(target, motion=motion)
+    start = np.array(guide.canvas._board_point(0, 0, 0))
+    end = np.array(guide.canvas._board_point(0, 0, 1))
+    assert sign * (end[2] - start[2]) > 0
+    np.testing.assert_array_equal(start[:2], end[:2])
+    assert guide.has_motion
+    guide.set_target(target, motion='hold')
+    assert not guide.has_motion and not guide.replay.isEnabled()
+    np.testing.assert_array_equal(guide.canvas._board_point(0, 0, 0),
+                                  guide.canvas._board_point(0, 0, 1))
+
+
 @pytest.mark.parametrize('view', ['board', 'profile', 'spatial'])
 def test_qpainter_frames_are_nonblank_and_change(app, tmp_path, view):
     configure_application_style(app)

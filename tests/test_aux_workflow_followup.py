@@ -101,7 +101,7 @@ def test_replacement_import_does_not_claim_guided_poses(panel):
     assert len(panel._aux_pairs) == 2
     assert len(panel._aux_images) == 3
     assert panel._aux_capture_sequence.done_count == 0
-    assert '有效配对 2 组' in panel._aux_cap_progress.format()
+    assert '图像配对 2 组' in panel._aux_cap_progress.format()
     assert '不代表姿态覆盖或标定精度' in panel._lbl_aux_pair_count.toolTip()
 
 

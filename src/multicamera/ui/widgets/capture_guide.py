@@ -1038,7 +1038,8 @@ class CaptureSequenceWidget(QFrame):
         total = self._sequence.total
         self._progress_lbl.setText(f"{done}/{total}")
         skipped = sum(t.status == CaptureStatus.SKIPPED for t in self._sequence.targets)
-        self._title_lbl.setText(f'采图引导 · 已采 {done}')
+        self._title_lbl.setText(f'引导步骤 · 已记录 {done}/{total}')
+        self._title_lbl.setToolTip('引导步骤记录独立于图像配对数量；导入图片不自动证明姿态覆盖。')
         summary = f'已采 {done} · 跳过 {skipped} · 待采 {total - done - skipped}'
         self._btn_steps.setToolTip(summary + '\n姿态清单：查看记录状态并跳转')
         self._large_guide._targets = self._sequence.targets

@@ -1,6 +1,7 @@
 """Offline source semantics and live/offline navigation without solving a rig."""
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
@@ -82,6 +83,42 @@ def test_current_preview_counts_are_distinct_from_cumulative_coverage(offline_wi
     assert '缩放检测' in text
     assert '累计' in win._stereo_capture.coverage_button.toolTip()
     assert '预览角点' in win._stream_view._views[pair.left_id]._info.text()
+
+
+def test_review_summary_updates_immediately_with_recorded_original_counts(offline_window):
+    win = offline_window
+    pair = win._calib_panel.preview_pairs()[0]
+    left = replace(pair.left_detection,
+                   charuco_corners=pair.left_detection.charuco_corners[:-2],
+                   charuco_ids=pair.left_detection.charuco_ids[:-2])
+    right = replace(pair.right_detection,
+                    charuco_corners=pair.right_detection.charuco_corners[:-4],
+                    charuco_ids=pair.right_detection.charuco_ids[:-4])
+    win._show_review_pair(replace(pair, left_detection=left, right_detection=right))
+    text = win._stereo_capture.compact_summary.text()
+    assert '导入原图' in text
+    assert f'左目 {left.num_corners}/{win._board.num_corners}' in text
+    assert f'右目 {right.num_corners}/{win._board.num_corners}' in text
+    assert '回看' in win._stereo_capture.instruction.text()
+    win._stream_view.end_review()
+    assert '回看' not in win._stereo_capture.instruction.text()
+    text = win._stereo_capture.compact_summary.text()
+    counts = win._stream_view.displayed_corner_counts()
+    assert '缩放检测' in text
+    assert f'左目 {counts[pair.left_id]}/{win._board.num_corners}' in text
+    assert f'右目 {counts[pair.right_id]}/{win._board.num_corners}' in text
+
+
+def test_completed_pair_count_does_not_stretch_sidebar(offline_window, app):
+    win = offline_window
+    panel, guide = win._calib_panel, win._stereo_capture
+    panel._lbl_capture_count.setText('有效配对 20 / 20 · 已达建议数量，可继续补拍；不代表精度')
+    guide.refresh()
+    app.processEvents()
+    app.processEvents()
+    assert guide.coverage_button.text() == '数据分析'
+    assert '有效配对 20 / 20' in guide.coverage_button.toolTip()
+    assert win._guide_scroll.horizontalScrollBar().maximum() == 0
 
 
 def test_swap_failure_and_live_return_do_not_destroy_prior_state(offline_window):

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QBoxLayout,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -131,13 +132,18 @@ class MainWindow(QMainWindow):
         self._preview_body = QWidget()
         preview_body = QVBoxLayout(self._preview_body)
         preview_body.setContentsMargins(0, 0, 0, 0)
-        preview_body.setSizeConstraint(QLayout.SetMinimumSize)
         self._stream_view.setMinimumHeight(230)
-        self._capture_preview_splitter = QSplitter(Qt.Vertical)
+        self._capture_preview_splitter = QSplitter(Qt.Horizontal)
         self._capture_preview_splitter.setChildrenCollapsible(False)
         self._capture_preview_splitter.setHandleWidth(5)
         self._capture_preview_splitter.addWidget(self._stream_view)
-        self._capture_preview_splitter.addWidget(self._stereo_capture)
+        self._guide_scroll = QScrollArea()
+        self._guide_scroll.setFrameShape(QFrame.NoFrame)
+        self._guide_scroll.setWidgetResizable(True)
+        self._guide_scroll.setMinimumWidth(300)
+        self._guide_scroll.setMaximumWidth(440)
+        self._guide_scroll.setWidget(self._stereo_capture)
+        self._capture_preview_splitter.addWidget(self._guide_scroll)
         self._capture_preview_splitter.setStretchFactor(0, 1)
         self._capture_preview_splitter.setStretchFactor(1, 0)
         preview_body.addWidget(self._capture_preview_splitter, 1)
@@ -147,6 +153,7 @@ class MainWindow(QMainWindow):
         self._preview_scroll.setWidget(self._preview_body)
         workspace.addWidget(self._preview_scroll, 1)
         self._capture_bottom = QWidget()
+        self._capture_bottom.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self._capture_bottom_layout = QHBoxLayout(self._capture_bottom)
         self._capture_bottom_layout.setContentsMargins(0, 0, 0, 0)
         self._capture_actions = QWidget()
@@ -182,6 +189,8 @@ class MainWindow(QMainWindow):
         self._logs_widget.setMaximumHeight(150)
         self._logs_widget.setMinimumHeight(100)
         workspace.addWidget(self._logs_widget)
+        self._logs_workspace_index = workspace.indexOf(self._logs_widget)
+        self._aux_panel_dialogs = {}
         self._logs_widget.hide()
         self._toggle_logs.toggled.connect(self._toggle_log_panel)
 
@@ -242,12 +251,14 @@ class MainWindow(QMainWindow):
             footer.show()
             self._capture_layout_active = active
         self._stereo_capture.setVisible(active)
+        self._guide_scroll.setVisible(active)
         self._stereo_capture.banner.setVisible(active)
         self._capture_actions.setVisible(active)
         self._inspector.setVisible(not active)
         self._view_aux.setVisible(not active)
         self._view_split.setVisible(not active)
         self._sync_capture_density()
+        self._sync_auxiliary_panels()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -255,9 +266,11 @@ class MainWindow(QMainWindow):
             self._sync_capture_density()
         if hasattr(self, '_toolbar'):
             self._sync_toolbar_density()
+        if hasattr(self, '_aux_panel_dialogs'):
+            self._sync_auxiliary_panels()
 
     def _sync_capture_density(self):
-        compact = self._capture_layout_active and (self.height() < 900 or self.width() < 1150)
+        compact = self._capture_layout_active
         if compact == getattr(self, '_compact_capture', None):
             return
         self._compact_capture = compact
@@ -277,12 +290,49 @@ class MainWindow(QMainWindow):
             self._changing_gallery_density = True
             self._gallery._toggle.setChecked(self._gallery_before_compact)
             self._changing_gallery_density = False
-        self._capture_preview_splitter.setOrientation(Qt.Horizontal if compact else Qt.Vertical)
-        self._capture_preview_splitter.setSizes([750, 400] if compact else [380, 320])
+        self._capture_preview_splitter.setOrientation(Qt.Horizontal)
+        self._capture_preview_splitter.setSizes([750, 350])
 
     def _on_gallery_expansion_changed(self, expanded):
         if getattr(self, '_compact_capture', False) and not getattr(self, '_changing_gallery_density', False):
             self._gallery_before_compact = expanded
+        if hasattr(self, '_aux_panel_dialogs'):
+            self._sync_auxiliary_panels()
+
+    def _sync_auxiliary_panels(self):
+        """Keep low-height windows usable without compressing the video area."""
+        floating = self.height() < 900
+        panels = (
+            ('gallery', '配对图像', self._gallery._body, self._gallery.layout(), 1,
+             self._gallery._toggle, bool(self._gallery._pairs)),
+            ('logs', '操作日志', self._logs_widget, self._workspace.layout(),
+             self._logs_workspace_index, self._toggle_logs, True),
+        )
+        for key, title, widget, home, index, toggle, available in panels:
+            toggle.setToolTip(f'在独立窗口查看{title}' if floating else f'展开或收起{title}')
+            dialog = self._aux_panel_dialogs.get(key)
+            expanded = toggle.isChecked() and available
+            if floating and (expanded or dialog is not None):
+                if dialog is None:
+                    dialog = QDialog(self, Qt.Tool)
+                    dialog.setWindowTitle(title)
+                    box = QVBoxLayout(dialog)
+                    box.setContentsMargins(8, 8, 8, 8)
+                    dialog.resize(min(900, self.width() - 80), 170)
+                    dialog.finished.connect(lambda _result, t=toggle: t.setChecked(False))
+                    self._aux_panel_dialogs[key] = dialog
+                if widget.parentWidget() is not dialog:
+                    home.removeWidget(widget)
+                    dialog.layout().addWidget(widget)
+                widget.setVisible(expanded)
+                dialog.setVisible(expanded and self.isVisible())
+            else:
+                if dialog is not None and widget.parentWidget() is dialog:
+                    dialog.layout().removeWidget(widget)
+                    home.insertWidget(index, widget)
+                if dialog is not None:
+                    dialog.hide()
+                widget.setVisible(expanded)
 
     def _build_workbench_header(self):
         header = QWidget()
@@ -570,6 +620,7 @@ class MainWindow(QMainWindow):
             else:
                 self._show_review_pair(current)
         self._gallery.set_pairs(pairs)
+        self._sync_auxiliary_panels()
 
     @Slot(str, bool)
     def _on_review_changed(self, key, active):
@@ -578,6 +629,7 @@ class MainWindow(QMainWindow):
         self._lbl_review.setText(f"回看 · {key}")
         self._lbl_review.setToolTip(key)
         self._review_bar.setVisible(active)
+        self._stereo_capture.refresh()
 
     @Slot(str, object)
     def _on_gallery_pair_selected(self, key, images):
@@ -601,6 +653,7 @@ class MainWindow(QMainWindow):
     def _toggle_log_panel(self, expanded):
         self._toggle_logs.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self._logs_widget.setVisible(expanded)
+        self._sync_auxiliary_panels()
 
     @Slot(str)
     def _on_log_added(self, message):
@@ -1083,6 +1136,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._stream_manager.stop_all()
+        for dialog in self._aux_panel_dialogs.values():
+            dialog.hide()
         super().closeEvent(event)
 
     def _default_rgb_settings_url(self) -> str:

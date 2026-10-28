@@ -283,6 +283,11 @@ def test_result_summary_and_native_actions_use_real_results(bench, monkeypatch, 
     win._workflow_tabs.setCurrentIndex(2)
     assert "0.220" in panel._lbl_result_summary.text()
     assert "已保存" in panel._lbl_result_storage.text()
+    assert '双目 RMS 0.150 px' in panel._lbl_result_metrics.text()
+    assert '基线 100.00 mm' in panel._lbl_result_metrics.text()
+    assert '融合 RMS 0.220 px' in panel._lbl_result_metrics.text()
+    assert panel._lbl_result_metrics.isVisible()
+    assert 'JSON：已生成' in panel._lbl_result_storage.text()
     assert panel._btn_export_results.isEnabled()
     assert panel._btn_open_results.isEnabled()
     app.processEvents()
@@ -307,6 +312,7 @@ def test_result_summary_and_native_actions_use_real_results(bench, monkeypatch, 
     assert exports == [True]
     panel._clear_calibration_results()
     assert panel.result_directory is None
+    assert not panel._lbl_result_metrics.text()
     assert not panel._btn_export_results.isEnabled()
     assert not panel._btn_open_results.isEnabled()
 
@@ -368,7 +374,9 @@ def test_sidebar_summary_uses_actual_board_and_live_readiness(bench):
     assert panel._aux_board_values['geometry'].text() == '7 列 × 5 行格子'
     assert panel._aux_board_values['spacing'].text() == '80 mm'
     assert '24 点' in panel._aux_board_values['points'].text()
-    assert panel._lbl_aux_pair_count.text() == '8 / 13'
+    assert panel._lbl_aux_pair_count.text() == '8 组 · 建议 13 组'
+    assert panel._aux_seq_widget._title_lbl.text() == '引导步骤 · 已记录 0/13'
+    assert '独立于图像配对数量' in panel._aux_seq_widget._title_lbl.toolTip()
     assert not panel._lbl_aux_readiness.isVisible()
     assert not panel._lbl_aux_board.isVisible()
     assert not panel._aux_seq_widget._dots.isVisible()

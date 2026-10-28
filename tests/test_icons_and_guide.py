@@ -13,6 +13,18 @@ from multicamera.ui.widgets.capture_guide import (
 )
 
 
+def test_selected_table_row_has_readable_text_contrast():
+    def luminance(color):
+        channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+                  for value in channels]
+        return sum(weight * value for weight, value in zip((.2126, .7152, .0722), linear))
+
+    selected = theme.app_stylesheet().split('QTableWidget::item:selected {', 1)[1].split('}', 1)[0]
+    assert f'background: {theme.PRIMARY};' in selected and 'color: white;' in selected
+    assert 1.05 / (luminance(theme.PRIMARY) + .05) >= 4.5
+
+
 def test_bundled_icons_render_all_states_and_high_dpi(app):
     directory = Path(theme.__file__).with_name('icons')
     assert (directory / 'LICENSE').exists()

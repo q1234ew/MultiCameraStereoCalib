@@ -790,12 +790,23 @@ class CalibrationPanel(QWidget):
     def _refresh_result_summary(self):
         rig = self._rig
         if rig is None:
+            self._lbl_result_metrics.clear()
             self._lbl_result_summary.setText("采集数据已变化，请重新标定" if self._results_outdated else "尚无标定结果")
             self._lbl_result_decision.setText("尚无可评估结果")
             self._lbl_result_decision.setStyleSheet(f'color:{TEXT_DIM}; font-size:15px; font-weight:bold;')
             self._lbl_result_risks.clear()
         else:
             decision = summarize_quality(rig)
+            metrics = [
+                f'{name} · 双目 RMS {pair.stereo.rms_error:.3f} px\n'
+                f'内参 RMS 左 {pair.left_intrinsics.rms_error:.3f} / '
+                f'右 {pair.right_intrinsics.rms_error:.3f} px · '
+                f'基线 {np.linalg.norm(pair.stereo.T) * 1000:.2f} mm'
+                for name, pair in rig.pairs.items()
+            ]
+            metrics.extend(f'{aux.camera_id} · 融合 RMS {aux.rms_error:.3f} px · '
+                           f'{aux.frame_count} 组' for aux in rig.aux_cameras.values())
+            self._lbl_result_metrics.setText('\n'.join(metrics))
             color = DANGER if decision.level == 'poor' else WARNING if decision.level == 'fair' else SUCCESS
             self._lbl_result_decision.setText(decision.title)
             self._lbl_result_decision.setStyleSheet(f'color:{color}; font-size:15px; font-weight:bold;')
@@ -820,15 +831,30 @@ class CalibrationPanel(QWidget):
                 lines.extend([aux.camera_id, f"融合 RMS  {aux.rms_error:.3f} px · {aux.frame_count} 组", ""])
             lines.extend(['', *decision.details, '', *decision.risks])
             self._lbl_result_summary.setText("\n".join(lines).rstrip())
-        if self._result_errors:
-            status = (f"已保存 {len(self._result_files)} 个文件 · 部分格式未生成\n"
-                      if self._result_directory is not None else "保存失败\n")
-            if self._result_directory is not None:
-                status += f'结果目录：{Path(self._result_directory).resolve()}\n\n'
-            status += "\n".join(self._result_errors)
-        elif self._result_directory is not None:
+        if self._result_directory is not None:
             directory = Path(self._result_directory)
-            status = f"文件已保存：{len(self._result_files)} 个\n{directory.resolve()}"
+            saved = [Path(path).name for path in self._result_files
+                     if Path(path).name != 'calibration_manifest.json']
+            header = f'已保存 {len(saved)} 个标定文件' if saved else '尚无已保存的标定文件'
+            if self._result_errors:
+                header += ' · 部分格式未生成' if saved else ' · 文件生成失败'
+            status_lines = [header]
+            titles = {'rig.json': 'JSON', 'rig_opencv.yml': 'OpenCV 完整',
+                      'rig_opencv_standard.yml': 'OpenCV 双目标准',
+                      'rig_kalibr.yaml': 'Kalibr', 'calibration_manifest.json': '文件校验清单'}
+            status_lines.extend(f'{titles.get(name, name)}：已生成' for name in saved)
+            for error in self._result_errors:
+                name, _, reason = error.partition(':')
+                reason = reason.strip()
+                brief = reason[:160] + '…（完整原因见提示/日志）' if len(reason) > 160 else reason
+                status_lines.append(f'{titles.get(name, name)}：未生成 · {brief}')
+            folder = self._lbl_result_storage.fontMetrics().elidedText(
+                directory.name, Qt.ElideMiddle, 280,
+            )
+            status_lines.append(f'结果目录：{folder}')
+            status = '\n'.join(status_lines)
+        elif self._result_errors:
+            status = '保存失败\n' + '\n'.join(self._result_errors)
         else:
             status = "文件待生成或另存" if rig is not None else ""
             if self._results_outdated:
@@ -836,9 +862,11 @@ class CalibrationPanel(QWidget):
                 if self._previous_result_directory is not None:
                     status += f'\n历史文件保留：{Path(self._previous_result_directory).resolve()}'
         self._lbl_result_storage.setText(status)
-        storage_tip = str(self._result_directory or '')
+        storage_tip = str(Path(self._result_directory).resolve()) if self._result_directory else ''
         if self._result_files:
             storage_tip += '\n本次文件：\n' + '\n'.join(Path(path).name for path in self._result_files)
+        if self._result_errors:
+            storage_tip += '\n未生成原因：\n' + '\n'.join(self._result_errors)
         self._lbl_result_storage.setToolTip(storage_tip)
         self._btn_export_results.setEnabled(rig is not None)
         self._btn_open_results.setEnabled(self._result_directory is not None)
@@ -1229,7 +1257,7 @@ class CalibrationPanel(QWidget):
         self._aux_progress_header = QWidget()
         progress_header = QHBoxLayout(self._aux_progress_header)
         progress_header.setContentsMargins(0, 0, 0, 0)
-        progress_header.addWidget(QLabel("有效配对"))
+        progress_header.addWidget(QLabel("图像配对"))
         progress_header.addStretch()
         self._lbl_aux_pair_count = QLabel("0 / 13")
         progress_header.addWidget(self._lbl_aux_pair_count)
@@ -1299,6 +1327,11 @@ class CalibrationPanel(QWidget):
         self._lbl_result_decision.setWordWrap(True)
         self._lbl_result_decision.setTextFormat(Qt.PlainText)
         results.addWidget(self._lbl_result_decision)
+        self._lbl_result_metrics = _WrappingLabel()
+        self._lbl_result_metrics.setWordWrap(True)
+        self._lbl_result_metrics.setTextFormat(Qt.PlainText)
+        self._lbl_result_metrics.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        results.addWidget(self._lbl_result_metrics)
         self._lbl_result_risks = _WrappingLabel()
         self._lbl_result_risks.setWordWrap(True)
         self._lbl_result_risks.setTextFormat(Qt.PlainText)
@@ -3511,7 +3544,7 @@ class CalibrationPanel(QWidget):
         total = self._aux_capture_sequence.total
         self._aux_cap_progress.setMaximum(total)
         self._aux_cap_progress.setValue(min(valid, total))
-        self._aux_cap_progress.setFormat(f'有效配对 {valid} 组 · 建议 {total} 组')
+        self._aux_cap_progress.setFormat(f'图像配对 {valid} 组 · 建议 {total} 组')
         self._refresh_aux_readiness()
         self._lbl_aux_status.setText(f"最少 3 组 · 建议 {total} 组")
         self._refresh_preview_pairs()
@@ -3684,8 +3717,10 @@ class CalibrationPanel(QWidget):
         self._aux_task_values['capture'].setToolTip(capture_status)
         self._aux_task_values['calibration'].setToolTip(calibration_status)
         self._btn_rgb_prerequisite.setVisible(not intrinsics_ready)
-        self._lbl_aux_pair_count.setText(f"{len(self._aux_pairs)} / {self._aux_capture_sequence.total}")
-        self._lbl_aux_pair_count.setToolTip('有效平面板配对数 / 建议采图组数；不代表姿态覆盖或标定精度')
+        self._lbl_aux_pair_count.setText(
+            f"{len(self._aux_pairs)} 组 · 建议 {self._aux_capture_sequence.total} 组")
+        self._lbl_aux_pair_count.setToolTip(
+            '有效平面板配对数 / 建议采图组数；与引导步骤记录独立，不代表姿态覆盖或标定精度')
         self._btn_capture_aux.setEnabled(not busy and frames is not None)
         self._btn_capture_aux.setToolTip(capture_status)
         self._btn_calib_aux.setEnabled(not busy and not problem)

@@ -111,6 +111,9 @@ def test_primary_instruction_advances_one_condition_at_a_time(stereo_bench, app,
         s.update(center=np.array([.15, .5]), stable=False, sharp=False)
     guide.refresh()
     assert guide._instruction_stage == 'distance' and '靠近' in guide.instruction.text()
+    assert guide.schematic.motion == 'approach'
+    assert (guide.schematic.canvas._board_point(0, 0, 1)[2]
+            < guide.schematic.canvas._board_point(0, 0, 0)[2])
     assert '平移' not in guide.instruction.text()
     pose['distance_area'] = .07
     guide.refresh()
@@ -127,16 +130,51 @@ def test_primary_instruction_advances_one_condition_at_a_time(stereo_bench, app,
         s['sharp'] = True
     guide.refresh()
     assert guide._instruction_stage == 'stability' and '静止' in guide.instruction.text()
+    assert guide.schematic.description.text() == guide.instruction.text()
+    assert not guide.schematic.timer.isActive()
+    assert guide.schematic.progress == 1.
+    assert not guide.schematic.replay.isEnabled()
+    assert '目标姿态参考' in guide.schematic.caption.text()
     assert not guide.auto_ready()
     for s in samples:
         s['stable'] = True
     guide.refresh()
     assert guide._instruction_stage == 'ready' and '可以采集' in guide.instruction.text()
+    assert guide.schematic.description.text() == guide.instruction.text()
+    assert not guide.schematic.timer.isActive()
     assert guide.auto_ready()
     pose['distance_area'] = .2
     guide.refresh()
     assert guide._instruction_stage == 'distance' and '远离' in guide.instruction.text()
+    assert guide.schematic.motion == 'retreat'
+    assert (guide.schematic.canvas._board_point(0, 0, 1)[2]
+            > guide.schematic.canvas._board_point(0, 0, 0)[2])
     assert not guide.auto_ready()
+
+
+def test_conflicting_distance_stops_animation_and_resumes_in_correct_direction(
+        stereo_bench, app, monkeypatch):
+    guide, _ = prepare(stereo_bench, app)
+    guide.btn_near.click()
+    areas = {LEFT: .02, RIGHT: .6}
+    monkeypatch.setattr(guide, '_pose_measurement', lambda cid, *args:
+                        {'yaw': 0., 'pitch': 0., 'depth': .5, 'distance_area': areas[cid]})
+    guide.refresh()
+    assert '暂停前后移动' in guide.instruction.text()
+    assert guide.schematic.motion == 'hold'
+    assert not guide.schematic.timer.isActive()
+    assert not guide.schematic.replay.isEnabled()
+    assert not guide.auto_ready()
+    areas[LEFT] = .6
+    guide.refresh()
+    assert '远离' in guide.instruction.text()
+    assert guide.schematic.motion == 'retreat'
+    assert guide.schematic.canvas._board_point(0, 0, 1)[2] > guide.schematic.canvas._board_point(0, 0, 0)[2]
+    areas.update({LEFT: .02, RIGHT: .02})
+    guide.refresh()
+    assert '靠近' in guide.instruction.text()
+    assert guide.schematic.motion == 'approach'
+    assert guide.schematic.canvas._board_point(0, 0, 1)[2] < guide.schematic.canvas._board_point(0, 0, 0)[2]
 
 
 def test_supplement_does_not_bypass_pose_gate(stereo_bench, app, monkeypatch):
@@ -148,6 +186,8 @@ def test_supplement_does_not_bypass_pose_gate(stereo_bench, app, monkeypatch):
         s.update(center=np.array([.5, .5]), distance_area=.16, sharp=True, stable=True)
     guide.refresh()
     assert guide._instruction_stage == 'tilt' and '手动采集基础样本' in guide.instruction.text()
+    assert guide.schematic.motion == 'hold'
+    assert not guide.schematic.timer.isActive()
     assert not guide.auto_ready()
 
 

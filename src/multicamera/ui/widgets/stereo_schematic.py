@@ -29,10 +29,17 @@ def motion_description(target):
     return "按左目预览方向平移至建议区域，保持板面朝向"
 
 
-def board_point(x, y, progress, target):
+def board_point(x, y, progress, target, motion='plan'):
     """Camera axes: X right, Y down, Z forward; pivot edge stays fixed."""
     if target is None:
         return x, y, 4.7
+    if motion in ('approach', 'retreat'):
+        end_z = 4.7 + {'small': 1.6, 'medium': 0., 'large': -1.}.get(target.scale, 0.)
+        start_offset = 1. if motion == 'approach' else -1.
+        return (x + (target.zone_col - 1) * 1.25,
+                y + (target.zone_row - 1) * .8, end_z + start_offset * (1. - progress))
+    if motion == 'hold':
+        progress = 1.
     tilt = target.tilt
     x, y, z = tilt_point(x, y, progress, tilt)
     # Tilt demonstrations start at the suggested image position; they do not
@@ -119,7 +126,7 @@ class MotionCanvas(QWidget):
                     self._draw_scene(p, rect, self.guide.progress, True, 'dynamic')
 
     def _board_point(self, x, y, progress):
-        return board_point(x, y, progress, self.guide.target)
+        return board_point(x, y, progress, self.guide.target, self.guide.motion)
 
     def _depth_mode(self):
         return 'profile' if self.guide.view_mode == 'profile' else 'oblique'
@@ -163,16 +170,16 @@ class MotionCanvas(QWidget):
         corners = [(-1.45, -1), (1.45, -1), (1.45, 1), (-1.45, 1), (-1.45, -1)]
 
         def board(t, ghost=False):
-            pts = [board_point(x, y, t, target) for x, y in corners]
+            pts = [self._board_point(x, y, t) for x, y in corners]
             path(pts, ACCENT if ghost else '#68d7cf', 1.6, ghost,
                  None if ghost else '#304d49')
             if not ghost:
                 for k in range(1, 7):
                     x = -1.45 + 2.9 * k / 7
-                    path([board_point(x, -1, t, target), board_point(x, 1, t, target)], '#68a69f', .7)
+                    path([self._board_point(x, -1, t), self._board_point(x, 1, t)], '#68a69f', .7)
                 for k in range(1, 5):
                     y = -1 + 2 * k / 5
-                    path([board_point(-1.45, y, t, target), board_point(1.45, y, t, target)], '#68a69f', .7)
+                    path([self._board_point(-1.45, y, t), self._board_point(1.45, y, t)], '#68a69f', .7)
 
         if layer != 'static':
             board(progress)
@@ -186,10 +193,10 @@ class MotionCanvas(QWidget):
                 BoardTilt.TILT_DOWN: [(-1.45, 1), (1.45, 1)],
             }.get(target.tilt)
             if edge:
-                path([board_point(x, y, progress, target) for x, y in edge], WARNING, 3.5)
+                path([self._board_point(x, y, progress) for x, y in edge], WARNING, 3.5)
             # Arrow points from starting board centre to target centre.
-            a = project_point(board_point(0, 0, 0, target))
-            b = project_point(board_point(0, 0, 1, target))
+            a = project_point(self._board_point(0, 0, 0))
+            b = project_point(self._board_point(0, 0, 1))
             if math.hypot(b.x() - a.x(), b.y() - a.y()) > 5:
                 p.setPen(QPen(QColor(WARNING), 1.8))
                 p.drawLine(a, b)
@@ -203,10 +210,12 @@ class StereoSchematic(QWidget):
     def __init__(self):
         super().__init__()
         self.target = None
+        self.motion = 'plan'
         self.view_mode = 'board'
         self.progress = 0.
         self._key = object()
         self._enabled = False
+        self._instruction = None
         self._paused = False
         self._elapsed = 0.
         self._scroll_area = None
@@ -272,7 +281,9 @@ class StereoSchematic(QWidget):
         self.canvas.update()
 
     def _refresh_caption(self):
-        if self.view_mode == 'spatial':
+        if self._instruction is not None and not self._enabled:
+            text = '目标姿态参考（非实测） · 当前请按上方提示操作'
+        elif self.view_mode == 'spatial':
             text = '镜头前侧观察 · 非左目画面方向\n蓝色虚线为目标，黄色为移动侧；尺寸仅示意'
         else:
             edges = EDGES.get(self.target.tilt) if self.target is not None else None
@@ -280,21 +291,27 @@ class StereoSchematic(QWidget):
             text = action + '\n白色为固定边 · 黄色为移动边 · 蓝色虚线为目标（非实测）'
         self.caption.setText(text)
 
-    def set_target(self, target, *, active=True):
-        key = (target.zone_row, target.zone_col, target.tilt, target.scale) if target else None
-        enabled = bool(active and target is not None)
-        if key == self._key and enabled == self._enabled:
+    def set_target(self, target, *, active=True, instruction=None, motion='plan'):
+        key = (target.zone_row, target.zone_col, target.tilt, target.scale, motion) if target else None
+        enabled = bool(active and target is not None and motion != 'hold')
+        description = instruction if instruction is not None else motion_description(target)
+        if (key == self._key and enabled == self._enabled
+                and description == self.description.text()):
             return
         changed = key != self._key
         self.target, self._key = target, key
-        self._refresh_caption()
+        self.motion = motion
         self._enabled = enabled
-        self.description.setText(motion_description(target))
+        self._instruction = instruction
+        self._refresh_caption()
+        self.description.setText(description)
         self.pause.setEnabled(self._enabled and self.has_motion)
         self.replay.setEnabled(self._enabled and self.has_motion)
         if changed:
             self._elapsed = self.progress = 0.
             self._last = time.monotonic()
+        if not enabled:
+            self.progress = 1.
         self._sync_timer()
         self.canvas.update()
 
@@ -305,10 +322,16 @@ class StereoSchematic(QWidget):
     def _apply_compact(self):
         compact = self._preferred_compact and not self.expand.isChecked()
         self.canvas.compact = compact
+        self.canvas.setMinimumWidth(280 if self._preferred_compact else 360)
         self.canvas.setMinimumHeight(150 if compact else 210)
         self.canvas.setMaximumHeight(175 if compact else 16777215)
         self.caption.setVisible(not compact)
         self.view_options.setVisible(not compact)
+        self.view_options.layout().setDirection(
+            QHBoxLayout.TopToBottom if self._preferred_compact else QHBoxLayout.LeftToRight)
+        label = '收起示意与视角选项' if self.expand.isChecked() else '展开示意与视角选项'
+        self.expand.setToolTip(label)
+        self.expand.setAccessibleName(label)
         self.canvas.update()
 
     def _sync_timer(self, *args):
@@ -322,9 +345,14 @@ class StereoSchematic(QWidget):
 
     @property
     def has_motion(self):
+        if self.motion in ('approach', 'retreat'):
+            return self.target is not None
+        if self.motion == 'hold':
+            return False
         return self.target is not None and (
             self.target.tilt != BoardTilt.FRONT
             or (self.target.zone_row, self.target.zone_col) != (1, 1)
+            or self.target.scale != 'medium'
         )
 
     def _pause(self, paused):

@@ -178,12 +178,37 @@ def test_outdated_results_have_explicit_status(capture_panel, tmp_path):
     assert not panel._btn_export_results.isEnabled()
 
 
-def test_partial_export_keeps_full_directory_visible_and_copyable(capture_panel, tmp_path, app):
+def test_partial_export_keeps_compact_directory_and_full_path_copyable(capture_panel, tmp_path, app):
     directory = tmp_path / 'results'
     capture_panel.set_result_storage(directory, [directory / 'rig.json'], ['Kalibr: incompatible distortion'])
     text = capture_panel._lbl_result_storage.text()
-    assert str(directory.resolve()) in text
+    assert str(directory.resolve()) in capture_panel._lbl_result_storage.toolTip()
+    assert str(directory.resolve()) not in text
+    assert '结果目录：results' in text
+    assert 'JSON：已生成' in text and 'Kalibr：未生成' in text
     assert '部分格式未生成' in text and 'incompatible' in text
     assert capture_panel._btn_open_results.isEnabled()
     capture_panel._btn_copy_results.click()
     assert app.clipboard().text() == str(directory.resolve())
+
+
+def test_result_formats_exclude_manifest_and_elide_long_generation_path(capture_panel, tmp_path):
+    capture_panel._lbl_result_metrics.setText('obsolete metrics')
+    directory = tmp_path / ('nested_directory_' * 12) / ('calib_20261029_010000_' + 'f' * 32)
+    files = [directory / name for name in ('rig.json', 'rig_opencv.yml', 'calibration_manifest.json')]
+    errors = ['rig_kalibr.yaml: unsupported distortion']
+    capture_panel.set_result_storage(directory, files, errors)
+    assert not capture_panel._lbl_result_metrics.text()
+    text = capture_panel._lbl_result_storage.text()
+    assert '已保存 2 个标定文件' in text
+    assert 'OpenCV 完整：已生成' in text
+    assert 'Kalibr：未生成' in text
+    assert str(directory) not in text
+    assert str(directory.resolve()) in capture_panel._lbl_result_storage.toolTip()
+    capture_panel.set_result_storage(directory, files[:2], errors + [
+        'calibration_manifest.json: disk unavailable'])
+    assert '文件校验清单：未生成' in capture_panel._lbl_result_storage.text()
+    assert 'disk unavailable' in capture_panel._lbl_result_storage.toolTip()
+    capture_panel.set_result_storage(directory, [], ['rig.json: disk unavailable'])
+    assert '文件生成失败' in capture_panel._lbl_result_storage.text()
+    assert '部分格式未生成' not in capture_panel._lbl_result_storage.text()

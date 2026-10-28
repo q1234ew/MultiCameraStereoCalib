@@ -6,6 +6,7 @@ import time
 import copy
 import math
 import logging
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -598,48 +599,49 @@ class StereoCaptureWorkspace(QWidget):
     def _primary_action(self, pairs, samples, target, duplicate):
         """Order one actionable instruction without relaxing any capture gate."""
         if self.panel._pending_save_tokens or self.panel._save_workers or self.panel._save_queue:
-            return 'saving', '保持当前位置，等待原图保存完成'
+            return 'saving', '保持当前位置，等待原图保存完成', 'hold'
         if self.panel._failed_save_jobs:
-            return 'saving', '先重试保存失败的原图，或撤销该次采集'
+            return 'saving', '先重试保存失败的原图，或撤销该次采集', 'hold'
         if self.panel._white_balance_guard.busy:
-            return 'preparation', '保持当前位置，等待相机参数稳定'
+            return 'preparation', '保持当前位置，等待相机参数稳定', 'hold'
         if (self.panel._model_worker or self.panel._calib_worker or self.panel._stereo_import_worker
                 or self.panel._aux_dataset_busy()):
-            return 'preparation', '保持当前位置，等待当前任务完成'
+            return 'preparation', '保持当前位置，等待当前任务完成', 'hold'
         feasible = (self._distance_available(self._distance_override) if self._distance_override else
                     self._analysis.recommendation.feasible)
         if not feasible:
-            return 'blocked', '当前距离构图不可用，请检查分辨率和标定板'
+            return 'blocked', '当前距离构图不可用，请检查分辨率和标定板', 'hold'
         if not samples or not all(s['valid'] for s in samples):
-            return 'visibility', '让标定板同时进入左右画面'
+            return 'visibility', '让标定板同时进入左右画面', 'hold'
         ready, message = self._distance_status(pairs, samples, target)
         if not ready:
             if '判断冲突' in message:
-                return 'distance', '先检查左右共视，暂停前后移动'
+                return 'distance', '先检查左右共视，暂停前后移动', 'hold'
             if '靠近' in message:
-                return 'distance', '向镜头靠近，保持当前高度'
+                return 'distance', '向镜头靠近，保持当前高度', 'approach'
             if '远离' in message:
-                return 'distance', '远离镜头，保持当前高度'
-            return 'distance', '保持板面朝向，等待双路距离检测'
+                return 'distance', '远离镜头，保持当前高度', 'retreat'
+            return 'distance', '保持板面朝向，等待双路距离检测', 'hold'
         if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
                    for s in samples):
             positions = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))
-            return 'position', f'平移至画面{positions[target.zone_row][target.zone_col]}，保持前后距离'
+            return 'position', f'平移至画面{positions[target.zone_row][target.zone_col]}，保持前后距离', 'hold'
         aligned, message = self._adaptive_aligned(pairs, samples, target)
         if not aligned:
+            tilt_motion = 'plan' if target.tilt != BoardTilt.FRONT else 'hold'
             if '待内参' in message:
-                return 'tilt', '按示意调整板面朝向，手动采集基础样本'
+                return 'tilt', '按示意调整板面朝向，手动采集基础样本', tilt_motion
             action = TILT_ACTIONS.get(target.tilt)
-            return 'tilt', action[0] if action else '将板面转正，保持前后距离'
+            return 'tilt', action[0] if action else '将板面转正，保持前后距离', tilt_motion
         if not all(s.get('sharp') for s in samples):
-            return 'quality', '检查对焦与光照，保持板面位置'
+            return 'quality', '检查对焦与光照，保持板面位置', 'hold'
         if not all(s.get('stable') for s in samples):
-            return 'stability', '保持静止至少 0.6 秒'
+            return 'stability', '保持静止至少 0.6 秒', 'hold'
         if duplicate:
-            return 'duplicate', '稍微改变板面朝向，避免重复构图'
+            return 'duplicate', '稍微改变板面朝向，避免重复构图', 'hold'
         if any(self.panel._sm.get_sync_pair(name) is None for name in self.panel._selected_pairs()):
-            return 'pairing', '等待左右帧满足软件时间配对'
-        return 'ready', '保持静止，可以采集'
+            return 'pairing', '等待左右帧满足软件时间配对', 'hold'
+        return 'ready', '保持静止，可以采集', 'hold'
 
     def refresh(self):
         options = [self.panel._combo_pair.itemText(i) for i in range(self.panel._combo_pair.count())]
@@ -659,6 +661,7 @@ class StereoCaptureWorkspace(QWidget):
         using_override = bool(self.adaptive and key is not None and self._distance_override)
         self._instruction_stage = ('review' if self.view.review_key else
                                    'offline' if offline else 'fixed')
+        motion = 'hold'
         live = (self.adaptive and not offline and not self.view.review_key and key is not None
                 and self.panel._active_step == 0 and self.panel._workflow_phase == 'capture')
         self.distance_tools.setVisible(live)
@@ -679,7 +682,6 @@ class StereoCaptureWorkspace(QWidget):
             self.view.set_capture_sequence(self._adaptive_sequence if using_adaptive or using_override
                                            else self.panel._capture_sequence)
         self.panel._seq_widget.setVisible(not offline and not using_adaptive)
-        self.schematic.set_target(target, active=not bool(self.view.review_key) and not offline)
         self.schematic.setVisible(not offline)
         self.schematic_title.setText('离线数据检查' if offline else '相机与目标示意')
         loaded = len(self.panel.preview_pairs()) if offline else 0
@@ -756,7 +758,7 @@ class StereoCaptureWorkspace(QWidget):
         if using_adaptive and not duplicate:
             self.advice.setText(self._analysis.summary)
         if using_adaptive and not self.view.review_key and not offline:
-            self._instruction_stage, action = self._primary_action(pairs, samples, target, duplicate)
+            self._instruction_stage, action, motion = self._primary_action(pairs, samples, target, duplicate)
             self.instruction.setText(action)
             prefix = ('指定补采' if self._distance_override else
                       '距离补采' if self._analysis.recommendation.repairing_distance else '自适应推荐')
@@ -775,6 +777,13 @@ class StereoCaptureWorkspace(QWidget):
             self._instruction_stage = 'analysis'
             self.instruction.setText('正在更新采图建议，请保持当前位置' if not self._guidance_error else
                                      '自适应分析不可用，请检查固定计划')
+        adaptive_action = using_adaptive and not self.view.review_key and not offline
+        self.schematic.set_target(
+            replace(target, tilt=BoardTilt.FRONT) if motion in ('approach', 'retreat') else target,
+            active=adaptive_action or self._instruction_stage == 'fixed',
+            instruction=self.instruction.text() if adaptive_action or live else None,
+            motion=motion if adaptive_action else 'plan' if self._instruction_stage == 'fixed' else 'hold',
+        )
         self.advice.setStyleSheet(f"color:{WARNING if duplicate else TEXT_DIM}; font-size:12px;")
         self.advice.setVisible(duplicate or not self._compact)
         left = pairs[0].left.camera_id if pairs else None
@@ -819,12 +828,12 @@ class StereoCaptureWorkspace(QWidget):
             )
             self.status.setText(self.compact_summary.text())
         self.coverage_button.setToolTip(
-            '  '.join(self._coverage_summary) +
+            self.panel._lbl_capture_count.text() + '\n' + '  '.join(self._coverage_summary) +
             "\n数据集累计：所有已采图出现过的板角点 ID 比例 / 4×4 视场网格占比。"
             "不是当前帧完整度或姿态覆盖率；当前预览角点可能因缩放检测少于原图检测。",
         )
         self.coverage_button.setText(
-            "数据分析 · " + self.panel._lbl_capture_count.text() if self._compact else
+            "数据分析" if self._compact else
             "累计板角点 ID / 视场网格  ·  " + "  |  ".join(
                 [self.panel._lbl_capture_count.text(), *self._coverage_summary],
             )
