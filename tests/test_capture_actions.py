@@ -270,3 +270,32 @@ def test_distance_buttons_and_instruction_fit_small_windows(stereo_bench, app, t
             assert win.rect().contains(widget.mapTo(win, widget.rect().bottomRight()))
         assert win._preview_scroll.horizontalScrollBar().maximum() == 0
         win.grab().save(str(directory / f'capture-actions-{width}.png'))
+
+
+def test_distance_actions_wrap_with_large_font_in_narrow_sidebar(stereo_bench, app):
+    win = stereo_bench
+    guide, _ = prepare(win, app)
+    guide.btn_near.click()
+    win.resize(1000, 680)
+    buttons = (guide.btn_near, guide.btn_far, guide.btn_resume_guidance)
+    for button in buttons:
+        button.setStyleSheet('font-size:20px;')
+    for _ in range(4):
+        app.processEvents()
+    assert guide._distance_wrapped
+    index = guide._distance_layout.indexOf(guide.btn_resume_guidance)
+    assert guide._distance_layout.getItemPosition(index) == (1, 0, 1, 2)
+    viewport = win._guide_scroll.viewport()
+    win._guide_scroll.verticalScrollBar().setValue(0)
+    app.processEvents()
+    assert win._guide_scroll.horizontalScrollBar().maximum() == 0
+    for button in buttons:
+        assert viewport.rect().contains(button.mapTo(viewport, button.rect().topLeft()))
+        assert viewport.rect().contains(button.mapTo(viewport, button.rect().bottomRight()))
+    for button in buttons:
+        button.setStyleSheet('')
+    guide.btn_resume_guidance.click()
+    for _ in range(3):
+        app.processEvents()
+    assert not guide._distance_wrapped
+    assert guide.btn_resume_guidance.isHidden()

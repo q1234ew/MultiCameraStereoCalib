@@ -228,6 +228,8 @@ jobs:
             "Windows x64 build of MultiCamera Stereo Calibration.",
             "", "Version: $env:PRODUCT_VERSION", "Tag: $tag",
             "Commit: $env:GITHUB_SHA", "Variant: $variant",
+            "Changes: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/docs/CHANGELOG.md",
+            "Known limitations: self-tests do not establish hardware calibration accuracy or replace physical camera/UI checks on the target Windows device.",
             "", "Download the portable ZIP or, when included, the Setup EXE.",
             "SHA256SUMS.txt contains checksums for the binary downloads.",
             "calibration_self_test.json records calibration and export executed by the final EXE.",

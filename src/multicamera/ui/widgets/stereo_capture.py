@@ -10,9 +10,9 @@ from dataclasses import replace
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QThreadPool, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, QThreadPool, Slot
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QToolButton,
+    QComboBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -123,27 +123,32 @@ class StereoCaptureWorkspace(QWidget):
         outer.addWidget(self.advice)
 
         self.distance_tools = QWidget()
-        distance_row = QHBoxLayout(self.distance_tools)
+        distance_row = QGridLayout(self.distance_tools)
+        self._distance_layout = distance_row
+        self._distance_wrapped = None
+        self._distance_viewport = None
         distance_row.setContentsMargins(0, 0, 0, 0)
         self.btn_near = QToolButton()
         self.btn_far = QToolButton()
-        for button, text, scale in ((self.btn_near, '补近距离', 'large'),
-                                    (self.btn_far, '补远距离', 'small')):
+        for column, (button, text, scale) in enumerate((
+                (self.btn_near, '补近距离', 'large'), (self.btn_far, '补远距离', 'small'))):
             button.setText(text)
             button.setIcon(app_icon('camera'))
             button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             button.setAccessibleName(text)
             button.setToolTip(f'在中央正面补采{DISTANCE_LABELS[scale]}；保留全部原图验收和自动采集门禁')
             button.clicked.connect(lambda checked=False, s=scale: self._start_distance_capture(s))
-            distance_row.addWidget(button)
+            distance_row.addWidget(button, 0, column)
         self.btn_resume_guidance = QToolButton()
         self.btn_resume_guidance.setText('返回推荐')
         self.btn_resume_guidance.setIcon(app_icon('rotate-ccw'))
         self.btn_resume_guidance.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.btn_resume_guidance.setToolTip('结束指定距离补采，返回基于现有数据的自适应推荐')
         self.btn_resume_guidance.clicked.connect(self._resume_guidance)
-        distance_row.addWidget(self.btn_resume_guidance)
-        distance_row.addStretch()
+        self.btn_resume_guidance.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        distance_row.addWidget(self.btn_resume_guidance, 0, 2)
+        distance_row.setColumnStretch(3, 1)
+        self.distance_tools.installEventFilter(self)
         outer.insertWidget(0, self.distance_tools)
 
         self.coverage_button = QToolButton()
@@ -171,6 +176,32 @@ class StereoCaptureWorkspace(QWidget):
     @property
     def adaptive(self):
         return self.guide_mode.currentData() == 'adaptive' and not self.panel.offline_selection
+
+    def eventFilter(self, watched, event):
+        if (watched in (self.distance_tools, self._distance_viewport)
+                and event.type() in (QEvent.Resize, QEvent.LayoutRequest)):
+            self._layout_distance_controls()
+        return super().eventFilter(watched, event)
+
+    def _layout_distance_controls(self):
+        buttons = (self.btn_near, self.btn_far, self.btn_resume_guidance)
+        visible = [button for button in buttons if not button.isHidden()]
+        required = sum(button.sizeHint().width() for button in visible)
+        required += max(0, len(visible) - 1) * self._distance_layout.horizontalSpacing()
+        margins = self.layout().contentsMargins()
+        parent_width = self.parentWidget().width() if self.parentWidget() else self.width()
+        available = min(self.distance_tools.width(), parent_width - margins.left() - margins.right())
+        wrapped = not self.btn_resume_guidance.isHidden() and required > available
+        if wrapped == self._distance_wrapped:
+            return
+        self._distance_wrapped = wrapped
+        self._distance_layout.removeWidget(self.btn_resume_guidance)
+        if wrapped:
+            self._distance_layout.addWidget(self.btn_resume_guidance, 1, 0, 1, 2)
+        else:
+            self._distance_layout.addWidget(self.btn_resume_guidance, 0, 2)
+        for column, stretch in enumerate((1, 1, 0, 0) if wrapped else (0, 0, 0, 1)):
+            self._distance_layout.setColumnStretch(column, stretch)
 
     def _manual_navigation(self):
         self.guide_mode.setCurrentIndex(1)
@@ -370,6 +401,13 @@ class StereoCaptureWorkspace(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self.parentWidget() is not self._distance_viewport:
+            if self._distance_viewport is not None:
+                self._distance_viewport.removeEventFilter(self)
+            self._distance_viewport = self.parentWidget()
+            if self._distance_viewport is not None:
+                self._distance_viewport.installEventFilter(self)
+        self._layout_distance_controls()
         self.samples.clear()
         self.timer.start()
         self.refresh()
@@ -677,6 +715,7 @@ class StereoCaptureWorkspace(QWidget):
                 f'中央正面补采{DISTANCE_LABELS[scale]}；保持原图验收，完成后可返回推荐' if available else
                 '仅单组实时自适应采集可用；请结束回看、等待任务完成，并确认分辨率能满足角点间距')
         self.btn_resume_guidance.setVisible(self._distance_override is not None)
+        self._layout_distance_controls()
         target = self._target()
         if not offline and self.panel._active_step == 0:
             self.view.set_capture_sequence(self._adaptive_sequence if using_adaptive or using_override
