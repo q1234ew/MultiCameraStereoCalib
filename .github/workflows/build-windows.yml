@@ -13,6 +13,15 @@ on:
         required: false
         default: false
         type: boolean
+      installer_compression:
+        description: "Installer compression: normal is faster; ultra64 prioritizes size"
+        required: false
+        default: normal
+        type: choice
+        options:
+          - normal
+          - max
+          - ultra64
       audit_release:
         description: "Optional existing Release tag to inspect its archived OpenCV binary"
         required: false
@@ -48,17 +57,15 @@ jobs:
           cache: "pip"
           cache-dependency-path: |
             pyproject.toml
-            MultiCamera.spec
             packaging/windows/constraints.txt
 
       - name: Install Python dependencies
         shell: pwsh
         run: |
-          python -m pip install -U pip wheel
           if ("${{ inputs.pointcloud }}" -eq "true") {
-            python -m pip install -c packaging/windows/constraints.txt -e ".[build-win,pointcloud]"
+            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win,pointcloud]" pytest
           } else {
-            python -m pip install -c packaging/windows/constraints.txt -e ".[build-win]"
+            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win]" pytest
           }
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
           python -m pip check
@@ -98,7 +105,6 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pip install pytest
           python -m pytest -q tests
           if ($LASTEXITCODE -ne 0) { throw "Calibration regression tests failed" }
           python -m multicamera --self-test-calibration --report installer_output/calibration_source_test.json
@@ -129,24 +135,52 @@ jobs:
             }
           }
 
-      - name: Package portable ZIP
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force installer_output | Out-Null
-          Compress-Archive -Path dist\MultiCamera\* -DestinationPath installer_output\MultiCamera_portable_x64.zip -Force
-
-      - name: Install Inno Setup
-        if: ${{ github.event_name == 'push' || inputs.installer }}
-        run: choco install innosetup --yes --no-progress
-
-      - name: Build installer
+      - name: Locate or install Inno Setup
         if: ${{ github.event_name == 'push' || inputs.installer }}
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
-          & $iscc "/DMyAppVersion=$env:PRODUCT_VERSION" packaging\windows\MultiCamera.iss
-          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+          $ErrorActionPreference = "Stop"
+          function Find-Iscc {
+            foreach ($path in @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
+              if (Test-Path $path) { return $path }
+            }
+            $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($command) { return $command.Source }
+          }
+          $iscc = Find-Iscc
+          if (!$iscc) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+            $iscc = Find-Iscc
+          }
+          if (!$iscc) { throw "Inno Setup compiler was not found" }
+          "ISCC_EXE=$iscc" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Package Windows distributions
+        shell: pwsh
+        env:
+          BUILD_INSTALLER: ${{ github.event_name == 'push' || inputs.installer }}
+          INSTALLER_COMPRESSION: ${{ inputs.installer_compression || 'normal' }}
+        run: |
+          $packageArgs = @("scripts/package_windows.py")
+          if ($env:BUILD_INSTALLER -eq "true") {
+            $packageArgs += @("--installer-compiler", $env:ISCC_EXE, "--version", $env:PRODUCT_VERSION,
+              "--installer-compression", $env:INSTALLER_COMPRESSION)
+          }
+          python @packageArgs
+          if ($LASTEXITCODE -ne 0) { throw "Windows distribution packaging failed" }
+
+      - name: Summarize packaging performance
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $path = "installer_output/packaging_metrics.json"
+          if (Test-Path $path) {
+            '### Packaging performance' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            '```json' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Get-Content $path -Raw | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
 
       - name: Publish Windows Release
         shell: pwsh
@@ -159,6 +193,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $assets = @(Get-Item "installer_output/MultiCamera_portable_x64.zip")
           $assets += Get-Item "installer_output/calibration_source_test.json", "installer_output/calibration_self_test.json"
+          $assets += Get-Item "installer_output/packaging_metrics.json"
           if (Test-Path "installer_output/previous_opencv_audit.json") {
             $assets += Get-Item "installer_output/previous_opencv_audit.json"
           }

@@ -8,8 +8,15 @@
 #endif
 #define MyAppPublisher "MultiCamera"
 #define MyAppExeName "MultiCamera.exe"
-#define DistDir "..\\..\\dist\\MultiCamera"
-#define OutputRoot "..\\..\\installer_output"
+#ifndef DistDir
+  #define DistDir "..\\..\\dist\\MultiCamera"
+#endif
+#ifndef OutputRoot
+  #define OutputRoot "..\\..\\installer_output"
+#endif
+#ifndef MyCompression
+  #define MyCompression "lzma2/normal"
+#endif
 
 [Setup]
 AppId={{8F3C2A1B-9D0E-4F2A-8C7B-1E2D3A4B5C6D}
@@ -24,7 +31,7 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir={#OutputRoot}
 OutputBaseFilename=MultiCamera_Setup_{#MyAppVersion}_x64
-Compression=lzma2/ultra64
+Compression={#MyCompression}
 SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=..\..\assets\logo.ico

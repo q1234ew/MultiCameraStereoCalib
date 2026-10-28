@@ -54,7 +54,10 @@ if _assets.is_dir():
 for pkg in ("aiohttp", "zeroconf"):
     hiddenimports += collect_submodules(pkg)
 for pkg in ("scipy.optimize", "scipy.spatial"):
-    hiddenimports += collect_submodules(pkg)
+    hiddenimports += collect_submodules(
+        pkg, filter=lambda name: not any(part in {"tests", "test", "benchmarks"}
+                                        for part in name.split(".")),
+    )
 
 if include_open3d:
     d, b, h = collect_all("open3d")

@@ -147,6 +147,8 @@ python scripts/prepare_release.py --bump none         # 将当前已验证版本
 
 Windows 本地构建入口为 `scripts\build_windows.bat`；安装包入口为 `scripts\build_windows_installer.bat`，需要 Inno Setup 6。添加 `--pointcloud` 可选择包含 Open3D 的构建，具体参数见脚本和技术文档。
 
+安装器默认使用速度优先的 `normal` 压缩；Actions可选 `installer_compression=max/ultra64`，本地可设置 `MULTICAMERA_INSTALLER_COMPRESSION`。CI在最终EXE自检通过后并行生成ZIP与安装器，耗时及体积见新构建的Release附件 `packaging_metrics.json`；压缩更快可能使下载包略大，不影响程序功能。
+
 GitHub Actions 支持手动构建或推送 `v*` 标签触发构建。标签构建包含安装包，默认不包含 Open3D；发布前执行源代码回归、源码自检和最终 EXE 标定自检，通过后将安装包、便携 ZIP、报告及校验值发布到 Release。
 
 ## 文档与维护

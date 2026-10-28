@@ -21,7 +21,8 @@ if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Se
 if not "%ISCC%"=="" (
     echo.
     echo 使用 Inno Setup 生成安装包...
-    "%ISCC%" /DMyAppVersion=%PRODUCT_VERSION% packaging\windows\MultiCamera.iss
+    if not defined MULTICAMERA_INSTALLER_COMPRESSION set "MULTICAMERA_INSTALLER_COMPRESSION=normal"
+    python scripts\package_windows.py --installer-only --installer-compiler "%ISCC%" --version "%PRODUCT_VERSION%"
     if errorlevel 1 exit /b 1
     echo.
     echo 安装包: installer_output\MultiCamera_Setup_%PRODUCT_VERSION%_x64.exe
@@ -32,11 +33,10 @@ echo.
 echo [未检测到 Inno Setup 6] 已跳过 .exe 安装包。
 echo 请安装：https://jrsoftware.org/isdl.php  后重新运行本脚本。
 echo 正在生成 ZIP 便携包作为替代...
-powershell -NoProfile -Command ^
-  "Compress-Archive -Path (Join-Path '%CD%' 'dist\MultiCamera\*') -DestinationPath (Join-Path '%CD%' 'installer_output\MultiCamera_%PRODUCT_VERSION%_portable_x64.zip') -Force"
+python scripts\package_windows.py
 if errorlevel 1 (
     echo ZIP 打包失败，请手动压缩 dist\MultiCamera 文件夹。
     exit /b 2
 )
 echo.
-echo 便携 ZIP: installer_output\MultiCamera_%PRODUCT_VERSION%_portable_x64.zip
+echo 便携 ZIP: installer_output\MultiCamera_portable_x64.zip

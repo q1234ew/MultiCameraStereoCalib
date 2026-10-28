@@ -14,17 +14,24 @@ if /I "%~1"=="/pointcloud" set "WITH_POINTCLOUD=1"
 
 if not exist ".venv\Scripts\activate.bat" (
     python -m venv .venv
+    if errorlevel 1 exit /b 1
 )
 call .venv\Scripts\activate.bat
-python -m pip install -U pip
+if errorlevel 1 exit /b 1
+REM PEP 660 editable installs need pip 21.3+; upgrade only legacy environments.
+python -c "import importlib.metadata as m,sys; sys.exit(0 if tuple(int(p) for p in m.version('pip').split('.')[:2]) >= (21,3) else 1)" >nul 2>&1
+if errorlevel 1 (
+    python -m pip install --disable-pip-version-check --upgrade "pip>=21.3"
+    if errorlevel 1 exit /b 1
+)
 if "%WITH_POINTCLOUD%"=="1" (
     echo 构建点云完整包，将安装并打包 Open3D...
-    pip install -c packaging\windows\constraints.txt -e ".[build-win,pointcloud]"
+    python -m pip install --disable-pip-version-check --prefer-binary -c packaging\windows\constraints.txt -e ".[build-win,pointcloud]"
     if errorlevel 1 exit /b 1
     set "MULTICAMERA_WITH_OPEN3D=1"
 ) else (
     echo 构建轻量包，不打包 Open3D；点云功能在此包中不可用。
-    pip install -c packaging\windows\constraints.txt -e ".[build-win]"
+    python -m pip install --disable-pip-version-check --prefer-binary -c packaging\windows\constraints.txt -e ".[build-win]"
     if errorlevel 1 exit /b 1
     set "MULTICAMERA_WITH_OPEN3D="
 )

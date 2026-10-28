@@ -458,7 +458,7 @@ GitHub Actions 打包策略：
 - 手动构建可填写 `audit_release`（例如 `v0.1.0-build.20261020.2`），下载旧 ZIP、核对其校验清单，并在独立 Windows Python 进程加载旧包中的 `cv2.pyd`，输出 `previous_opencv_audit.json`。此报告检查旧原生绑定，不代表直接运行了旧 GUI EXE；探针环境的 Python 包 metadata 与归档二进制版本分开记录。
 - 发布 job 使用仓库自带的 `GITHUB_TOKEN` 和 `contents: write` 权限，不需要新增 PAT。相同 ref 的构建串行运行，避免同时修改同一个 Release。
 - tag 构建以当前标签创建 Release；手动构建自动使用 `windows-build-<run_id>` 标签，指向本次构建的精确 commit。带 `-` 的标签和手动构建标记为预发布，不覆盖正式 Latest。
-- 新 Release 先创建草稿，附件上传成功后再发布。重跑复用原标签并更新同名附件；启用不可变 Release 的仓库应使用新标签重新发布。
+- 新 Release 先创建草稿，附件上传成功后再发布。已存在的Release拒绝覆盖；修复后使用新的标签或新的手动构建运行，不移动已发布标签或替换同名二进制。
 - 下载入口为仓库的 `Releases` 页面，运行摘要同时输出本次 Release URL。下载 EXE/ZIP 附件，不要将自动生成的 Source code 压缩包当作可运行程序。
 - Release 发布失败时 job 保持失败状态，可查看 GitHub CLI 的权限、网络或附件上传错误。旧构建的“Re-run jobs”仍使用旧工作流；切换发布方式后必须用新提交触发构建。
 
@@ -1582,3 +1582,47 @@ RGB双目单组实时自适应采集时，右侧引导区顶部提供“补近�
 `tests/test_capture_actions.py` 覆盖补近/远及返回、数据更新期间保持指定目标、首次建会话/替换会话、模型/固定计划切换、回看保护、不可行分辨率、保存及参数准备禁用、自动定时器兼容、逐步提示和回退、PnP/重复构图/软件配对门禁，以及1000×680、1280×800、1440×1024布局截图。已有自适应和原图验收回归继续执行。
 
 本轮不改变标定求解器、距离阈值、原图验收规则、设备曝光/白平衡参数、点云或mrcal研究代码。Qt截图和模拟状态不能证明真实操作者移动体验；近/中/远完整实拍与Windows最终EXE仍需现场验证。
+
+## 39. Windows构建效率优化与耗时记录
+
+### 39.1 保留验证，减少重复工作
+
+Actions继续完整执行：安装依赖与pip check → 干净提交/版本/标签检查 → 全部应用回归 → 源码标定自检 → PyInstaller → 最终EXE标定自检 → 分发压缩 → 校验与Release发布。任何源码回归、EXE接口/数值/版本检查或分发任务失败均不能发布；不通过减少测试、复用旧EXE或跳过源码安装提速。
+
+Python依赖使用现有pip下载缓存，缓存键只取 `pyproject.toml` 和 `packaging/windows/constraints.txt`，不再因 `MultiCamera.spec` 改动失效。运行库、构建工具和pytest合并一次安装，优先使用符合约束的wheel，不再在现代CI环境每次升级pip或测试前单独安装pytest。本地脚本仅在pip低于21.3、不支持所需PEP660 editable安装时升级pip，保留旧Python环境兼容。
+
+SciPy仅对optimize/spatial继续收集所需子模块，显式扫描过滤tests/test/benchmarks，保留least_squares和Rotation等运行模块；不排除实际求解器、OpenCV接口或Qt运行插件。最终能否运行仍由新Windows构建的EXE验证，不以静态过滤测试代替。
+
+### 39.2 分发压缩与并行调度
+
+`scripts/package_windows.py` 使用标准库，不新增应用依赖。CI在最终EXE自检成功后才调用；便携ZIP与可选Inno安装器使用两个工作线程并行生成，仅共同读取同一份验证后的dist，等待两者结束。任一失败都会返回非零退出，不能降级为只发布另一个成功产物。
+
+- ZIP使用Deflate level 1，保持 `MultiCamera_portable_x64.zip` 文件名，EXE位于ZIP根目录而非额外套一层目录；包含隐藏资源和中文名称。相比原有Compress-Archive减少压缩工作，下载体积可能增加。source不允许空EXE、指向包外的符号链接或把输出目录放回source中。
+- Inno默认从 `lzma2/ultra64` 改为 `lzma2/normal`，保留SolidCompression。速度、构建内存和下载体积之间作明确取舍，不改变安装后的程序文件。手动Actions输入 `installer_compression` 可选normal/max/ultra64；标签构建默认normal。
+- 安装器先寻找已有ISCC，找不到才执行Chocolatey安装。编译器仍必须实际存在，安装命令失败不会继续发布。
+- ZIP与安装器分别在独立临时目录生成，成功验证后替换本地输出；失败不覆盖已有对应文件。ISCC即使返回0但没有产生新的非空EXE也会失败，不允许拿旧安装包冒充新产物。这里的本地输出替换不适用于已发布Release，后者仍禁止覆盖。
+
+CI同时请求ZIP和安装器时并行；只请求便携版时不安装Inno。`build_windows_installer.bat` 本地有ISCC时使用同一工具的 `--installer-only` 保持只生成安装器的路径；没有ISCC时生成统一命名的便携ZIP作为替代，不重复执行一次PyInstaller。
+
+本地选择压缩等级：
+
+```bat
+set MULTICAMERA_INSTALLER_COMPRESSION=max
+scripts\build_windows_installer.bat
+```
+
+`normal` 优先构建速度，`max` 用于更紧凑的压缩，`ultra64` 保留旧高压缩模式；选择后仍需执行全部校验。直接调用 `package_windows.py` 只做分发压缩，不能代替完整构建/自检入口。
+
+### 39.3 性能指标与发布附件
+
+工具生成 `installer_output/packaging_metrics.json`：总压缩墙钟耗时、是否并行、每个任务耗时、压缩设置、产物字节数，以及ZIP源文件数/未压缩字节数。任务失败时尽可能记录失败阶段并返回错误。并行任务耗时之和不等于实际墙钟时间，比较时应看总耗时及相同Open3D变体/压缩设置。
+
+Actions将该报告写入Job Summary，并随Release及SHA256SUMS发布；原来的源码和EXE两份标定报告继续保留。依赖安装、回归及PyInstaller阶段耗时仍查看Actions各步骤时间，不把压缩报告误称为全构建时间。
+
+### 39.4 验证与限制
+
+`tests/test_windows_packaging.py` 用标准ZIP往返校验根目录结构、隐藏和中文资源、原文件不变、实际并发启动、任一分发失败整体失败、旧ZIP/旧安装器保护、版本及输入检查、路径空格与中文、SciPy收集过滤和CI验证顺序；不调用真实ISCC，也不生成可运行Windows EXE。
+
+本机可做Python回归、源码标定自检、YAML解析、编译及Ruff检查，不能执行Windows批处理、真实Inno编译及最终EXE验收。本轮未触发远端构建，暂无可靠的Windows优化前后耗时/体积对照，不承诺固定节省比例。下一次经授权构建应对照相同变体的Actions步骤时间、packaging_metrics及实际下载体积，再确认默认压缩取舍是否合适。
+
+参考：[Inno压缩等级](https://jrsoftware.org/ishelp/topic_setup_compression.htm)、[PyInstaller收集接口](https://pyinstaller.org/en/stable/hooks.html)、[GitHub依赖缓存](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)。
