@@ -19,7 +19,7 @@
 
 在 [Releases](https://github.com/q1234ew/MultiCameraStereoCalib/releases) 中选择所需版本：
 
-- `MultiCamera_Setup_0.1.1_x64.exe`：Windows x64 安装包，文件名中的版本号以实际发布为准。
+- `MultiCamera_Setup_0.1.2_x64.exe`：Windows x64 安装包，文件名中的版本号以实际发布为准。
 - `MultiCamera_portable_x64.zip`：便携版，完整解压后运行 `MultiCamera.exe`，不要只复制 EXE。
 - `SHA256SUMS.txt`：下载文件校验值。
 - `calibration_source_test.json`、`calibration_self_test.json`：源码环境及最终 EXE 的标定自检报告。
@@ -134,8 +134,8 @@ python -m multicamera --self-test-calibration --report calibration_self_test.jso
 
 ```bash
 python scripts/prepare_release.py --dry-run           # 预览默认 PATCH 升版
-python scripts/prepare_release.py                     # PATCH：0.1.1 → 0.1.2
-python scripts/prepare_release.py --bump minor        # MINOR：0.1.1 → 0.2.0
+python scripts/prepare_release.py                     # PATCH：0.1.2 → 0.1.3
+python scripts/prepare_release.py --bump minor        # MINOR：0.1.2 → 0.2.0
 python scripts/prepare_release.py --preview --bump patch  # 新 PATCH 版本的首个测试构建
 python scripts/prepare_release.py --preview           # 当前目标版本的下一次测试构建
 python scripts/prepare_release.py --bump none         # 将当前已验证版本准备为正式版
