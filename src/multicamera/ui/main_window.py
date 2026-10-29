@@ -301,7 +301,7 @@ class MainWindow(QMainWindow):
 
     def _sync_auxiliary_panels(self):
         """Keep low-height windows usable without compressing the video area."""
-        floating = self.height() < 900
+        floating = self._capture_layout_active or self.height() < 900
         panels = (
             ('gallery', '配对图像', self._gallery._body, self._gallery.layout(), 1,
              self._gallery._toggle, bool(self._gallery._pairs)),

@@ -30,6 +30,7 @@ from ...streaming.stream_manager import StreamManager
 from ..opencv_unicode_text import TextPainter
 from ..theme import BG_CARD, BG_DARK, BORDER, TEXT, TEXT_DIM, TEXT_HINT, SUCCESS, DANGER, standard_icon
 from .capture_guide import CaptureSequence, CaptureTarget, draw_target_overlay
+from .stable_text import StableTextLabel
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -279,7 +280,7 @@ class CameraView(QFrame):
         self._image_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(self._image_label)
 
-        self._info = QLabel("等待连接...")
+        self._info = StableTextLabel("等待连接...", lines=2)
         self._info_color = TEXT_DIM
         self._info.setTextFormat(Qt.PlainText)
         self._info.setMinimumHeight(24)
@@ -290,15 +291,12 @@ class CameraView(QFrame):
             f" background: transparent;"
         )
         self._info.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._info.installEventFilter(self)
         layout.addWidget(self._info)
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Resize:
             if watched is self._image_label:
                 self._render_cached_frame()
-            elif watched is self._info:
-                self._info.setMinimumHeight(max(24, self._info.heightForWidth(event.size().width())))
         return super().eventFilter(watched, event)
 
     def set_expanded_mode(self, expanded: bool):
@@ -371,7 +369,6 @@ class CameraView(QFrame):
     def update_info(self, text: str):
         self._info.setText(text)
         self._info.setToolTip(text)
-        self._info.setMinimumHeight(max(24, self._info.heightForWidth(self._info.width())))
         color = DANGER if "无法连接" in text or "失败" in text else TEXT_DIM
         if color != self._info_color:
             self._info_color = color

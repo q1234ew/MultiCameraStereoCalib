@@ -105,7 +105,8 @@ def test_primary_instruction_advances_one_condition_at_a_time(stereo_bench, app,
     win = stereo_bench
     guide, _ = prepare(win, app)
     _, samples = guide._current_samples()
-    pose = {'yaw': 25., 'pitch': 0., 'depth': 1., 'distance_area': .02}
+    pose = {'yaw': 25., 'pitch': 0., 'depth': 1., 'distance_area': .02,
+            'distance_reliable': True}
     monkeypatch.setattr(guide, '_pose_measurement', lambda *args: dict(pose))
     for s in samples:
         s.update(center=np.array([.15, .5]), stable=False, sharp=False)
@@ -158,7 +159,8 @@ def test_conflicting_distance_stops_animation_and_resumes_in_correct_direction(
     guide.btn_near.click()
     areas = {LEFT: .02, RIGHT: .6}
     monkeypatch.setattr(guide, '_pose_measurement', lambda cid, *args:
-                        {'yaw': 0., 'pitch': 0., 'depth': .5, 'distance_area': areas[cid]})
+                        {'yaw': 0., 'pitch': 0., 'depth': .5, 'distance_area': areas[cid],
+                         'distance_reliable': True})
     guide.refresh()
     assert '暂停前后移动' in guide.instruction.text()
     assert guide.schematic.motion == 'hold'
@@ -185,7 +187,7 @@ def test_supplement_does_not_bypass_pose_gate(stereo_bench, app, monkeypatch):
     for s in samples:
         s.update(center=np.array([.5, .5]), distance_area=.16, sharp=True, stable=True)
     guide.refresh()
-    assert guide._instruction_stage == 'tilt' and '手动采集基础样本' in guide.instruction.text()
+    assert guide._instruction_stage == 'distance' and '等待距离确认' in guide.instruction.text()
     assert guide.schematic.motion == 'hold'
     assert not guide.schematic.timer.isActive()
     assert not guide.auto_ready()
@@ -195,7 +197,8 @@ def test_supplement_keeps_duplicate_and_pairing_gates(stereo_bench, app, monkeyp
     guide, _ = prepare(stereo_bench, app)
     guide.btn_near.click()
     monkeypatch.setattr(guide, '_pose_measurement', lambda *args:
-                        {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': .16})
+                        {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': .16,
+                         'distance_reliable': True})
     _, samples = guide._current_samples()
     for s in samples:
         s.update(center=np.array([.5, .5]), sharp=True, stable=True)

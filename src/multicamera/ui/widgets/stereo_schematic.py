@@ -15,6 +15,7 @@ from ..theme import ACCENT, BG_MID, BORDER, TEXT_DIM, TEXT_HINT, WARNING, app_ic
 from .board_motion import BoardTilt, TILT_ACTIONS, tilt_point
 from .stereo_camera_model import draw_stereo_camera
 from .board_view import EDGES, paint_board_view
+from .stable_text import StableTextLabel
 
 def motion_description(target):
     if target is None:
@@ -232,10 +233,10 @@ class StereoSchematic(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setAlignment(Qt.AlignTop)
         toolbar = QHBoxLayout()
-        self.description = QLabel("暂无采图动作")
+        self.description = StableTextLabel("暂无采图动作", lines=2)
         self.description.setWordWrap(True)
-        self.description.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         toolbar.addWidget(self.description, 1)
+        toolbar.addStretch()
         self.expand = QToolButton()
         self.expand.setCheckable(True)
         self.expand.setIcon(app_icon('maximize-2'))
@@ -325,6 +326,7 @@ class StereoSchematic(QWidget):
         self.canvas.setMinimumWidth(280 if self._preferred_compact else 360)
         self.canvas.setMinimumHeight(150 if compact else 210)
         self.canvas.setMaximumHeight(175 if compact else 16777215)
+        self.description.setVisible(not compact)
         self.caption.setVisible(not compact)
         self.view_options.setVisible(not compact)
         self.view_options.layout().setDirection(

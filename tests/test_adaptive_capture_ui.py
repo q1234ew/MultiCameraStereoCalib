@@ -59,7 +59,7 @@ def test_default_adaptive_worker_updates_overlay_without_final_intrinsics(stereo
     assert guide._analysis.recommendation.sample_count == 0
     assert win._stream_view._capture_sequence is guide._adaptive_sequence
     assert not panel._seq_widget.isVisible()
-    assert '未验证' in guide.reason.text()
+    assert '建立初始模型' in guide.reason.text()
     initial = guide._target()
     add_pair(win)
     guide.refresh()

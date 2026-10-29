@@ -19,13 +19,14 @@ from PySide6.QtWidgets import (
 from ...calibration.models import CameraModel
 from ...calibration.adaptive_guidance import (
     DISTANCE_LABELS, GuidanceObservation, evaluate_distance, measure_pose, measure_composition,
-    _candidate_feasible,
+    _candidate_feasible, reliable_distance_pose,
 )
 from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
 from ..theme import ACCENT, BORDER, SUCCESS, TEXT_DIM, WARNING, app_icon
 from .capture_guide import BoardTilt, TILT_LABELS, CaptureTarget, CaptureSequence
 from .stereo_schematic import StereoSchematic, TILT_ACTIONS
+from .stable_text import StableTextLabel
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +65,13 @@ class StereoCaptureWorkspace(QWidget):
             f"QWidget#stereoCaptureBanner {{background:#202830; border-bottom:1px solid {BORDER};}}"
             "QWidget#stereoCaptureBanner QLabel {background:transparent; border:none;}"
         )
-        self.instruction = QLabel("连接左右相机并放入标定板")
+        self.instruction = StableTextLabel("连接左右相机并放入标定板", lines=2)
         self.instruction.setWordWrap(True)
         self.instruction.setStyleSheet(
             f"color:{ACCENT}; font-size:18px; font-weight:bold; background:transparent;"
         )
         banner.addWidget(self.instruction, 2)
-        self.reason = QLabel("固定采图计划 · 等待实时检测")
+        self.reason = StableTextLabel("固定采图计划 · 等待实时检测", lines=2)
         self.reason.setWordWrap(True)
         self.reason.setStyleSheet('background:transparent;')
         banner.addWidget(self.reason, 1)
@@ -113,14 +114,17 @@ class StereoCaptureWorkspace(QWidget):
         self.status.setMinimumWidth(205)
         body.addWidget(self.status, 1)
         outer.addLayout(body)
-        self.compact_summary = QLabel()
+        self.compact_summary = StableTextLabel(lines=7)
         self.compact_summary.setWordWrap(True)
         self.compact_summary.hide()
         outer.addWidget(self.compact_summary)
-        self.advice = QLabel("建议补拍不同位置和倾角")
+        self.advice = StableTextLabel("建议补拍不同位置和倾角", lines=3)
         self.advice.setWordWrap(True)
         self.advice.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         outer.addWidget(self.advice)
+        self.receipt = StableTextLabel('本次原图：尚未采集', lines=2)
+        self.receipt.setAccessibleName('最近原图采集结果')
+        outer.addWidget(self.receipt)
 
         self.distance_tools = QWidget()
         distance_row = QGridLayout(self.distance_tools)
@@ -146,6 +150,9 @@ class StereoCaptureWorkspace(QWidget):
         self.btn_resume_guidance.setToolTip('结束指定距离补采，返回基于现有数据的自适应推荐')
         self.btn_resume_guidance.clicked.connect(self._resume_guidance)
         self.btn_resume_guidance.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        policy = self.btn_resume_guidance.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.btn_resume_guidance.setSizePolicy(policy)
         distance_row.addWidget(self.btn_resume_guidance, 0, 2)
         distance_row.setColumnStretch(3, 1)
         self.distance_tools.installEventFilter(self)
@@ -332,6 +339,7 @@ class StereoCaptureWorkspace(QWidget):
         intr = self.panel._intrinsics.get(camera_id)
         if intr is None and self._analysis and self._analysis_key == key:
             intr = self._analysis.intrinsics.get(camera_id)
+        sample['pose_expected'] = intr is not None
         if intr is None or intr.model != self.panel._camera_model:
             return None
         det = sample['detection']
@@ -608,7 +616,9 @@ class StereoCaptureWorkspace(QWidget):
         if pose is None:
             return "姿态估计不可用\n请检查内参、可见角点或调整姿态"
         prefix = '临时内参估计\n' if temporary else ''
-        return prefix + (f"板中心深度  {pose['depth']:.2f} m\n"
+        distance = (f"板中心深度  {pose['depth']:.2f} m（可信）" if reliable_distance_pose(pose)
+                    else '距离待确认（不显示米数）')
+        return prefix + (f"{distance}\n"
                          f"左右倾  {pose['yaw']:.1f}°\n上下倾  {pose['pitch']:.1f}°")
 
     def _refresh_sample_context(self):
@@ -653,12 +663,16 @@ class StereoCaptureWorkspace(QWidget):
             return 'visibility', '让标定板同时进入左右画面', 'hold'
         ready, message = self._distance_status(pairs, samples, target)
         if not ready:
+            if '距离临界' in message:
+                return 'distance', '前后小幅微调至目标距离档位中部，再保持静止', 'hold'
+            if '距离待确认' in message:
+                return 'distance', '保持板面清晰、朝向稳定，等待距离确认', 'hold'
             if '判断冲突' in message:
                 return 'distance', '先检查左右共视，暂停前后移动', 'hold'
             if '靠近' in message:
-                return 'distance', '向镜头靠近，保持当前高度', 'approach'
+                return 'distance', '将标定板靠近相机，保持当前高度', 'approach'
             if '远离' in message:
-                return 'distance', '远离镜头，保持当前高度', 'retreat'
+                return 'distance', '将标定板远离相机，保持当前高度', 'retreat'
             return 'distance', '保持板面朝向，等待双路距离检测', 'hold'
         if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
                    for s in samples):
@@ -668,7 +682,9 @@ class StereoCaptureWorkspace(QWidget):
         if not aligned:
             tilt_motion = 'plan' if target.tilt != BoardTilt.FRONT else 'hold'
             if '待内参' in message:
-                return 'tilt', '按示意调整板面朝向，手动采集基础样本', tilt_motion
+                action = TILT_ACTIONS.get(target.tilt)
+                move = action[0] if action else '将板面正对相机'
+                return 'tilt', move + '，然后手动点击采集', tilt_motion
             action = TILT_ACTIONS.get(target.tilt)
             return 'tilt', action[0] if action else '将板面转正，保持前后距离', tilt_motion
         if not all(s.get('sharp') for s in samples):
@@ -784,9 +800,14 @@ class StereoCaptureWorkspace(QWidget):
         self.pose_status.setToolTip("PnP 数值仅供观察；本轮不自动验收角度、方向或姿态多样性")
         if using_adaptive and not self.view.review_key:
             reached, message = self._adaptive_aligned(pairs, samples, target)
-            self.pose_status.setText(message)
+            # Keep the compact status readable; full numeric diagnostics stay in tooltips.
+            short_message = message.split(' · 等效板面占比')[0].split('；')[0]
+            if '非实测距离' in message and '距离待确认' not in message:
+                short_message += '（占比近似，待内参）'
+            self.pose_status.setText(short_message)
             self.pose_status.setStyleSheet(f'color:{SUCCESS if reached else WARNING};')
-            self.pose_status.setToolTip('经验验收范围，不代表精度合格；双路位置、角点凸包占比及倾角共同检查')
+            self.pose_status.setToolTip(message + '\n经验验收范围，不代表精度合格；'
+                                        '双路位置、距离可信度及倾角共同检查')
         matches = self._duplicate_matches(pairs, samples) if visible else []
         duplicate = bool(matches)
         self.advice.setText(
@@ -798,15 +819,33 @@ class StereoCaptureWorkspace(QWidget):
             self.advice.setText(self._analysis.summary)
         if using_adaptive and not self.view.review_key and not offline:
             self._instruction_stage, action, motion = self._primary_action(pairs, samples, target, duplicate)
-            self.instruction.setText(action)
+            self.instruction.setText('操作：' + action)
             prefix = ('指定补采' if self._distance_override else
                       '距离补采' if self._analysis.recommendation.repairing_distance else '自适应推荐')
-            evidence = ('已有内参支持，倾角可估计' if self._analysis.recommendation.pose_available
-                        else '冷启动：倾角未验证')
+            evidence = ('距离与倾角可检测' if self._analysis.recommendation.pose_available
+                        else '建立初始模型，请手动采图')
             complete = (self._distance_override is not None and self._distance_override
                         not in self._analysis.recommendation.missing_distances)
             subtitle = '本档数量已补足，可返回推荐' if complete else evidence
-            self.reason.setText(f'{prefix} · {DISTANCE_LABELS[target.scale]}\n{subtitle}')
+            tilts = {BoardTilt.FRONT: '正面', BoardTilt.TILT_LEFT: '左边近',
+                     BoardTilt.TILT_RIGHT: '右边近', BoardTilt.TILT_UP: '上边近',
+                     BoardTilt.TILT_DOWN: '下边近'}
+            goal = (f'{prefix} · 目标：{DISTANCE_LABELS[target.scale]}'
+                    if prefix != '自适应推荐' else
+                    f'目标：{DISTANCE_LABELS[target.scale]} · {tilts[target.tilt]}')
+            self.reason.setText(f'{goal}\n状态：{subtitle}')
+            poses = [self._pose_measurement(camera.camera_id, sample)
+                     for pair, offset in zip(pairs, range(0, len(samples), 2))
+                     for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
+            if not complete and poses and all(reliable_distance_pose(p) for p in poses):
+                values = ' / '.join(f"{p['depth']:.2f}" for p in poses)
+                self.reason.setText(f'{goal}\n'
+                                    f'板中心深度 {values} m · 可信估计')
+            busy_state = {'saving': '保存失败，请重试' if self.panel._failed_save_jobs else '等待原图保存',
+                          'preparation': '等待当前准备完成',
+                          'analysis': '更新采图建议中'}.get(self._instruction_stage)
+            if busy_state:
+                self.reason.setText(f'{goal}\n状态：{busy_state}')
             if self._distance_override:
                 label = DISTANCE_LABELS[self._distance_override]
                 self.advice.setText(f'指定补采：{label} · '
@@ -823,8 +862,10 @@ class StereoCaptureWorkspace(QWidget):
             instruction=self.instruction.text() if adaptive_action or live else None,
             motion=motion if adaptive_action else 'plan' if self._instruction_stage == 'fixed' else 'hold',
         )
+        self.instruction.setToolTip(self.instruction.text())
+        self._refresh_receipt(pairs, offline)
         self.advice.setStyleSheet(f"color:{WARNING if duplicate else TEXT_DIM}; font-size:12px;")
-        self.advice.setVisible(duplicate or not self._compact)
+        self.advice.setVisible(not self._compact)
         left = pairs[0].left.camera_id if pairs else None
         self.pose.setText("当前姿态（相对左相机）\n\n" + self._pose_text(left, samples[0] if samples else None))
         self.pose.setToolTip("深度为整板角点中心的相机 Z 值；左右倾正值为右边近，上下倾正值为下边近；不包含画面内旋转")
@@ -850,7 +891,8 @@ class StereoCaptureWorkspace(QWidget):
             f"稳定 {'✓' if stable else '待检查'}\n{self.pose_status.text()}\n"
             "数据集累计：板角点 ID / 视场网格\n" + '  '.join(self._coverage_summary)
         )
-        self.compact_summary.setToolTip(self.pose.text() + '\n' + self.status.text())
+        self.compact_summary.setToolTip(self.pose.text() + '\n' + self.status.text()
+                                       + '\n' + self.pose_status.toolTip())
         if offline:
             counts = self.view.displayed_corner_counts()
             origin = self.view.review_detection_origin if self.view.review_key else '缩放检测'
@@ -877,6 +919,41 @@ class StereoCaptureWorkspace(QWidget):
                 [self.panel._lbl_capture_count.text(), *self._coverage_summary],
             )
         )
+
+    def _refresh_receipt(self, pairs, offline):
+        self.receipt.setVisible(not offline)
+        if self.view.review_key:
+            self.receipt.setText(f'正在回看：{self.view.review_key}\n结束回看后继续实时采图')
+            self.receipt.setToolTip(self.receipt.text())
+            return
+        reviews = self.panel._capture_reviews.get(pairs[0].name, []) if pairs else []
+        if not reviews:
+            self.receipt.setText('本次原图：尚未采集\n预览角点与采图原图分别检测')
+            self.receipt.setToolTip(self.receipt.text())
+            return
+        item = reviews[-1]
+        token = item.save_token
+        state = ('保存失败' if token in self.panel._failed_save_jobs else
+                 '保存中' if token in self.panel._pending_save_tokens else
+                 '已保存' if token in self.panel._saved_capture_tokens else item.save_state)
+        left = getattr(item.left_detection, 'num_corners', 0)
+        right = getattr(item.right_detection, 'num_corners', 0)
+        accepted = item.quality_state == '可采纳'
+        quality = ('完整角点可采纳' if min(left, right) == self.board.num_corners else
+                   '部分角点可采纳') if accepted else item.quality_state or '验收待确认'
+        self.receipt.setText(f'本次原图 {item.key.rsplit(" ", 1)[-1]} · {state}\n'
+                             f'左{left} / 右{right} · {quality}')
+        next_step = ('未计入有效样本，请查看验收详情后重拍。' if not accepted else
+                     '保存失败，请重试保存原图，不要重复采集。' if state == '保存失败' else
+                     '下一步：按上方操作调整后继续采图；精度待标定评估。' if state == '已保存' else
+                     '请等待原图保存确认，再按上方操作继续。')
+        self.receipt.setToolTip(item.result_text() + '\n' + next_step)
+        if (state == '已保存' and self.adaptive and not self.view.review_key
+                and self._instruction_stage not in ('saving', 'preparation', 'analysis')
+                and '本档数量已补足' not in self.reason.text()):
+            goal = self.reason.text().split('\n')[0]
+            outcome = '已保存，按上方操作继续' if accepted else '已保存但未采纳，请查看验收详情'
+            self.reason.setText(f'{goal}\n本组原图{outcome}')
 
     def set_compact(self, compact):
         self._compact = compact

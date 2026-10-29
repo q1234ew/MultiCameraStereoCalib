@@ -30,7 +30,8 @@ def test_explicit_middle_near_far_then_height_groups(board):
     recs = [ag.analyze_guidance(board, CameraModel.PINHOLE,
             {c: seq[:n] for c, seq in data.items()},
             {c: intrinsics() for c in data}).recommendation for n in range(23)]
-    assert tuple(r.scale for r in recs[:7]) == ag.CENTRAL_DISTANCE_PLAN
+    # These observations are all far away: actual evidence supersedes request index.
+    assert tuple(r.scale for r in recs[:7]) == ('medium',) * 7
     assert all((r.zone_row, r.zone_col) == (1, 1) for r in recs[:7])
     heights = [r.zone_row for r in recs]
     assert [h for i, h in enumerate(heights) if i == 0 or h != heights[i - 1]] == [1, 0, 2]
@@ -91,7 +92,8 @@ def test_live_distance_changes_text_and_auto_gate(stereo_bench, app, monkeypatch
     for area, message, ready in ((.02, '靠近', False), (.2, '远离', False),
                                  (.07, '距离到位', True)):
         monkeypatch.setattr(guide, '_pose_measurement', lambda *args, a=area:
-                            {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': a})
+                            {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': a,
+                             'distance_reliable': True})
         ok, text = guide._distance_status(pair, samples, target)
         assert ok is ready and message in text and 'PnP深度等效' in text
         aligned, _ = guide._adaptive_aligned(pair, samples, target)
@@ -192,7 +194,8 @@ def test_replay_and_client_share_distance_gate(stereo_bench, both_poses, monkeyp
 
     guide = stereo_bench._stereo_capture
     pair = stereo_bench._calib_panel._sm.stereo_pairs['rgb']
-    pose = {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': .07}
+    pose = {'yaw': 0., 'pitch': 0., 'depth': 1., 'distance_area': .07,
+            'distance_reliable': True}
     poses = {LEFT: pose, RIGHT: pose if both_poses else None}
     monkeypatch.setattr(guide, '_pose_measurement', lambda cid, sample: poses[cid])
     samples = [{'valid': True, 'center': np.array([.5, .5]), 'area': .025,
@@ -206,4 +209,46 @@ def test_replay_and_client_share_distance_gate(stereo_bench, both_poses, monkeyp
     verdict = _matches(rec, measurements)
     assert verdict['composition_match'] is both_poses
     assert expected is both_poses
-    assert source == ('pnp' if both_poses else 'composition')
+    assert source == ('pnp' if both_poses else 'uncertain')
+
+
+def test_live_metric_distance_disappears_when_pose_is_untrusted(stereo_bench, app, tmp_path):
+    win = stereo_bench
+    guide = activate(win, app)
+    det, frame, intr = sample(win)
+    win._calib_panel._intrinsics.update({LEFT: intr, RIGHT: intr})
+    publish_stable(win, det, frame)
+    settle(guide, app)
+    assert '板中心深度' in guide.reason.text() and 'm' in guide.pose.text()
+    assert '目标' in guide.reason.toolTip()
+    assert '目标' not in guide.compact_summary.text()
+    app.processEvents()
+    win.grab().save(str(tmp_path / 'pnp-distance-credible.png'))
+    bad = deepcopy(intr)
+    bad.rms_error = 3.
+    win._calib_panel._intrinsics.update({LEFT: bad, RIGHT: bad})
+    publish_stable(win, deepcopy(det), frame)
+    settle(guide, app)
+    assert '板中心深度' not in guide.reason.text()
+    assert '不显示米数' in guide.pose.text()
+    assert '内参拟合误差偏大' in guide.reason.toolTip()
+    assert guide.schematic.motion == 'hold'
+    assert not guide.auto_ready()
+    app.processEvents()
+    win.grab().save(str(tmp_path / 'pnp-distance-uncertain.png'))
+
+
+def test_uncertain_distance_blocks_raw_gate_as_well_as_preview(stereo_bench, app, monkeypatch):
+    guide = activate(stereo_bench, app)
+    det, frame, intr = sample(stereo_bench)
+    intr.rms_error = 3.
+    stereo_bench._calib_panel._intrinsics.update({LEFT: intr, RIGHT: intr})
+    publish_stable(stereo_bench, det, frame)
+    settle(guide, app)
+    pairs, samples = guide._current_samples()
+    ready, text = guide._adaptive_aligned(pairs, samples, guide._target())
+    assert not ready and '距离待确认' in text
+    # Simulate the preview gate having passed before the raw recheck.
+    monkeypatch.setattr(guide, 'auto_ready', lambda: True)
+    ready, text = guide.validate_capture('rgb', frame, frame, det, det)
+    assert not ready and '距离待确认' in text

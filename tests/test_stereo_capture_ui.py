@@ -168,11 +168,10 @@ def test_gallery_and_logs_keep_preview_visible_and_restore_inline(stereo_bench, 
             win._calib_panel._footer_info.geometry())
         for key, widget in (('gallery', win._gallery._body), ('logs', win._logs_widget)):
             dialog = win._aux_panel_dialogs[key]
-            assert dialog.isVisible() == (size[1] < 900)
+            assert dialog.isVisible()
             assert widget.isVisible()
-            if size[1] < 900:
-                assert widget.parentWidget() is dialog
-                dialog.grab().save(str(directory / f'{key}-tool-{size[0]}.png'))
+            assert widget.parentWidget() is dialog
+            dialog.grab().save(str(directory / f'{key}-tool-{size[0]}.png'))
         win.grab().save(str(directory / f'capture-panels-{size[0]}.png'))
     QTest.keyClick(win._aux_panel_dialogs['gallery'], Qt.Key_Escape)
     assert not win._gallery._toggle.isChecked()
@@ -182,6 +181,11 @@ def test_gallery_and_logs_keep_preview_visible_and_restore_inline(stereo_bench, 
     assert len(win._gallery._pairs) == 4
     win._aux_panel_dialogs['logs'].close()
     assert not win._toggle_logs.isChecked()
+    win.resize(1440, 1024)
+    win._calib_panel.show_workflow('calibration', False)
+    app.processEvents()
+    assert win._gallery._body.parentWidget() is win._gallery
+    assert win._logs_widget.parentWidget() is win._workspace
 
 
 def test_expanded_schematic_fits_sidebar_without_horizontal_scroll(stereo_bench, app, tmp_path):

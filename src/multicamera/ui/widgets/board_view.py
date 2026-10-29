@@ -130,9 +130,9 @@ def paint_board_view(p, rect, target, progress, point, compact=False, layer='dyn
             p.setBrush(QColor(BG_MID))
             p.drawRoundedRect(panel.adjusted(1, 1, -1, -1), 6, 6)
         _text(p, QRectF(main.x() + 4, main.y(), main.width() - 8, heading),
-              '板面放大 · 同左目方向', TEXT, 11 if compact else 12)
+              '相机视角 · 不镜像', TEXT, 11 if compact else 12)
         _text(p, QRectF(depth.x() + 4, depth.y(), depth.width() - 8, heading),
-              ('立体 · 相机固定' if oblique else '侧视 · 镜头在左' if side else '俯视 · 镜头在下'),
+              ('位置示意 · 相机固定' if oblique else '侧视 · 镜头在左' if side else '俯视 · 镜头在下'),
               TEXT, 10 if compact else 12)
         if target is None:
             _text(p, main_image, '等待采图计划')

@@ -85,6 +85,7 @@ from ..theme import (
     BORDER, SUCCESS, TEXT, TEXT_DIM, TEXT_HINT, WARNING, DANGER, standard_icon, app_icon,
 )
 from ..configuration import ConfigurationImpact
+from .stable_text import StableTextLabel
 from .capture_guide import (
     CaptureSequence,
     CaptureSequenceWidget,
@@ -1413,17 +1414,18 @@ class CalibrationPanel(QWidget):
         info.setSpacing(6)
         info.setAlignment(Qt.AlignTop)
         layout.addWidget(self._footer_info)
-        self._lbl_raw_save = QLabel()
+        self._lbl_raw_save = StableTextLabel(lines=1)
+        self._lbl_raw_save.setMinimumWidth(self._footer_info.minimumWidth())
         self._lbl_raw_save.setWordWrap(False)
-        self._lbl_raw_save.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
-        self._lbl_raw_save.setMinimumHeight(self._lbl_raw_save.fontMetrics().height())
         self._lbl_raw_save.setStyleSheet(f"font-size:12px; color:{TEXT_DIM};")
         info.addWidget(self._lbl_raw_save)
-        self._lbl_capture_readiness = QLabel()
+        self._lbl_capture_readiness = StableTextLabel(lines=1)
         self._lbl_capture_readiness.setWordWrap(True)
         self._lbl_capture_readiness.setTextFormat(Qt.PlainText)
         self._lbl_capture_readiness.setStyleSheet(f'color:{TEXT_DIM}; background:transparent; font-size:12px;')
-        info.addWidget(self._lbl_capture_readiness)
+        self._capture_status_pages = QStackedWidget()
+        self._capture_status_pages.addWidget(self._lbl_capture_readiness)
+        info.addWidget(self._capture_status_pages)
         self._combo_capture_quality = QComboBox()
         self._combo_capture_quality.addItem('验收：自动（允许部分角点）', 'automatic')
         self._combo_capture_quality.addItem('验收：完整角点', 'strict')
@@ -1439,10 +1441,9 @@ class CalibrationPanel(QWidget):
             self, '采图验收详情', self._lbl_capture_decision.toolTip()))
         quality_row.addWidget(self._btn_capture_decision_details)
         info.addLayout(quality_row)
-        self._lbl_capture_decision = QLabel()
+        self._lbl_capture_decision = StableTextLabel(lines=2)
         self._lbl_capture_decision.setWordWrap(True)
         self._lbl_capture_decision.setTextFormat(Qt.PlainText)
-        self._lbl_capture_decision.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._lbl_capture_decision.setToolTip('保存成功不代表通过标定验收；待复核和拒收不计入有效样本，可重拍或撤销。')
         info.addWidget(self._lbl_capture_decision)
         self._btn_retry_save = QToolButton()
@@ -1452,11 +1453,11 @@ class CalibrationPanel(QWidget):
         self._btn_retry_save.setToolTip('使用保留的原图重试，不重复检测或增加采集记录')
         self._btn_retry_save.clicked.connect(self._retry_failed_saves)
         self._btn_retry_save.hide()
-        info.addWidget(self._btn_retry_save)
+        self._capture_status_pages.addWidget(self._btn_retry_save)
         self._wb_progress = QWidget()
         progress_row = QHBoxLayout(self._wb_progress)
         progress_row.setContentsMargins(0, 0, 0, 0)
-        self._lbl_wb_progress = QLabel()
+        self._lbl_wb_progress = StableTextLabel(lines=1)
         self._lbl_wb_progress.setWordWrap(True)
         self._lbl_wb_progress.setStyleSheet(f"color:{ACCENT}; background:transparent; font-size:12px;")
         progress_row.addWidget(self._lbl_wb_progress, 1)
@@ -1467,7 +1468,11 @@ class CalibrationPanel(QWidget):
         self._btn_cancel_wb.setToolTip("取消白平衡准备及本次待执行的采图")
         self._btn_cancel_wb.clicked.connect(self._cancel_white_balance)
         progress_row.addWidget(self._btn_cancel_wb)
-        info.addWidget(self._wb_progress)
+        self._capture_status_pages.addWidget(self._wb_progress)
+        self._capture_status_pages.setFixedHeight(max(self._lbl_wb_progress.height(),
+                                                      self._btn_retry_save.sizeHint().height(),
+                                                      self._btn_cancel_wb.sizeHint().height()))
+        self._capture_status_pages.setCurrentWidget(self._lbl_capture_readiness)
         self._wb_progress.hide()
         self._wb_progress_timer = QTimer(self)
         self._wb_progress_timer.setInterval(250)
@@ -1600,6 +1605,10 @@ class CalibrationPanel(QWidget):
         self._footer_info.setMaximumWidth(280 if compact else 16777215)
         self._action_footer.layout().setStretch(0, 1 if compact else 0)
         self._action_footer.layout().setStretch(1, 2 if compact else 0)
+        self._footer_info.layout().setSpacing(2 if compact else 6)
+        self._lbl_capture_decision.set_lines(1 if compact else 2)
+        self._lbl_capture_decision.setVisible(self._workflow_phase == 'capture'
+                                              and self._active_step != 2 and not self.offline_selection)
 
     def _set_board_details(self, expanded):
         self._aux_board_details.setVisible(expanded)
@@ -1962,7 +1971,7 @@ class CalibrationPanel(QWidget):
                 )
                 if failed:
                     self._lbl_raw_save.setStyleSheet(f'color:{DANGER}; background:transparent; font-size:12px;')
-        self._btn_retry_save.setVisible(bool(self._failed_save_jobs) and self._active_step != 2)
+        self._sync_capture_status_page()
         self._btn_retry_save.setEnabled(not self._pending_save_tokens and not self._white_balance_guard.busy)
         if self.offline_selection and self._active_step != 2:
             self._lbl_raw_save.setText('离线原图保留在源目录')
@@ -1983,7 +1992,8 @@ class CalibrationPanel(QWidget):
 
     def _refresh_capture_readiness(self):
         visible = self._workflow_phase == 'capture' and self._active_step == 0 and not self.offline_selection
-        self._lbl_capture_readiness.setVisible(visible)
+        self._lbl_capture_readiness.setVisible(
+            visible and self._capture_status_pages.currentWidget() is self._lbl_capture_readiness)
         if not visible:
             return
         pairs = self._selected_pairs()
@@ -3656,7 +3666,7 @@ class CalibrationPanel(QWidget):
         self._refresh_capture_source_ui()
 
     def _on_white_balance_busy(self, busy):
-        self._wb_progress.setVisible(busy)
+        self._sync_capture_status_page(busy)
         if busy:
             self._wb_progress_timer.start()
             self._refresh_white_balance_progress()
@@ -3675,7 +3685,18 @@ class CalibrationPanel(QWidget):
         guard = self._white_balance_guard
         elapsed = max(0, time.monotonic() - guard.started_at)
         self._lbl_wb_progress.setText(f'{guard.stage} · 已等待 {elapsed:.0f} 秒')
+        self._lbl_wb_progress.setToolTip(self._lbl_wb_progress.text())
         self._btn_cancel_wb.setEnabled(not guard.cancel_requested)
+
+    def _sync_capture_status_page(self, busy=None):
+        busy = self._white_balance_guard.busy if busy is None else busy
+        page = (self._wb_progress if busy else self._btn_retry_save
+                if self._failed_save_jobs and self._active_step != 2
+                else self._lbl_capture_readiness)
+        self._capture_status_pages.setCurrentWidget(page)
+        self._capture_status_pages.setVisible(self._workflow_phase == 'capture' and (
+            busy or self._active_step == 0 and not self.offline_selection
+            or bool(self._failed_save_jobs) and self._active_step != 2))
 
     def _cancel_white_balance(self):
         self._white_balance_guard.cancel()

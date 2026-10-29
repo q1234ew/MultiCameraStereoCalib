@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 
 import cv2
@@ -39,6 +39,8 @@ TILTED_FOOTPRINT_PADDING = 1.08
 MIN_BOARD_HULL_FRACTION = .5
 TILT_THRESHOLD_DEGREES = 12.
 MAX_REPROJECTION_RMS = 3.
+MAX_DISTANCE_RELATIVE_STD = .05
+MAX_DISTANCE_SPACING_ERROR = .10
 BOOTSTRAP_MIN_VIEWS = 6
 BOOTSTRAP_MAX_VIEWS = 30
 BOOTSTRAP_MAX_RMS = 2.5
@@ -78,6 +80,14 @@ class GuidanceAnalysis:
     recommendation: GuidanceRecommendation
     intrinsics: dict[str, CameraIntrinsics]
     summary: str
+    distance_counts: dict[str, int] = field(default_factory=dict)
+    approximate_distance_counts: dict[str, int] = field(default_factory=dict)
+
+
+def reliable_distance_pose(pose):
+    return bool(pose is not None and pose.get('distance_reliable', False)
+                and np.isfinite(pose.get('distance_area', np.nan))
+                and pose['distance_area'] > 0)
 
 
 def _hull_area(points):
@@ -170,12 +180,69 @@ def evaluate_distance(scale, measurements):
                                    for m in measurements):
         return False, '等待双路距离检测', [], 'unavailable'
     poses = [m.get('pose') for m in measurements]
-    reliable = all(p is not None and 'distance_area' in p for p in poses)
+    reliable = all(reliable_distance_pose(p) for p in poses)
     areas = ([p['distance_area'] for p in poses] if reliable else
              [m.get('distance_area', m.get('area', 0)) for m in measurements])
     ready, text = distance_feedback(scale, areas)
-    source = 'PnP深度等效' if reliable else '占比近似，非实测距离；先保持板面朝向'
-    return ready, f'{text}（{source}）', areas, 'pnp' if reliable else 'composition'
+    if reliable:
+        distances = []
+        low, high = SCALE_AREA_RANGES[scale]
+        boundary = False
+        for i, p in enumerate(poses, 1):
+            # A = C/Z² converts the same scale policy into camera-specific metres.
+            factor = p['distance_area'] * p['depth'] ** 2
+            margin = 2 * p.get('depth_std', 0.)
+            boundary |= (ready and not (np.sqrt(factor / high) + margin <= p['depth']
+                                       <= np.sqrt(factor / low) - margin))
+            distances.append(f"相机{i}板中心深度 {p['depth']:.2f} m"
+                             f"（目标 {np.sqrt(factor / high):.2f}–"
+                             f"{np.sqrt(factor / low):.2f} m）")
+        if boundary:
+            text = '距离临界，稍向目标档位中部移动后保持静止；' + text
+        return ready and not boundary, (f"{text}（PnP深度等效 · 可信）；"
+                                       + '；'.join(distances)), areas, 'pnp'
+    uncertain = any(m.get('pose_expected') or m.get('pose') is not None for m in measurements)
+    source = '占比近似，非实测距离；先保持板面朝向'
+    if uncertain:
+        reasons = sorted({p.get('distance_reason', '距离可信度不足')
+                          for p in poses if p is not None and not reliable_distance_pose(p)})
+        reason = '、'.join(reasons) or 'PnP不可解或内参不匹配'
+        return False, f'距离待确认：{reason}；{text}（{source}，暂不自动验收）', areas, 'uncertain'
+    return ready, f'{text}（{source}）', areas, 'composition'
+
+
+def _distance_quality(obj, image, rv, center_translation, K, d, project, rms, intrinsics):
+    """Conditional local pose uncertainty; excludes intrinsic/board systematic error."""
+    radius = float(np.linalg.norm(np.ptp(obj, axis=0)))
+    parameters = np.r_[rv.ravel(), center_translation.ravel() / radius]
+    columns = []
+    for axis in range(6):
+        plus, minus = parameters.copy(), parameters.copy()
+        plus[axis] += 1e-5
+        minus[axis] -= 1e-5
+        a = project(obj.reshape(-1, 1, 3), plus[:3], plus[3:] * radius, K, d)[0]
+        b = project(obj.reshape(-1, 1, 3), minus[:3], minus[3:] * radius, K, d)[0]
+        columns.append(((a - b) / 2e-5).ravel())
+    _, singular, vt = np.linalg.svd(np.column_stack(columns), full_matrices=False)
+    if singular[-1] <= singular[0] * 1e-10:
+        return False, '位姿约束退化', None
+    sigma = max(.5, rms * np.sqrt(2 * len(image) / max(1, 2 * len(image) - 6)))
+    covariance = (vt.T * (sigma / singular) ** 2) @ vt
+    depth_std = float(radius * np.sqrt(max(0., covariance[5, 5])))
+    points = image.reshape(-1, 2)
+    separations = np.linalg.norm(points[:, None] - points[None, :], axis=2)
+    np.fill_diagonal(separations, np.inf)
+    spacing = float(np.median(separations.min(axis=1)))
+    reasons = []
+    if intrinsics.rms_error > BOOTSTRAP_MAX_RMS:
+        reasons.append('内参拟合误差偏大')
+    if spacing < MIN_CORNER_SPACING_PX:
+        reasons.append('角点间距过小')
+    if rms > MAX_DISTANCE_SPACING_ERROR * spacing:
+        reasons.append('重投影误差相对角点间距偏大')
+    if depth_std / center_translation[2] > MAX_DISTANCE_RELATIVE_STD:
+        reasons.append('深度估计不稳定')
+    return not reasons, '、'.join(reasons) or '局部深度约束通过', depth_std
 
 
 def _valid_intrinsics(intrinsics, size, model):
@@ -242,13 +309,20 @@ def measure_pose(board, observation, intrinsics) -> dict | None:
         if not np.isfinite(rms) or rms > MAX_REPROJECTION_RMS:
             return None
         normal = R[:, 2] * (1 if R[2, 2] > 0 else -1)
-        depth = float(np.mean(transformed[:, 2]))
+        midpoint = (all_points.min(axis=0) + all_points.max(axis=0)) / 2
+        board_center = R @ midpoint + tv.ravel()
+        depth = float(board_center[2])
+        reliable, reason, depth_std = _distance_quality(
+            obj - midpoint, image, rv, board_center, K, d, project, rms, intrinsics)
         frontal_area = (_hull_area(all_points[:, :2]) * K[0, 0] * K[1, 1]
                         / (np.prod(clean.image_size) * depth ** 2))
         return dict(yaw=float(np.degrees(np.arctan2(normal[0], normal[2]))),
                     pitch=float(np.degrees(np.arctan2(normal[1], normal[2]))),
-                    depth=depth, area=area, center=center, distance_area=float(frontal_area))
-    except (ValueError, TypeError, cv2.error):
+                    depth=depth, range=float(np.linalg.norm(board_center)),
+                    depth_std=depth_std, reprojection_rms=float(rms),
+                    distance_reliable=reliable, distance_reason=reason,
+                    area=area, center=center, distance_area=float(frontal_area))
+    except (ValueError, TypeError, np.linalg.LinAlgError, cv2.error):
         return None
 
 
@@ -423,6 +497,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     pose_available = len(intrinsics) == 2
     verified = 0
     paired_distances = Counter()
+    approximate_distances = Counter()
     repair_requests = Counter()
     repairing_distance = False
     requests, zone_requests, tilt_requests = Counter(), Counter(), Counter()
@@ -439,7 +514,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         pair_scales = []
         pair_areas = []
         # Do not mix one camera's PnP with the other camera's fallback scale.
-        reliable_distance = all(p is not None and 'distance_area' in p for p in poses)
+        reliable_distance = all(reliable_distance_pose(p) for p in poses)
         for i, g in enumerate(pair):
             fraction = _hull_area(g[1][:, :2]) / _hull_area(np.asarray(board.object_points)[:, :2])
             distance_area = (poses[i]['distance_area'] if reliable_distance else g[3] / fraction)
@@ -452,9 +527,15 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                 tilt = _tilt(poses[i])
                 tilts[i][tilt] += 1
                 joint[(*zone, tilt, scale)] += 1
+        measurements = [dict(valid=True, pose=p, pose_expected=camera in intrinsics,
+                             distance_area=a)
+                        for camera, p, a in zip(cameras, poses, pair_areas)]
         if (pair_scales[0] == pair_scales[1]
-                and distance_feedback(pair_scales[0], pair_areas)[0]):
-            paired_distances[pair_scales[0]] += 1
+                and evaluate_distance(pair_scales[0], measurements)[0]):
+            if reliable_distance:
+                paired_distances[pair_scales[0]] += 1
+            else:
+                approximate_distances[pair_scales[0]] += 1
         def score(candidate):
             r, c, t, s = candidate
             coverage = sum(sc[s] + .7 * ti[t]
@@ -479,6 +560,12 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             local = [c for c in alternatives if c[:2] == zone]
             if zone == (1, 1) and zone_requests[zone] < len(CENTRAL_DISTANCE_PLAN):
                 desired = CENTRAL_DISTANCE_PLAN[zone_requests[zone]]
+                if reliable_distance:
+                    gaps = [s for s in ('medium', 'large', 'small')
+                            if paired_distances[s] < DISTANCE_SAMPLE_GOALS[s]
+                            and any(c[3] == s for c in local)]
+                    if gaps:
+                        desired = gaps[0]
                 at_distance = [c for c in local if c[3] == desired]
                 if at_distance:
                     local = at_distance
@@ -512,9 +599,13 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         reason = f'当前分辨率下构图难以兼顾边距和角点间距；请调整分辨率或标定板。{status}。'
     distances = ' / '.join(f'{DISTANCE_LABELS[s]} {paired_distances[s]}'
                            for s in ('large', 'medium', 'small'))
+    approximate = ' / '.join(f'{DISTANCE_LABELS[s]} {approximate_distances[s]}'
+                             for s in ('large', 'medium', 'small'))
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
                '中央中→近→远，再同高度补边缘；已建议不计姿态或距离覆盖。'
-               f'双路同档距离样本：{distances}。'
+               f'双路同档可信PnP距离样本：{distances}。'
+               f'占比近似样本：{approximate}。'
+               '占比近似不计为可信距离覆盖；内参可用后重新评估全部历史样本。'
                '构图仅为几何近似，不保证双目共视；不代表标定完成或全局最优。')
     unavailable = [s for s in _SCALES if not any(c[:2] == (1, 1) and c[3] == s for c in candidates)]
     if unavailable:
@@ -531,4 +622,5 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             summary += '本轮补采建议已达上限，先完成分区；缺口未清零，不代表距离采集完成。'
     rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique),
                                  bool(candidates), repairing_distance, missing)
-    return GuidanceAnalysis(rec, intrinsics, summary)
+    return GuidanceAnalysis(rec, intrinsics, summary, dict(paired_distances),
+                            dict(approximate_distances))

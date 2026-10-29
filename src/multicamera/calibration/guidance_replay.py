@@ -12,7 +12,9 @@ from .adaptive_guidance import (
 
 def _snapshot(analysis):
     return {'recommendation': asdict(analysis.recommendation), 'summary': analysis.summary,
-            'intrinsic_cameras': sorted(analysis.intrinsics)}
+            'intrinsic_cameras': sorted(analysis.intrinsics),
+            'distance_counts': analysis.distance_counts,
+            'approximate_distance_counts': analysis.approximate_distance_counts}
 
 
 def _measurement(board, observation, intrinsics):
@@ -26,7 +28,7 @@ def _measurement(board, observation, intrinsics):
         pose = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in pose.items()}
     return {'geometry_valid': True, 'center': center.tolist(), 'area': geometry[3],
             'distance_area': measure_composition(board, clean)['distance_area'],
-            'corners': len(clean.ids), 'pose': pose}
+            'corners': len(clean.ids), 'pose': pose, 'pose_expected': intrinsics is not None}
 
 
 def _matches(recommendation, measurements):
