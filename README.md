@@ -20,7 +20,7 @@
 在 [Releases](https://github.com/q1234ew/MultiCameraStereoCalib/releases) 中选择所需版本：
 
 - `MultiCamera_Setup_0.1.2_x64.exe`：Windows x64 安装包，文件名中的版本号以实际发布为准。
-- `MultiCamera_portable_x64.zip`：便携版，完整解压后运行 `MultiCamera.exe`，不要只复制 EXE。
+- `MultiCamera_portable_<version>_x64.zip`：后续便携版统一包含实际产品版本号，完整解压后运行 `MultiCamera.exe`，不要只复制 EXE。已发布的0.1.2预览包仍使用 `MultiCamera_portable_x64.zip`，历史附件不改名。
 - `SHA256SUMS.txt`：下载文件校验值。
 - `calibration_source_test.json`、`calibration_self_test.json`：源码环境及最终 EXE 的标定自检报告。
 

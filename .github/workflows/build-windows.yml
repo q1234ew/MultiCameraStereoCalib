@@ -90,10 +90,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $downloadDir = Join-Path $env:RUNNER_TEMP "opencv-previous-release"
-          gh release download $env:AUDIT_RELEASE --repo $env:GH_REPO --dir $downloadDir --pattern "MultiCamera_portable_x64.zip" --pattern "SHA256SUMS.txt"
+          gh release download $env:AUDIT_RELEASE --repo $env:GH_REPO --dir $downloadDir --pattern "MultiCamera_portable*_x64.zip" --pattern "SHA256SUMS.txt"
           if ($LASTEXITCODE -ne 0) { throw "Could not download previous Release" }
-          $zipPath = Join-Path $downloadDir "MultiCamera_portable_x64.zip"
-          $expected = (Get-Content (Join-Path $downloadDir "SHA256SUMS.txt") | Where-Object { $_ -match '  MultiCamera_portable_x64\.zip$' }).Split()[0]
+          $archives = @(Get-ChildItem $downloadDir -File -Filter "MultiCamera_portable*_x64.zip")
+          if ($archives.Count -ne 1) { throw "Expected exactly one portable ZIP in previous Release" }
+          $zipPath = $archives[0].FullName
+          $checksumPattern = '^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($archives[0].Name) + '$'
+          $records = @(Get-Content (Join-Path $downloadDir "SHA256SUMS.txt") | Where-Object { $_ -match $checksumPattern })
+          if ($records.Count -ne 1) { throw "Expected exactly one matching portable ZIP checksum" }
+          $expected = ($records[0] -split '\s+', 2)[0]
           if ((Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
             throw "Previous Release archive checksum mismatch"
           }
@@ -162,9 +167,9 @@ jobs:
           BUILD_INSTALLER: ${{ github.event_name == 'push' || inputs.installer }}
           INSTALLER_COMPRESSION: ${{ inputs.installer_compression || 'normal' }}
         run: |
-          $packageArgs = @("scripts/package_windows.py")
+          $packageArgs = @("scripts/package_windows.py", "--version", $env:PRODUCT_VERSION)
           if ($env:BUILD_INSTALLER -eq "true") {
-            $packageArgs += @("--installer-compiler", $env:ISCC_EXE, "--version", $env:PRODUCT_VERSION,
+            $packageArgs += @("--installer-compiler", $env:ISCC_EXE,
               "--installer-compression", $env:INSTALLER_COMPRESSION)
           }
           python @packageArgs
@@ -191,7 +196,7 @@ jobs:
           BUILD_POINTCLOUD: ${{ inputs.pointcloud || false }}
         run: |
           $ErrorActionPreference = "Stop"
-          $assets = @(Get-Item "installer_output/MultiCamera_portable_x64.zip")
+          $assets = @(Get-Item "installer_output/MultiCamera_portable_$($env:PRODUCT_VERSION)_x64.zip")
           $assets += Get-Item "installer_output/calibration_source_test.json", "installer_output/calibration_self_test.json"
           $assets += Get-Item "installer_output/packaging_metrics.json"
           if (Test-Path "installer_output/previous_opencv_audit.json") {

@@ -32,10 +32,12 @@ def source(tmp_path):
 def test_portable_roundtrip_keeps_all_resources_without_wrapper_folder(source, tmp_path):
     before = {p.relative_to(source).as_posix(): p.read_bytes() for p in source.rglob('*') if p.is_file()}
     output = tmp_path / 'output bundle'
-    report = packaging.package(source, output)
+    report = packaging.package(source, output, version='1.2.3')
     assert report['status'] == 'passed' and not report['parallel']
     assert report['phases'][0]['compression_level'] == 1
-    with zipfile.ZipFile(output / packaging.ZIP_NAME) as archive:
+    assert report['version'] == '1.2.3'
+    assert report['phases'][0]['file'] == 'MultiCamera_portable_1.2.3_x64.zip'
+    with zipfile.ZipFile(output / 'MultiCamera_portable_1.2.3_x64.zip') as archive:
         assert archive.testzip() is None
         assert {name: archive.read(name) for name in archive.namelist()} == before
     assert json.loads((output / 'packaging_metrics.json').read_text()) == report
@@ -50,7 +52,7 @@ def test_installer_and_zip_really_run_concurrently(source, tmp_path, monkeypatch
     def phase(name):
         barrier.wait(timeout=10)
         return {'phase': name}
-    monkeypatch.setattr(packaging, 'portable_zip', lambda *args: phase('portable_zip'))
+    monkeypatch.setattr(packaging, 'portable_zip', lambda *args, **kwargs: phase('portable_zip'))
     monkeypatch.setattr(packaging, 'installer', lambda *args: phase('installer'))
     result = packaging.package(source, tmp_path / 'output', compiler=compiler, version='0.1.1')
     assert result['parallel'] and result['status'] == 'passed'
@@ -67,7 +69,7 @@ def test_any_failed_distribution_fails_the_whole_package(source, tmp_path, monke
         if name == failed_phase:
             raise RuntimeError('injected failure')
         return {'phase': name}
-    monkeypatch.setattr(packaging, 'portable_zip', lambda *args: phase('portable_zip'))
+    monkeypatch.setattr(packaging, 'portable_zip', lambda *args, **kwargs: phase('portable_zip'))
     monkeypatch.setattr(packaging, 'installer', lambda *args: phase('installer'))
     output = tmp_path / 'output'
     with pytest.raises(RuntimeError, match=failed_phase):
@@ -79,22 +81,25 @@ def test_any_failed_distribution_fails_the_whole_package(source, tmp_path, monke
 
 def test_failed_zip_does_not_replace_previous_archive(source, tmp_path, monkeypatch):
     output = tmp_path / 'output'
-    packaging.portable_zip(source, output)
-    previous = (output / packaging.ZIP_NAME).read_bytes()
+    packaging.portable_zip(source, output, version='1.2.3')
+    archive_path = output / 'MultiCamera_portable_1.2.3_x64.zip'
+    previous = archive_path.read_bytes()
     monkeypatch.setattr(zipfile.ZipFile, 'write', lambda *args, **kwargs:
                         (_ for _ in ()).throw(OSError('disk full')))
     with pytest.raises(OSError):
-        packaging.portable_zip(source, output)
-    assert (output / packaging.ZIP_NAME).read_bytes() == previous
+        packaging.portable_zip(source, output, version='1.2.3')
+    assert archive_path.read_bytes() == previous
     assert not list(output.glob('.portable-*'))
 
 
 @pytest.mark.parametrize('version', ['0.1', 'v0.1.1', '0.1.1-build.1', '01.1.1'])
-def test_installer_version_must_remain_numeric(source, tmp_path, version):
+@pytest.mark.parametrize('with_installer', [False, True])
+def test_distribution_version_must_remain_numeric(source, tmp_path, version, with_installer):
     compiler = tmp_path / 'ISCC.exe'
     compiler.touch()
     with pytest.raises(ValueError, match='numeric'):
-        packaging.package(source, tmp_path / 'output', compiler=compiler, version=version)
+        packaging.package(source, tmp_path / 'output',
+                          compiler=compiler if with_installer else None, version=version)
 
 
 def test_inno_args_preserve_paths_with_spaces(source, tmp_path, monkeypatch):
@@ -149,6 +154,30 @@ def test_cli_works_from_another_working_directory(source, tmp_path):
         cwd=tmp_path, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['status'] == 'passed'
+    version = packaging.resolve_version(None)
+    assert (tmp_path / 'output' / f'MultiCamera_portable_{version}_x64.zip').is_file()
+
+
+def test_new_version_keeps_older_and_legacy_archives(source, tmp_path):
+    output = tmp_path / 'output'
+    output.mkdir()
+    legacy = output / 'MultiCamera_portable_x64.zip'
+    legacy.write_bytes(b'historical archive')
+    packaging.package(source, output, version='1.2.3')
+    old = output / 'MultiCamera_portable_1.2.3_x64.zip'
+    previous = old.read_bytes()
+    result = packaging.package(source, output, version='1.2.4')
+    assert old.read_bytes() == previous
+    assert legacy.read_bytes() == b'historical archive'
+    assert result['phases'][0]['file'] == 'MultiCamera_portable_1.2.4_x64.zip'
+    assert (output / result['phases'][0]['file']).is_file()
+
+
+def test_portable_rejects_unsafe_version_before_creating_output(source, tmp_path):
+    output = tmp_path / 'output'
+    with pytest.raises(ValueError, match='numeric'):
+        packaging.portable_zip(source, output, version='../escape')
+    assert not output.exists()
 
 
 def test_scipy_collection_keeps_runtime_but_excludes_tests():
@@ -173,3 +202,11 @@ def test_workflow_keeps_release_gates_and_fast_packaging_contract():
     assert 'packaging_metrics.json' in workflow
     assert 'Compress-Archive' not in workflow and 'pip install -U' not in workflow
     assert 'cache: "pip"' in workflow and 'cache: "venv"' not in workflow
+    assert 'MultiCamera_portable_$($env:PRODUCT_VERSION)_x64.zip' in workflow
+    assert '@("scripts/package_windows.py", "--version", $env:PRODUCT_VERSION)' in workflow
+    assert '--pattern "MultiCamera_portable*_x64.zip"' in workflow
+    assert '[regex]::Escape($archives[0].Name)' in workflow
+    assert '$archives.Count -ne 1' in workflow and '$records.Count -ne 1' in workflow
+    batch = (ROOT / 'scripts/build_windows_installer.bat').read_text(encoding='utf-8')
+    assert 'package_windows.py --version "%PRODUCT_VERSION%"' in batch
+    assert 'MultiCamera_portable_%PRODUCT_VERSION%_x64.zip' in batch

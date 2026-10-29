@@ -33,10 +33,10 @@ echo.
 echo [未检测到 Inno Setup 6] 已跳过 .exe 安装包。
 echo 请安装：https://jrsoftware.org/isdl.php  后重新运行本脚本。
 echo 正在生成 ZIP 便携包作为替代...
-python scripts\package_windows.py
+python scripts\package_windows.py --version "%PRODUCT_VERSION%"
 if errorlevel 1 (
     echo ZIP 打包失败，请手动压缩 dist\MultiCamera 文件夹。
     exit /b 2
 )
 echo.
-echo 便携 ZIP: installer_output\MultiCamera_portable_x64.zip
+echo 便携 ZIP: installer_output\MultiCamera_portable_%PRODUCT_VERSION%_x64.zip

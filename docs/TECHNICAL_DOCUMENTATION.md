@@ -448,7 +448,7 @@ GitHub Actions 打包策略：
 
 - 手动触发默认只生成便携 ZIP，不安装 Inno Setup。
 - tag 构建或手动勾选 `installer` 时才生成 Inno 安装包。
-- 使用 Windows runner 预装的 GitHub CLI，将 `MultiCamera_portable_x64.zip`、可选的 `MultiCamera_Setup_*_x64.exe` 和 `SHA256SUMS.txt` 上传到 GitHub Release 附件，不再调用 `actions/upload-artifact`，不占用 Actions Artifact 存储额度。
+- 使用 Windows runner 预装的 GitHub CLI，将 `MultiCamera_portable_<version>_x64.zip`、可选的 `MultiCamera_Setup_<version>_x64.exe` 和 `SHA256SUMS.txt` 上传到 GitHub Release 附件，不再调用 `actions/upload-artifact`，不占用 Actions Artifact 存储额度。历史 Release 的无版本号便携包保持原名。
 - 手动勾选 `pointcloud` 时才把 Open3D 纳入 CI 包。
 - PyInstaller 打包前安装测试依赖并以离屏 Qt 执行 `python -m pytest -q tests`；测试失败会阻止构建和发布。
 - 项目依赖限制 OpenCV 为 `>=4.9,<5`，Windows CI 和本地构建脚本另使用 `packaging/windows/constraints.txt` 固定为已验证的 `opencv-contrib-python==4.13.0.92`。升级该约束时必须重新通过源码和 EXE 自检；不要混装四种共享 `cv2` 命名空间的 OpenCV 发行包。
@@ -1597,7 +1597,7 @@ SciPy仅对optimize/spatial继续收集所需子模块，显式扫描过滤tests
 
 `scripts/package_windows.py` 使用标准库，不新增应用依赖。CI在最终EXE自检成功后才调用；便携ZIP与可选Inno安装器使用两个工作线程并行生成，仅共同读取同一份验证后的dist，等待两者结束。任一失败都会返回非零退出，不能降级为只发布另一个成功产物。
 
-- ZIP使用Deflate level 1，保持 `MultiCamera_portable_x64.zip` 文件名，EXE位于ZIP根目录而非额外套一层目录；包含隐藏资源和中文名称。相比原有Compress-Archive减少压缩工作，下载体积可能增加。source不允许空EXE、指向包外的符号链接或把输出目录放回source中。
+- ZIP使用Deflate level 1，文件名统一为 `MultiCamera_portable_<version>_x64.zip`，EXE位于ZIP根目录而非额外套一层目录；包含隐藏资源和中文名称。相比原有Compress-Archive减少压缩工作，下载体积可能增加。source不允许空EXE、指向包外的符号链接或把输出目录放回source中。
 - Inno默认从 `lzma2/ultra64` 改为 `lzma2/normal`，保留SolidCompression。速度、构建内存和下载体积之间作明确取舍，不改变安装后的程序文件。手动Actions输入 `installer_compression` 可选normal/max/ultra64；标签构建默认normal。
 - 安装器先寻找已有ISCC，找不到才执行Chocolatey安装。编译器仍必须实际存在，安装命令失败不会继续发布。
 - ZIP与安装器分别在独立临时目录生成，成功验证后替换本地输出；失败不覆盖已有对应文件。ISCC即使返回0但没有产生新的非空EXE也会失败，不允许拿旧安装包冒充新产物。这里的本地输出替换不适用于已发布Release，后者仍禁止覆盖。
@@ -1696,3 +1696,13 @@ test3真实图片流程再次校验导入、回看、左右交换、标定、结
 ### 41.6 Windows字体与补采操作自适应
 
 Windows构建#20在1000×680窗口复现返回推荐按钮右边界溢出1像素。补采操作布局现使用按钮实际 `sizeHint()`、布局间距和侧栏视口宽度计算需求；三项操作放不下时，将返回推荐放到第二行，补近/补远保持首行。恢复空间或隐藏返回推荐时回到单行。父视口尺寸变化和布局请求均重新调度，不依赖固定字体、像素阈值或平台分支。保留严格的窗口可见性检查，新增大字体视口完整性检查。
+
+## 42. Windows发行文件统一命名原则
+
+后续可下载二进制统一包含产品版本与架构：安装器为 `MultiCamera_Setup_<version>_x64.exe`，便携包为 `MultiCamera_portable_<version>_x64.zip`，例如 `MultiCamera_portable_0.1.2_x64.zip`。规则写入AGENTS.md，打包、上传、下载说明、性能报告与SHA256SUMS必须引用同一实际文件名。
+
+`scripts/package_windows.py` 的 `--version` 同时用于ZIP和安装器，接受纯数字MAJOR.MINOR.PATCH；省略时读取 `src/multicamera/__init__.py` 的唯一版本来源，不依赖当前工作目录。CI和本地Windows批处理显式传入已校验的PRODUCT_VERSION，包括仅生成便携包和无Inno时的回退路径。性能报告增加version字段，并记录带版本号的实际输出文件名。
+
+新版本ZIP不覆盖其他产品版本或遗留的无版本号ZIP。Release上传只选取当前PRODUCT_VERSION的精确文件名，不通过通配符误用旧包。既有Release（包括windows-build-40741401157）不改名、不替换；旧OpenCV归档审计兼容版本化及遗留名称，要求下载后恰好存在一个便携ZIP和一条对应文件名的校验记录，存在歧义或校验不符即失败。
+
+回归覆盖版本化ZIP往返、不同版本及旧文件并存、非法版本拒绝、跨工作目录默认版本、并行压缩和失败保护，以及CI/本地脚本中的名称与参数一致性。此次仅更新后续命名规则，不重新发布历史安装包。

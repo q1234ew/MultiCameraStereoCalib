@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import tempfile
 import time
@@ -15,10 +16,22 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ZIP_NAME = 'MultiCamera_portable_x64.zip'
 
 
-def portable_zip(source: Path, output: Path, level: int = 1) -> dict:
+def resolve_version(version: str | None) -> str:
+    if version is None:
+        version = runpy.run_path(str(ROOT / 'scripts/check_release.py'))['product_version']()
+    if not re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', version):
+        raise ValueError('Packaging requires a numeric MAJOR.MINOR.PATCH version')
+    return version
+
+
+def portable_zip_name(version: str) -> str:
+    return f'MultiCamera_portable_{resolve_version(version)}_x64.zip'
+
+
+def portable_zip(source: Path, output: Path, level: int = 1, *, version: str | None = None) -> dict:
+    filename = portable_zip_name(resolve_version(version))
     source, output = source.resolve(), output.resolve()
     if source == output or source in output.parents:
         raise ValueError('Packaging output must be outside the source directory')
@@ -30,9 +43,9 @@ def portable_zip(source: Path, output: Path, level: int = 1) -> dict:
         raise ValueError('Portable source must not contain symbolic links')
     output.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    destination = output / ZIP_NAME
+    destination = output / filename
     with tempfile.TemporaryDirectory(prefix='.portable-', dir=output) as staging:
-        staged = Path(staging) / ZIP_NAME
+        staged = Path(staging) / filename
         with zipfile.ZipFile(staged, 'w', compression=zipfile.ZIP_DEFLATED,
                              compresslevel=level, allowZip64=True) as archive:
             for path in files:
@@ -76,22 +89,22 @@ def package(source: Path, output: Path, *, compiler: Path | None = None,
         raise ValueError('Portable source must not contain symbolic links')
     if installer_only and compiler is None:
         raise ValueError('Installer-only packaging requires an Inno Setup compiler')
+    version = resolve_version(version)
     if compiler is not None:
         if not compiler.is_file():
             raise ValueError('Inno Setup compiler was not found')
-        if not version or not re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', version):
-            raise ValueError('Installer requires a numeric MAJOR.MINOR.PATCH version')
     if compression not in ('normal', 'max', 'ultra64'):
         raise ValueError('Unsupported installer compression')
     output.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    report = {'status': 'running', 'parallel': compiler is not None and not installer_only,
+    report = {'status': 'running', 'version': version,
+              'parallel': compiler is not None and not installer_only,
               'phases': []}
     failures = []
     with ThreadPoolExecutor(max_workers=2) as pool:
         jobs = []
         if not installer_only:
-            jobs.append(('portable_zip', pool.submit(portable_zip, source, output)))
+            jobs.append(('portable_zip', pool.submit(portable_zip, source, output, version=version)))
         if compiler is not None:
             jobs.append(('installer', pool.submit(installer, source, output, compiler,
                                                   version, compression)))
