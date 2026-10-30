@@ -19,7 +19,7 @@
 
 在 [Releases](https://github.com/q1234ew/MultiCameraStereoCalib/releases) 中选择所需版本：
 
-- `MultiCamera_Setup_0.2.0_x64.exe`：Windows x64 安装包，文件名中的版本号以实际发布为准。
+- `MultiCamera_Setup_0.3.0_x64.exe`：Windows x64 安装包，文件名中的版本号以实际发布为准。
 - `MultiCamera_portable_<version>_x64.zip`：后续便携版统一包含实际产品版本号，完整解压后运行 `MultiCamera.exe`，不要只复制 EXE。已发布的0.1.2预览包仍使用 `MultiCamera_portable_x64.zip`，历史附件不改名。
 - `SHA256SUMS.txt`：下载文件校验值。
 - `calibration_source_test.json`、`calibration_self_test.json`：源码环境及最终 EXE 的标定自检报告。
@@ -61,6 +61,8 @@ py -3.11 -m venv .venv
 5. 在“结果”中检查质量提示、逐帧误差和校正残差，查看自动保存目录，或选择对象与格式手动导出。
 
 自适应推荐是可解释的启发式补缺，不是数学意义的全局最佳姿态。临时引导内参不写入最终标定文件；采图数量、引导进度或低训练 RMS 均不能单独证明标定精度合格。
+
+“标定”页的优化策略可显式选择“自动校验择模”：检查模型反算、单调性和校正视野，在数据充足时比较同类候选模型的留出误差；无合格候选时拒绝发布结果。默认仍为标准策略，自动择模不代替独立测量验收。
 
 白平衡默认采用“自动稳定（不锁定）”：设备已经自动时仅检查，不重复写模式；设备处于手动时，采图准备仅开启自动，不再自行关闭。每次采图重新检查，只放行本次，不承诺参数固定或颜色准确。另保留显式“手动冻结验证（可能变色）”选项，仅供已验证设备使用，不代表通用锁定能力。此策略避免再次触发自动转手动变色，不是设备已有偏绿的根因修复；不稳定、接口失败或取消仍拒绝采图。
 
@@ -134,8 +136,8 @@ python -m multicamera --self-test-calibration --report calibration_self_test.jso
 
 ```bash
 python scripts/prepare_release.py --dry-run           # 预览默认 PATCH 升版
-python scripts/prepare_release.py                     # PATCH：0.2.0 → 0.2.1
-python scripts/prepare_release.py --bump minor        # MINOR：0.2.0 → 0.3.0
+python scripts/prepare_release.py                     # PATCH：0.3.0 → 0.3.1
+python scripts/prepare_release.py --bump minor        # MINOR：0.3.0 → 0.4.0
 python scripts/prepare_release.py --preview --bump patch  # 新 PATCH 版本的首个测试构建
 python scripts/prepare_release.py --preview           # 当前目标版本的下一次测试构建
 python scripts/prepare_release.py --bump none         # 将当前已验证版本准备为正式版
