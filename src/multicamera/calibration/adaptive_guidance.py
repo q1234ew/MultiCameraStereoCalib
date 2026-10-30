@@ -29,6 +29,7 @@ SCALE_AREA_RANGES = {'small': (.012, .04), 'medium': (.04, .12), 'large': (.12, 
 DISTANCE_LABELS = {'small': '远距离', 'medium': '中距离', 'large': '近距离'}
 # Request budgets bound cold-start stages; they are not verified distance coverage.
 CENTRAL_DISTANCE_PLAN = ('medium',) * 3 + ('large',) * 2 + ('small',) * 2
+BOOTSTRAP_TILTS = ('front', 'left', 'right', 'up', 'down', 'left', 'right')
 DISTANCE_SAMPLE_GOALS = {'medium': 3, 'large': 2, 'small': 2}
 MAX_DISTANCE_REPAIR_REQUESTS = 4
 MAX_DISTANCE_REPAIR_PER_SCALE = 2
@@ -522,6 +523,13 @@ def _choose_candidate(candidates, geometries, coverage, distances, tilts, reques
     return min(close, key=lambda item: (item[2], -item[1], item[0]))[0]
 
 
+def _bootstrap_target(candidates, step):
+    """Use the same geometry-filtered choice for scheduling and conditional hints."""
+    return min(candidates, key=lambda c: (
+        c[:2] != (1, 1), c[3] != CENTRAL_DISTANCE_PLAN[step],
+        c[2] != BOOTSTRAP_TILTS[step], _TILTS.index(c[2])))
+
+
 def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservation]],
                      provided_intrinsics: dict[str, CameraIntrinsics],
                      image_sizes: dict[str, tuple[int, int]] | None = None) -> GuidanceAnalysis:
@@ -611,7 +619,6 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     previous = np.array([.5, .5])
     previous_area, previous_tilt = .07, 'front'
     observed = []
-    bootstrap_tilts = ('front', 'left', 'right', 'up', 'down', 'left', 'right')
     for count, pair in enumerate(unique, 1):
         previous_target = target
         if repairing_distance:
@@ -655,10 +662,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         if candidates:
             if count < len(CENTRAL_DISTANCE_PLAN):
                 # Stable bootstrap instructions do not change when intrinsics arrive.
-                desired = CENTRAL_DISTANCE_PLAN[count]
-                target = min(candidates, key=lambda c: (
-                    c[:2] != (1, 1), c[3] != desired,
-                    c[2] != bootstrap_tilts[count], _TILTS.index(c[2])))
+                target = _bootstrap_target(candidates, count)
             else:
                 target = _choose_candidate(candidates, geometries, coverage, approximate_scales,
                     paired_tilts, requests, previous, previous_area, previous_tilt, previous_target,
@@ -737,8 +741,11 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         next_hint = '后续：调整分辨率或板规格后重新规划，不会自动跳过受限目标'
     elif len(unique) + 1 < len(CENTRAL_DISTANCE_PLAN):
         step = len(unique) + 1
-        next_hint = (f'本张验收并保存后，预计：中央 · {DISTANCE_LABELS[CENTRAL_DISTANCE_PLAN[step]]}'
-                     f' · {TILT_LABELS[bootstrap_tilts[step]]}；未通过则不推进')
+        nr, nc, nt, ns = _bootstrap_target(candidates, step)
+        next_region = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'),
+                       ('左下', '下方', '右下'))[nr][nc]
+        next_hint = (f'本张验收并保存后，预计：{next_region} · {DISTANCE_LABELS[ns]}'
+                     f' · {TILT_LABELS[nt]}；未通过则不推进')
     else:
         priorities = '、'.join(distance_gaps[:2]) or '视场边缘覆盖'
         angle_hint = '、'.join(TILT_LABELS[t] for t in missing_tilts[:2])

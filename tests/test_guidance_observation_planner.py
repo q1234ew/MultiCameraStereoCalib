@@ -159,3 +159,47 @@ def test_next_hint_is_conditional_and_does_not_advance_on_reanalysis(board):
     assert '验收并保存后' in first.recommendation.next_hint
     assert '未通过则不推进' in first.recommendation.next_hint
     assert analyze(board, empty).recommendation == first.recommendation
+
+
+@pytest.mark.parametrize('size', [(160, 120), (1280, 960)])
+def test_bootstrap_forecast_matches_next_geometry_filtered_target(board, monkeypatch, size):
+    monkeypatch.setattr(ag, '_bootstrap', lambda *args: None)
+    data = {c: [] for c in ('L', 'R')}
+    sizes = dict.fromkeys(data, size)
+    for n in range(len(ag.CENTRAL_DISTANCE_PLAN) - 1):
+        result = ag.analyze_guidance(board, CameraModel.PINHOLE, data, {}, sizes)
+        hint = result.recommendation.next_hint
+        if size == (160, 120):
+            assert '中距离、远距离' in result.summary
+            assert '中距离' not in hint and '远距离' not in hint
+        for c in data:
+            obs = observation(board, n, center=(.008 * n, 0))
+            obs.corners *= np.asarray(size) / obs.image_size
+            obs.image_size = size
+            data[c].append(obs)
+        next_rec = ag.analyze_guidance(board, CameraModel.PINHOLE, data, {}, sizes).recommendation
+        assert next_rec.sample_count == n + 1
+        assert ag.DISTANCE_LABELS[next_rec.scale] in hint
+        assert ag.TILT_LABELS[next_rec.tilt] in hint
+        assert '未通过则不推进' in hint
+        repeated = ag.analyze_guidance(board, CameraModel.PINHOLE,
+                                       {c: seq + [deepcopy(seq[-1])] for c, seq in data.items()}, {}, sizes)
+        assert repeated.recommendation == next_rec
+
+
+def test_forecast_names_actual_region_when_center_is_unavailable(board, monkeypatch):
+    geometry = ag._candidate_geometry
+    monkeypatch.setattr(ag, '_candidate_geometry', lambda b, c, sizes:
+                        geometry(b, c, sizes) if c[:2] == (0, 0) else None)
+    result = analyze(board, {'L': [], 'R': []})
+    assert result.recommendation.feasible
+    assert '预计：左上' in result.recommendation.next_hint
+    assert '预计：中央' not in result.recommendation.next_hint
+
+
+def test_no_feasible_candidate_has_no_specific_next_pose_forecast(board):
+    result = ag.analyze_guidance(board, CameraModel.PINHOLE, {'L': [], 'R': []}, {},
+                                 {'L': (32, 24), 'R': (32, 24)})
+    assert result.recommendation.phase == 'blocked'
+    assert '调整分辨率或板规格' in result.recommendation.next_hint
+    assert '本张验收并保存后' not in result.recommendation.next_hint

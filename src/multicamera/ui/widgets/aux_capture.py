@@ -45,6 +45,7 @@ class AuxCaptureGuide(QWidget):
         self._manual = False
         self._scope = None
         self.last_qualities = []
+        self._preview_detections = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -84,6 +85,7 @@ class AuxCaptureGuide(QWidget):
         self._samples.clear()
         self._sample_timestamps.clear()
         self.last_qualities = []
+        self._preview_detections = []
         self._manual = False
         self.receipt.setText('最近原图：尚未采集')
         self.refresh()
@@ -104,6 +106,7 @@ class AuxCaptureGuide(QWidget):
         self._sample_timestamps.pop(camera_id, None)
         self._preview_invalidated_at = self._clock()
         self.last_qualities = []
+        self._preview_detections = []
         if self.analysis is not None and not self._manual:
             self.render()
 
@@ -139,6 +142,7 @@ class AuxCaptureGuide(QWidget):
         panel = self.panel
         if self.last_qualities and self._clock() - self._preview_result_at > self.MAX_AGE:
             self.last_qualities = []
+            self._preview_detections = []
             if not self._manual:
                 self.render()
         if (panel._active_step != 2 or panel._workflow_phase != 'capture'
@@ -151,6 +155,7 @@ class AuxCaptureGuide(QWidget):
             self._samples.clear()
             self._sample_timestamps.clear()
             self.last_qualities = []
+            self._preview_detections = []
             if not self._manual:
                 self.render()
             return
@@ -172,10 +177,12 @@ class AuxCaptureGuide(QWidget):
         if (error or self._clock() - key[1] > self.MAX_AGE
                 or key[1] < self._preview_invalidated_at):
             self.last_qualities = []
+            self._preview_detections = []
             if not self._manual:
                 self.render()
             return
         detections, self.last_qualities = result
+        self._preview_detections = detections
         self._preview_result_at = key[1]
         # This independent sampler also works when an optional preview tile is closed.
         from types import SimpleNamespace
@@ -198,10 +205,13 @@ class AuxCaptureGuide(QWidget):
     def stability_reasons(self, detections, snapshot=None):
         reasons = []
         now, histories = snapshot if snapshot is not None else (self._clock(), self._samples)
+        if len(detections) != 2:
+            detections = (None, None)
         for name, camera_id, det in zip(('RGB', 'IR/辅助'),
                 (self.panel._rgb_left_camera_id(), self.panel._aux_camera_id()), detections):
             history = histories.get(camera_id, [])
-            stable = (det.valid and len(history) >= 3 and now - history[-1][0] <= self.MAX_AGE
+            stable = (det is not None and det.valid and len(history) >= 3
+                      and 0 <= now - history[-1][0] <= self.MAX_AGE
                       and history[-1][0] - history[0][0] >= .6
                       and det.image_size == history[-1][2]
                       and self._close(det.image_points.reshape(-1, 2), history[0][1], det.image_size))
@@ -224,6 +234,7 @@ class AuxCaptureGuide(QWidget):
             self._samples.clear()
             self._sample_timestamps.clear()
             self.last_qualities = []
+            self._preview_detections = []
         if self._key != key and self._worker is None:
             worker = AuxGuidanceWorker(key, deepcopy(self.panel._aux_board_config()),
                 self.panel._camera_model, deepcopy(self.panel._aux_pairs),
@@ -279,7 +290,8 @@ class AuxCaptureGuide(QWidget):
         else:
             self.panel._aux_seq_widget.set_completion_message('', '')
             target = analysis.target
-            capture = CaptureTarget(target.row, target.col, TILTS[target.tilt], scale=target.scale)
+            capture = CaptureTarget(target.row, target.col, TILTS[target.tilt], scale=target.scale,
+                                    target_area=target.target_area)
             if analysis.phase == 'repair':
                 seq.targets.append(capture)
                 seq._index = len(initial_plan())
@@ -300,9 +312,9 @@ class AuxCaptureGuide(QWidget):
                 self.phase.setText(self.phase.text() + '\nIR 距离按占比近似，非实测距离')
             instruction_stage, action = guidance_action(
                 self.panel._aux_board_config(), target, self.last_qualities)
-            if instruction_stage == 'ready' and any(
-                    len(self._samples.get(camera_id, [])) < 3 for camera_id in
-                    (self.panel._rgb_left_camera_id(), self.panel._aux_camera_id())):
+            if instruction_stage == 'ready' and (
+                    not 0 <= self._clock() - self._preview_result_at <= self.MAX_AGE
+                    or self.stability_reasons(self._preview_detections)):
                 instruction_stage, action = 'stability', '双路保持静止至少0.6秒，再采集原图'
             if instruction_stage in ('distance', 'position', 'quality'):
                 seq.targets[seq._index] = replace(capture, tilt=BoardTilt.FRONT)

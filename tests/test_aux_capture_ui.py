@@ -208,6 +208,58 @@ def test_rejected_stale_stability_and_cumulative_drift_do_not_pass(panel):
     assert len(panel._aux_guide.stability_reasons([det, det])) == 2
 
 
+@pytest.mark.parametrize('case', ['short', 'stale', 'size', 'drift', 'missing',
+                                'quality_stale', 'stable'])
+def test_preview_ready_and_raw_stability_share_full_acceptance(panel, case):
+    from multicamera.calibration.aux_guidance import guidance_action
+    from multicamera.ui.threads.aux_capture_worker import AuxCaptureWorker
+
+    guide = panel._aux_guide
+    image = board_image()
+    intr = CameraIntrinsics(np.array([[200., 0., 128.], [0., 200., 96.], [0., 0., 1.]]),
+                            np.zeros(5), (256, 192))
+    guide.analysis = AuxGuidanceAnalysis('initial', AuxTarget(), 0, 0, 0, {}, ())
+    guide._key = guide.context_key()
+    guide._clock = lambda: 10.
+    worker = AuxCaptureWorker((guide.context_key(), 10.), (image, image),
+                              panel._aux_board_config(), (intr, intr), 'ir')
+    worker.signals.completed.connect(guide._preview_ready)
+    worker.run()
+    assert guidance_action(panel._aux_board_config(), AuxTarget(), guide.last_qualities)[0] == 'ready'
+    detections = guide._preview_detections
+    for camera, det in zip(('left', 'ir'), detections):
+        times = [9., 9.5, 10.] if case != 'short' else [9.5, 9.6, 10.]
+        points = det.image_points.copy()
+        size = det.image_size
+        if camera == 'ir':
+            if case == 'size':
+                size = (512, 384)
+            if case == 'drift':
+                points += [5., 0.]
+        guide._samples[camera] = [(at, points.copy(), size) for at in times]
+    if case == 'missing':
+        guide._preview_detections = []
+    if case == 'stale':
+        guide._clock = lambda: 12.
+    if case == 'quality_stale':
+        guide._preview_result_at = 8.
+    guide.render()
+    assert ('可以采集' in guide.action.text()) == (case == 'stable')
+    assert bool(guide.stability_reasons(guide._preview_detections)) == (
+        case not in ('stable', 'quality_stale'))
+
+
+def test_aux_fitted_area_reaches_schematic_without_changing_progress(panel):
+    guide = panel._aux_guide
+    guide.analysis = AuxGuidanceAnalysis('initial', AuxTarget(scale='large', target_area=.20),
+                                        5, 0, 0, {}, ('large',))
+    guide._key = guide.context_key()
+    guide.render()
+    seq = panel._aux_capture_sequence
+    assert seq.current.target_area == .20
+    assert seq.done_count == 0 and guide.analysis.unique_count == 5
+
+
 def test_repeated_sampling_of_same_source_frame_never_proves_stability(panel):
     image = board_image()
     now = time.time()

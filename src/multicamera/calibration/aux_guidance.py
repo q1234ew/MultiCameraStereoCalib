@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
 import cv2
@@ -31,6 +31,7 @@ class AuxTarget:
     col: int = 1
     tilt: str = 'front'
     scale: str = 'medium'
+    target_area: float | None = None
 
 
 def initial_plan():
@@ -69,19 +70,38 @@ def observation(det, key='frame'):
                                det.image_size, str(key))
 
 
-def feasible_target(board, target, size):
-    """Fit the full physical grid envelope in the auxiliary view, conservatively."""
+def fit_target(board, target, size):
+    """Choose a reference area within the band, retaining grid and border limits."""
+    if (len(size) != 2 or any(isinstance(v, (bool, np.bool_))
+            or not isinstance(v, (int, np.integer)) or v <= 0 for v in size)):
+        return None
     points = board_adapter(board).object_points[:, :2]
     extent = np.ptp(points, axis=0)
+    if not np.isfinite(points).all() or np.any(extent <= 0):
+        return None
     width, height = size
-    area = AREA_TARGETS[target.scale] * width * height
-    span = np.array([np.sqrt(area * extent[0] / extent[1]),
-                     np.sqrt(area * extent[1] / extent[0])])
+    # Span/spacing/envelope scale with sqrt(area), so solve the feasible interval
+    # directly instead of missing narrow solutions between sampled area values.
+    span = np.array([np.sqrt(width * height * extent[0] / extent[1]),
+                     np.sqrt(width * height * extent[1] / extent[0])])
     spacing = span / np.maximum(1, [board.cols - 1, board.rows - 1])
     envelope = span + 2 * spacing
     center = np.array([(target.col + .5) / 3 * width, (target.row + .5) / 3 * height])
-    return bool(spacing.min() >= 4 and np.all(center - envelope / 2 >= 2)
-                and np.all(center + envelope / 2 <= np.array(size) - 3))
+    room = np.minimum(center - 2, np.asarray(size) - 3 - center)
+    if np.any(room <= 0):
+        return None
+    low, high = AREA_RANGES[target.scale]
+    minimum = max(low, (4 / spacing.min()) ** 2)
+    maximum = min(np.nextafter(high, low), np.min(2 * room / envelope) ** 2)
+    if minimum > maximum:
+        return None
+    preferred = AREA_TARGETS[target.scale]
+    area = float(np.clip(preferred, minimum, maximum))
+    return replace(target, target_area=None if area == preferred else area)
+
+
+def feasible_target(board, target, size):
+    return fit_target(board, target, size) is not None
 
 
 def duplicate_pair(pair, previous):
@@ -201,8 +221,10 @@ def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
         phase, target = 'repair', repair_target
     else:
         phase, target = 'complete', None
-    if target is not None and expected is not None and not feasible_target(board, target, expected[1]):
-        phase, target = 'blocked', None
+    if target is not None and expected is not None:
+        target = fit_target(board, target, expected[1])
+        if target is None:
+            phase = 'blocked'
     summary = (f'非重复 {len(clean)} 组 · 重复 {duplicates} 组 · 双路姿态可解 {verified} 组\n'
                + '可信 IR 距离：' + ' / '.join(f'{DISTANCE_NAMES[s]} {counts[s]}'
                                                 for s in ('large', 'medium', 'small')))

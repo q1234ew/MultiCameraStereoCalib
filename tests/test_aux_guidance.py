@@ -8,7 +8,8 @@ import pytest
 
 from multicamera.calibration.aux_capture_quality import AuxFrameQuality
 from multicamera.calibration.aux_guidance import (
-    AuxTarget, analyze_aux_guidance, feasible_target, guidance_action, initial_plan,
+    AREA_RANGES, AREA_TARGETS, AuxTarget, analyze_aux_guidance, feasible_target, fit_target,
+    guidance_action, initial_plan,
 )
 from multicamera.calibration.models import CameraIntrinsics, CameraModel
 from multicamera.calibration.planar import (
@@ -115,6 +116,56 @@ def test_low_resolution_or_large_envelope_never_claims_completion():
     assert feasible_target(board, AuxTarget(0, 0, scale='small'), (256, 192))
     assert not feasible_target(board, AuxTarget(0, 0, scale='large'), (256, 192))
     assert not feasible_target(board, AuxTarget(scale='small'), (48, 32))
+
+
+def test_wide_board_fits_near_band_without_requiring_nominal_area(monkeypatch):
+    board = PatternBoardConfig(cols=12, rows=4, square_size=.08)
+    obj = PlanarPatternDetector._make_object_points(board)
+    points = obj[:, :2] / board.square_size * 17 + [34., 70.]
+    rows = []
+    for i in range(5):
+        det = PlanarDetectionResult(True, obj.copy(), (points + [2 * i, 0]).astype(np.float32),
+                                    (256, 192), board.pattern_type)
+        rows.append((str(i), det, det))
+    monkeypatch.setattr('multicamera.calibration.aux_guidance._bootstrap', lambda *args: None)
+    result = analyze_aux_guidance(board, CameraModel.PINHOLE, rows)
+    assert result.unique_count == 5 and result.phase == 'initial'
+    assert result.target.scale == 'large'
+    area = result.target.target_area
+    assert AREA_RANGES['large'][0] <= area < AREA_TARGETS['large']
+    span = np.sqrt(area * 256 * 192 * np.array([11 / 3, 3 / 11]))
+    spacing = span / [11, 3]
+    assert spacing.min() >= 4
+    half = (span + 2 * spacing) / 2
+    assert np.all([128, 96] - half >= 2 - 1e-8)
+    assert np.all([128, 96] + half <= np.array([256, 192]) - 3 + 1e-8)
+    # The target area is only a drawing reference, not a new narrow capture gate.
+    qualities = [AuxFrameQuality(True, (), {'area': .194, 'center': [.5, .5]}, None)] * 2
+    assert guidance_action(board, result.target, qualities)[0] == 'tilt_unverified'
+    assert rows[0][1].image_points[0, 0] == 34
+
+
+@pytest.mark.parametrize('size', [(0, 192), (256, 0), (True, 192), (256., 192), (24, 16)])
+def test_aux_fit_rejects_invalid_or_unresolvable_sizes(size):
+    assert fit_target(PatternBoardConfig.ir_chessboard(), AuxTarget(), size) is None
+
+
+def test_aux_fit_searches_larger_area_when_nominal_spacing_is_too_small():
+    board = PatternBoardConfig.ir_chessboard()
+    fitted = fit_target(board, AuxTarget(scale='small'), (96, 64))
+    assert fitted is not None
+    assert AREA_TARGETS['small'] < fitted.target_area < AREA_RANGES['small'][1]
+
+
+def test_truly_infeasible_aux_target_stays_blocked(monkeypatch):
+    board, rows, _ = observations(1, intrinsics=False)
+    rows = [(key, replace(a, image_size=(32, 24), image_points=a.image_points / 8),
+             replace(b, image_size=(32, 24), image_points=b.image_points / 8))
+            for key, a, b in rows]
+    monkeypatch.setattr('multicamera.calibration.aux_guidance._bootstrap', lambda *args: None)
+    result = analyze_aux_guidance(board, CameraModel.PINHOLE, rows)
+    assert result.phase == 'blocked' and result.target is None
+    assert result.unique_count == 1
 
 
 def test_quality_feedback_translates_machine_codes():
