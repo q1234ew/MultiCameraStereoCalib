@@ -31,6 +31,12 @@ def test_full_calibration_without_legacy_binding(tmp_path, monkeypatch):
     assert report["calibration"]["detected_corners"] == 126
     assert report["calibration"]["baseline_m"] == pytest.approx(.12, abs=.0001)
     assert len(report["calibration"]["exports"]) == 4
+    health = report['calibration']['health_checks']
+    assert health['health']['status'] == 'ok'
+    assert health['invalid_lens_rejected'] and health['overzoom_rejected']
+    assert health['rational_denominator_preserved']
+    assert health['projection_baseline_rejected'] and health['zero_q_rejected']
+    assert health['wrong_depth_scale_rejected']
     fish = report["calibration"]["fisheye"]
     assert fish["model"] == "fisheye"
     assert fish["frames"] == fish["compatible_frames"] == 16

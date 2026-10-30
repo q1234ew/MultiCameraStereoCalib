@@ -73,6 +73,9 @@ class GuidanceRecommendation:
     feasible: bool = True
     repairing_distance: bool = False
     missing_distances: tuple[str, ...] = ()
+    phase: str = 'initial'
+    initial_total: int = 23
+    repair_count: int = 0
 
 
 @dataclass
@@ -491,6 +494,9 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             image_sizes.append(next(iter(maps[camera].values()))[0].image_size)
     candidates = [candidate for (r, c), t, s in product(zone_order, _TILTS, _SCALES)
                   if _candidate_feasible(board, candidate := (r, c, t, s), image_sizes)]
+    available_zones = {c[:2] for c in candidates}
+    initial_total = sum(len(CENTRAL_DISTANCE_PLAN) if z == (1, 1) else 2
+                        for z in available_zones)
     target = (1, 1, 'front', 'medium')
     if candidates and target not in candidates:
         target = candidates[0]
@@ -560,18 +566,21 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             local = [c for c in alternatives if c[:2] == zone]
             if zone == (1, 1) and zone_requests[zone] < len(CENTRAL_DISTANCE_PLAN):
                 desired = CENTRAL_DISTANCE_PLAN[zone_requests[zone]]
-                if reliable_distance:
-                    gaps = [s for s in ('medium', 'large', 'small')
-                            if paired_distances[s] < DISTANCE_SAMPLE_GOALS[s]
-                            and any(c[3] == s for c in local)]
-                    if gaps:
-                        desired = gaps[0]
-                at_distance = [c for c in local if c[3] == desired]
-                if at_distance:
-                    local = at_distance
-            target = min(local, key=score)
+            else:
+                desired = 'medium'
+            at_distance = [c for c in local if c[3] == desired]
+            if at_distance:
+                local = at_distance
+            if count < initial_total:
+                # Bootstrap may change history measurements, never the first-pass itinerary.
+                step = zone_requests[zone]
+                tilt = (_TILTS[step % len(_TILTS)] if zone == (1, 1) else
+                        'front' if step == 0 else _TILTS[1 + zone_order.index(zone) % 4])
+                target = min(local, key=lambda c: (c[2] != tilt, _TILTS.index(c[2])))
+            else:
+                target = min(local, key=score)
         repairing_distance = False
-        if (zone_requests[(1, 1)] >= len(CENTRAL_DISTANCE_PLAN)
+        if (initial_total <= count < initial_total + MAX_DISTANCE_REPAIR_REQUESTS
                 and sum(repair_requests.values()) < MAX_DISTANCE_REPAIR_REQUESTS):
             missing = [s for s in ('large', 'small', 'medium')
                        if paired_distances[s] < DISTANCE_SAMPLE_GOALS[s]]
@@ -582,8 +591,10 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                 # Group distance moves, but cap ignored gaps; vary tilt within a group.
                 target = min(repair_candidates, key=lambda c: (
                     missing.index(c[3]), paired_distances[c[3]] / DISTANCE_SAMPLE_GOALS[c[3]],
-                    score(c)))
+                    joint[c] > 0, score(c)))
                 repairing_distance = True
+    phase = ('blocked' if not candidates else 'initial' if len(unique) < initial_total else
+             'repair' if repairing_distance else 'review')
     row, col, tilt, scale = target
     tilt_text = {'front': '正对', 'left': '左边近倾斜', 'right': '右边近倾斜',
                  'up': '上边近倾斜', 'down': '下边近倾斜'}[tilt]
@@ -595,6 +606,8 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
               f'（{DISTANCE_LABELS[scale]}）。{status}。')
     if repairing_distance:
         reason = '距离缺口补采：' + reason
+    elif phase == 'review':
+        reason = '本轮引导结束；可前往标定评估，或自行选择距离继续补拍；不代表精度达标。'
     if not candidates:
         reason = f'当前分辨率下构图难以兼顾边距和角点间距；请调整分辨率或标定板。{status}。'
     distances = ' / '.join(f'{DISTANCE_LABELS[s]} {paired_distances[s]}'
@@ -602,7 +615,8 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     approximate = ' / '.join(f'{DISTANCE_LABELS[s]} {approximate_distances[s]}'
                              for s in ('large', 'medium', 'small'))
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
-               '中央中→近→远，再同高度补边缘；已建议不计姿态或距离覆盖。'
+               f'首轮 {min(len(unique), initial_total)}/{initial_total}：'
+               '中央中→近→远，再同高度补边缘，首轮结束后才补采；已建议不计姿态或距离覆盖。'
                f'双路同档可信PnP距离样本：{distances}。'
                f'占比近似样本：{approximate}。'
                '占比近似不计为可信距离覆盖；内参可用后重新评估全部历史样本。'
@@ -619,8 +633,9 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                      or (feasible_missing and all(repair_requests[s] >= MAX_DISTANCE_REPAIR_PER_SCALE
                                                  for s in feasible_missing)))
         if exhausted:
-            summary += '本轮补采建议已达上限，先完成分区；缺口未清零，不代表距离采集完成。'
+            summary += '本轮补采建议已达上限，请先标定评估或自主补拍；缺口未清零，不代表距离采集完成。'
     rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique),
-                                 bool(candidates), repairing_distance, missing)
+                                 bool(candidates), repairing_distance, missing, phase,
+                                 initial_total, sum(repair_requests.values()))
     return GuidanceAnalysis(rec, intrinsics, summary, dict(paired_distances),
                             dict(approximate_distances))

@@ -5,6 +5,7 @@ import numpy as np
 
 from .adaptive_guidance import GuidanceObservation, _geometry
 from .models import CameraModel
+from .health import check_stereo_health
 
 MIN_MODEL_VIEWS = 9
 MAX_MODEL_VIEWS = 24
@@ -104,6 +105,10 @@ def assess_camera_models(left, right, stereo, cancelled=lambda: False, progress=
                 _validate_intrinsics(rintr)
                 check()
                 result = scal.calibrate(lintr, rintr)
+                health = check_stereo_health(lintr, rintr, result)
+                detail['health'] = health
+                if health['status'] != 'ok':
+                    raise ValueError('模型有效性检查失败：' + '；'.join(health['reasons']))
                 if (not np.isfinite(result.R).all() or not np.isfinite(result.T).all()
                         or not np.isfinite(result.rms_error)):
                     raise ValueError('双目结果包含无效值')

@@ -307,6 +307,15 @@ class CalibrationEvaluator:
             "基线距离": f"{np.linalg.norm(pair.stereo.T):.4f} m",
         }
         alignment = pair.calibration_info.get('rectification', {})
+        health = pair.calibration_info.get('health', {})
+        if health:
+            details['有效性检查'] = '通过（数值采样）' if health['status'] == 'ok' else '失败，不可用于立体校正'
+        selection = pair.calibration_info.get('model_selection', {})
+        if selection:
+            details['自动择模'] = selection['selected']
+            chosen = selection['candidates'][selection['selected']]
+            if 'validation' in chosen:
+                details['留出跨相机投影 RMS'] = f"{chosen['validation']['rms_px']:.4f} px（同序列）"
         if alignment:
             coordinate = alignment.get('coordinate', '?')
             details['同 ID 校正检查'] = (

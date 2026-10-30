@@ -90,6 +90,8 @@ def _validate_rig(rig: MultiCameraRig):
     for camera_id, intr in _camera_intrinsics(rig).items():
         label = f"Camera {camera_id!r}"
         _check_shape(intr.camera_matrix, (3, 3), f"{label} camera_matrix")
+        _check_finite(intr.camera_matrix, f'{label} camera_matrix')
+        _check_finite(intr.dist_coeffs, f'{label} distortion')
         if intr.camera_matrix[0, 0] <= 0 or intr.camera_matrix[1, 1] <= 0:
             raise ValueError(f"{label} focal lengths must be positive")
         if not np.allclose(intr.camera_matrix[2], [0., 0., 1.], rtol=0, atol=1e-9):
@@ -112,8 +114,10 @@ def _validate_rig(rig: MultiCameraRig):
             raise ValueError(f"Pair {name!r} has inconsistent camera models or image sizes")
         for field in ("R", "E", "F"):
             _check_shape(getattr(stereo, field), (3, 3), f"Pair {name!r} {field}")
+            _check_finite(getattr(stereo, field), f"Pair {name!r} {field}")
         if np.asarray(stereo.T).size != 3:
             raise ValueError(f"Pair {name!r} T must contain three values")
+        _check_finite(stereo.T, f"Pair {name!r} T")
         _check_rotation(stereo.R, f"Pair {name!r} R")
         if np.asarray(stereo.T).shape not in {(3,), (3, 1), (1, 3)} or not np.any(stereo.T):
             raise ValueError(f"Pair {name!r} T must be a nonzero three-dimensional vector")
@@ -122,8 +126,15 @@ def _validate_rig(rig: MultiCameraRig):
             for field, shape in (("R1", (3, 3)), ("R2", (3, 3)),
                                  ("P1", (3, 4)), ("P2", (3, 4))):
                 _check_shape(getattr(stereo, field), shape, f"Pair {name!r} {field}")
+                _check_finite(getattr(stereo, field), f"Pair {name!r} {field}")
         if stereo.Q is not None:
             _check_shape(stereo.Q, (4, 4), f"Pair {name!r} Q")
+            _check_finite(stereo.Q, f"Pair {name!r} Q")
+        from ..calibration.health import check_stereo_health
+        health = check_stereo_health(pair.left_intrinsics, pair.right_intrinsics,
+                                     stereo, require_rectification=False)
+        if health['status'] != 'ok':
+            raise ValueError(f'Pair {name!r} 不可用于立体校正：' + '；'.join(health['reasons']))
     for camera_id, ext in rig.extrinsics.items():
         _check_rotation(ext.R, f"Extrinsic {camera_id!r} R")
         if np.asarray(ext.T).size != 3:
@@ -355,6 +366,9 @@ def _write_opencv_standard_stereo_fields(
 def _opencv_distortion_model(intr):
     if intr.model == CameraModel.FISHEYE:
         return "equidistant"
+    d = np.asarray(intr.dist_coeffs).ravel()
+    if len(d) >= 8 and not np.any(d[8:]):
+        return 'rational_polynomial'
     return {0: "none", 8: "rational_polynomial", 12: "rational_thin_prism",
             14: "rational_thin_prism_tilted"}.get(intr.dist_coeffs.size, "radtan")
 

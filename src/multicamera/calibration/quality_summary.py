@@ -6,6 +6,7 @@ import numpy as np
 
 from .assessment import CalibrationEvaluator, Grade
 from .models import CameraModel
+from .health import check_stereo_health
 
 
 def _finite_array(value):
@@ -106,6 +107,11 @@ def summarize_quality(rig):
         try:
             intrinsic(f'{name} 左目', pair.left_intrinsics)
             intrinsic(f'{name} 右目', pair.right_intrinsics)
+            health = check_stereo_health(pair.left_intrinsics, pair.right_intrinsics,
+                                         pair.stereo, require_rectification=False)
+            if health['status'] != 'ok':
+                invalid = True
+                risks.extend(f'{name} 不可用于立体校正：{reason}' for reason in health['reasons'])
             alignment = pair.calibration_info.get('rectification', {})
             if alignment and alignment.get('status') != 'ok':
                 invalid = True

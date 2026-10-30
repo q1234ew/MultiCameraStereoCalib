@@ -56,10 +56,10 @@ def rig():
     rotation = cv2.Rodrigues(np.array([.12, -.07, .04]))[0]
     translation = np.array([[-.1], [.01], [.02]])
     stereo = StereoCalibResult(rotation, translation, np.eye(3), np.eye(3))
-    stereo.R1, stereo.R2 = np.eye(3), np.eye(3)
-    stereo.P1 = np.column_stack((left.camera_matrix, np.zeros(3)))
-    stereo.P2 = np.column_stack((right.camera_matrix, translation))
-    stereo.Q = np.eye(4)
+    stereo.R1, stereo.R2, stereo.P1, stereo.P2, stereo.Q, _, _ = cv2.stereoRectify(
+        left.camera_matrix, left.dist_coeffs, right.camera_matrix, right.dist_coeffs,
+        left.image_size, rotation, translation, alpha=0,
+    )
     pair = StereoPairCalibration("rgb", "left", "right", left, right, stereo)
     return MultiCameraRig(
         pairs={"rgb": pair}, reference_camera="left", extrinsics={
@@ -142,9 +142,9 @@ def test_kalibr_rejects_nonzero_unrepresentable_coefficients(tmp_path, rig, coef
 
 @pytest.mark.parametrize("value", [0., 1e-10, -1e-10, 1e-12])
 def test_kalibr_allows_tiny_discarded_coefficients(tmp_path, rig, value):
-    rig.pairs["rgb"].left_intrinsics.dist_coeffs = np.array([.1, .2, .3, .4, value])
+    rig.pairs["rgb"].left_intrinsics.dist_coeffs = np.array([-.1, .02, .001, -.001, value])
     path = export.export_rig_kalibr_yaml(rig, tmp_path / "chain.yaml")
-    assert "distortion_coeffs: [0.1, 0.2, 0.3, 0.4]" in path.read_text()
+    assert "distortion_coeffs: [-0.1, 0.02, 0.001, -0.001]" in path.read_text()
     export.validate_rig_kalibr_chain(rig)
 
 

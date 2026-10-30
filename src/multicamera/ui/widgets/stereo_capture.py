@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from ...calibration.models import CameraModel
 from ...calibration.adaptive_guidance import (
     DISTANCE_LABELS, GuidanceObservation, evaluate_distance, measure_pose, measure_composition,
-    _candidate_feasible, reliable_distance_pose,
+    _candidate_feasible, reliable_distance_pose, MAX_DISTANCE_REPAIR_REQUESTS, SCALE_AREA_RANGES,
 )
 from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
@@ -319,9 +319,11 @@ class StereoCaptureWorkspace(QWidget):
                 rec = result.recommendation
                 self._apply_guidance_target()
                 logger.info('Capture guidance updated: pair=%s samples=%s target=%s/%s/%s/%s '
-                            'pose_available=%s feasible=%s', context[0], rec.sample_count,
+                            'pose_available=%s feasible=%s phase=%s initial_total=%s '
+                            'repairs=%s distance_counts=%s missing=%s', context[0], rec.sample_count,
                             rec.zone_row, rec.zone_col, rec.tilt, rec.scale,
-                            rec.pose_available, rec.feasible)
+                            rec.pose_available, rec.feasible, rec.phase, rec.initial_total,
+                            rec.repair_count, result.distance_counts, rec.missing_distances)
         self.refresh()
 
     def _target(self):
@@ -533,6 +535,8 @@ class StereoCaptureWorkspace(QWidget):
                 return bool(
                     self.isVisible() and not self.view.review_key and self._analysis
                     and self._analysis_key == key and not self.panel._pending_save_tokens
+                    and (self._distance_override is not None
+                         or self._analysis.recommendation.phase != 'review')
                     and self._guidance_worker is None
                     and all(s['valid'] and s.get('sharp') and s.get('stable') for s in samples)
                     and self._adaptive_aligned(pairs, samples, target)[0]
@@ -655,6 +659,8 @@ class StereoCaptureWorkspace(QWidget):
         if (self.panel._model_worker or self.panel._calib_worker or self.panel._stereo_import_worker
                 or self.panel._aux_dataset_busy()):
             return 'preparation', '保持当前位置，等待当前任务完成', 'hold'
+        if not self._distance_override and self._analysis.recommendation.phase == 'review':
+            return 'review', '本轮引导结束，可前往标定评估；仍可手动补拍', 'hold'
         feasible = (self._distance_available(self._distance_override) if self._distance_override else
                     self._analysis.recommendation.feasible)
         if not feasible:
@@ -670,9 +676,9 @@ class StereoCaptureWorkspace(QWidget):
             if '判断冲突' in message:
                 return 'distance', '先检查左右共视，暂停前后移动', 'hold'
             if '靠近' in message:
-                return 'distance', '将标定板靠近相机，保持当前高度', 'approach'
+                return 'distance', '板面先正对相机，再靠近镜头；保持当前高度', 'approach'
             if '远离' in message:
-                return 'distance', '将标定板远离相机，保持当前高度', 'retreat'
+                return 'distance', '板面先正对相机，再远离镜头；保持当前高度', 'retreat'
             return 'distance', '保持板面朝向，等待双路距离检测', 'hold'
         if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
                    for s in samples):
@@ -820,8 +826,6 @@ class StereoCaptureWorkspace(QWidget):
         if using_adaptive and not self.view.review_key and not offline:
             self._instruction_stage, action, motion = self._primary_action(pairs, samples, target, duplicate)
             self.instruction.setText('操作：' + action)
-            prefix = ('指定补采' if self._distance_override else
-                      '距离补采' if self._analysis.recommendation.repairing_distance else '自适应推荐')
             evidence = ('距离与倾角可检测' if self._analysis.recommendation.pose_available
                         else '建立初始模型，请手动采图')
             complete = (self._distance_override is not None and self._distance_override
@@ -830,17 +834,38 @@ class StereoCaptureWorkspace(QWidget):
             tilts = {BoardTilt.FRONT: '正面', BoardTilt.TILT_LEFT: '左边近',
                      BoardTilt.TILT_RIGHT: '右边近', BoardTilt.TILT_UP: '上边近',
                      BoardTilt.TILT_DOWN: '下边近'}
-            goal = (f'{prefix} · 目标：{DISTANCE_LABELS[target.scale]}'
-                    if prefix != '自适应推荐' else
-                    f'目标：{DISTANCE_LABELS[target.scale]} · {tilts[target.tilt]}')
+            rec = self._analysis.recommendation
+            phase = (f'首轮 {min(rec.sample_count + 1, rec.initial_total)}/{rec.initial_total}'
+                     if rec.phase == 'initial' else '复核' if rec.phase == 'review' else
+                     f'补采 {min(rec.repair_count + 1, MAX_DISTANCE_REPAIR_REQUESTS)}'
+                     f'/{MAX_DISTANCE_REPAIR_REQUESTS}')
+            # The diagram and visible goal describe this action, not a later tilt step.
+            current_tilt = ('先调距离，暂不倾斜' if self._instruction_stage == 'distance' else
+                            '先平移，暂不倾斜' if self._instruction_stage == 'position' else
+                            tilts[target.tilt])
+            goal = f'目标：{DISTANCE_LABELS[target.scale]} · {current_tilt}'
+            goal = f'{"指定补采" if self._distance_override else phase} · {goal}'
+            if not rec.feasible and not self._distance_override:
+                goal = '当前构图受限 · 请检查分辨率和标定板'
+            if self._instruction_stage == 'review':
+                goal = '本轮引导结束 · 可进入标定评估'
+                missing = '、'.join(DISTANCE_LABELS[s] for s in rec.missing_distances)
+                subtitle = (f'待补：{missing}；可自主补拍' if missing else '距离数量已满足')
+                subtitle += '；不代表精度达标'
             self.reason.setText(f'{goal}\n状态：{subtitle}')
             poses = [self._pose_measurement(camera.camera_id, sample)
                      for pair, offset in zip(pairs, range(0, len(samples), 2))
                      for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
-            if not complete and poses and all(reliable_distance_pose(p) for p in poses):
+            if (not complete and self._instruction_stage != 'review'
+                    and poses and all(reliable_distance_pose(p) for p in poses)):
                 values = ' / '.join(f"{p['depth']:.2f}" for p in poses)
+                low, high = SCALE_AREA_RANGES[target.scale]
+                lower = max(math.sqrt(p['distance_area'] * p['depth'] ** 2 / high) for p in poses)
+                upper = min(math.sqrt(p['distance_area'] * p['depth'] ** 2 / low) for p in poses)
+                distance_goal = (f'目标 {lower:.2f}–{upper:.2f} m' if lower < upper else
+                                 '左右目标范围冲突，请检查配置')
                 self.reason.setText(f'{goal}\n'
-                                    f'板中心深度 {values} m · 可信估计')
+                                    f'板中心深度 {values} m · {distance_goal}')
             busy_state = {'saving': '保存失败，请重试' if self.panel._failed_save_jobs else '等待原图保存',
                           'preparation': '等待当前准备完成',
                           'analysis': '更新采图建议中'}.get(self._instruction_stage)
@@ -857,7 +882,8 @@ class StereoCaptureWorkspace(QWidget):
                                      '自适应分析不可用，请检查固定计划')
         adaptive_action = using_adaptive and not self.view.review_key and not offline
         self.schematic.set_target(
-            replace(target, tilt=BoardTilt.FRONT) if motion in ('approach', 'retreat') else target,
+            replace(target, tilt=BoardTilt.FRONT)
+            if adaptive_action and self._instruction_stage in ('distance', 'position') else target,
             active=adaptive_action or self._instruction_stage == 'fixed',
             instruction=self.instruction.text() if adaptive_action or live else None,
             motion=motion if adaptive_action else 'plan' if self._instruction_stage == 'fixed' else 'hold',
@@ -948,12 +974,6 @@ class StereoCaptureWorkspace(QWidget):
                      '下一步：按上方操作调整后继续采图；精度待标定评估。' if state == '已保存' else
                      '请等待原图保存确认，再按上方操作继续。')
         self.receipt.setToolTip(item.result_text() + '\n' + next_step)
-        if (state == '已保存' and self.adaptive and not self.view.review_key
-                and self._instruction_stage not in ('saving', 'preparation', 'analysis')
-                and '本档数量已补足' not in self.reason.text()):
-            goal = self.reason.text().split('\n')[0]
-            outcome = '已保存，按上方操作继续' if accepted else '已保存但未采纳，请查看验收详情'
-            self.reason.setText(f'{goal}\n本组原图{outcome}')
 
     def set_compact(self, compact):
         self._compact = compact

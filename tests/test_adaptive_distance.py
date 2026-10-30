@@ -30,8 +30,8 @@ def test_explicit_middle_near_far_then_height_groups(board):
     recs = [ag.analyze_guidance(board, CameraModel.PINHOLE,
             {c: seq[:n] for c, seq in data.items()},
             {c: intrinsics() for c in data}).recommendation for n in range(23)]
-    # These observations are all far away: actual evidence supersedes request index.
-    assert tuple(r.scale for r in recs[:7]) == ('medium',) * 7
+    # The first pass does not restart distance gaps when bootstrap becomes available.
+    assert tuple(r.scale for r in recs[:7]) == ag.CENTRAL_DISTANCE_PLAN
     assert all((r.zone_row, r.zone_col) == (1, 1) for r in recs[:7])
     heights = [r.zone_row for r in recs]
     assert [h for i, h in enumerate(heights) if i == 0 or h != heights[i - 1]] == [1, 0, 2]
@@ -124,11 +124,13 @@ def test_distance_animation_moves_fixed_size_board_along_camera_axis():
 
 
 def test_missing_distances_get_bounded_repairs_and_remain_visible(board):
-    data = {c: [observation(board, i, depth=.6, center=(.003 * i, 0)) for i in range(25)]
+    data = {c: [observation(board, i, depth=.6, center=(.003 * i, 0)) for i in range(31)]
             for c in ('L', 'R')}
     provided = {c: intrinsics() for c in data}
     recs = [ag.analyze_guidance(board, CameraModel.PINHOLE,
-            {c: seq[:n] for c, seq in data.items()}, provided).recommendation for n in range(26)]
+            {c: seq[:n] for c, seq in data.items()}, provided).recommendation for n in range(32)]
+    assert all(r.phase == 'initial' and not r.repairing_distance for r in recs[:23])
+    assert recs[23].phase == 'repair'
     repairs = [r for r in recs if r.repairing_distance]
     assert len(repairs) == ag.MAX_DISTANCE_REPAIR_REQUESTS
     assert [r.scale for r in repairs] == ['large', 'large', 'small', 'small']
@@ -136,6 +138,7 @@ def test_missing_distances_get_bounded_repairs_and_remain_visible(board):
     assert all(r.zone_row == r.zone_col == 1 for r in repairs)
     assert all(r.missing_distances == ('large', 'small') for r in recs[7:])
     assert not recs[-1].repairing_distance
+    assert all(r.phase == 'review' for r in recs[27:])
     summary = ag.analyze_guidance(board, CameraModel.PINHOLE, data, provided).summary
     assert '距离待补' in summary and '已达上限' in summary
     assert '不代表距离采集完成' in summary
@@ -176,7 +179,7 @@ def test_distance_band_boundaries_match_coverage(scale, area, ready):
 def test_single_ignored_gap_reports_per_distance_retry_limit(board):
     data = {c: [] for c in ('L', 'R')}
     angles = [(0, 0, 0), (0, 25, 0), (25, 0, 0), (0, -25, 0), (-25, 0, 0)]
-    for i in range(12):
+    for i in range(28):
         for c in data:
             data[c].append(observation(board, i, depth=.8 if i in (5, 6) else .6,
                                        angles=angles[i % len(angles)], center=(.003 * i, 0)))
@@ -185,6 +188,26 @@ def test_single_ignored_gap_reports_per_distance_retry_limit(board):
     assert result.recommendation.missing_distances == ('large',)
     assert not result.recommendation.repairing_distance
     assert '已达上限' in result.summary
+
+
+def test_initial_itinerary_does_not_change_when_intrinsics_arrive(board):
+    data = diverse(board, count=8)
+    for n in range(8):
+        prefix = {c: seq[:n] for c, seq in data.items()}
+        cold = ag.analyze_guidance(board, CameraModel.PINHOLE, prefix, {}).recommendation
+        known = ag.analyze_guidance(board, CameraModel.PINHOLE, prefix,
+                                   {c: intrinsics() for c in data}).recommendation
+        assert (cold.zone_row, cold.zone_col, cold.scale, cold.tilt) == (
+            known.zone_row, known.zone_col, known.scale, known.tilt)
+        assert cold.phase == known.phase == 'initial'
+
+
+def test_review_replay_does_not_validate_a_stale_target():
+    from multicamera.calibration.guidance_replay import _matches
+    rec = ag.GuidanceRecommendation(1, 1, 'up', 'small', '', True, 27, phase='review')
+    verdict = _matches(rec, [])
+    assert verdict['composition_match'] is None
+    assert '旧目标' in verdict['reason']
 
 
 @pytest.mark.parametrize('both_poses', [False, True])

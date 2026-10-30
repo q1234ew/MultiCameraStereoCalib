@@ -1098,8 +1098,10 @@ class CalibrationPanel(QWidget):
         self._combo_calib_strategy.addItem("标准：固定内参求双目外参", "standard")
         self._combo_calib_strategy.addItem("稳健：固定切向畸变/高阶畸变", "robust")
         self._combo_calib_strategy.addItem("联合精修：允许双目阶段微调内参", "joint_refine")
+        self._combo_calib_strategy.addItem("自动校验择模：异常拦截与候选比较（推荐）", "auto_validated")
         self._combo_calib_strategy.setToolTip(
-            "切换策略会清空已有标定结果，但保留采集/导入的图像检测数据"
+            "切换策略清空旧结果、保留原图观测；自动校验择模仅在当前针孔/鱼眼类型内比较，"
+            "自动更换候选至少需要9对共同观测，检查失败不生成可用结果"
         )
         strategy_row.addWidget(self._combo_calib_strategy, 1)
         l1.addLayout(strategy_row)
@@ -2849,6 +2851,18 @@ class CalibrationPanel(QWidget):
         lines.extend(fmt_quality("右目内参", q_r))
         lines.append("")
         lines.extend(fmt_quality("双目外参", q_s))
+        pair = self._pair_calibs.get(pair_name)
+        choice = pair.calibration_info.get('model_selection', {}) if pair else {}
+        if choice:
+            labels = {'standard': '标准', 'constrained': '受约束', 'rational': '有理模型'}
+            lines.extend(['', '自动校验择模：' + labels.get(choice['selected'], choice['selected']),
+                          choice['reason']])
+            for name, candidate in choice['candidates'].items():
+                metric = candidate.get('validation', {}).get('rms_px')
+                message = (f'留出 RMS {metric:.3f} px' if metric is not None else
+                           '有效性检查通过，未触发留出比较' if candidate['status'] == 'ok' else
+                           candidate.get('error', '检查失败'))
+                lines.append(f"  - {labels.get(name, name)}: {message}")
 
         worst = min((q_l, q_r, q_s), key=lambda q: q.score)
         lines.append("")
@@ -2931,6 +2945,7 @@ class CalibrationPanel(QWidget):
             stereo_flags=stereo_flags,
             strategy_name=self._calib_strategy_label(),
             data_filter_key=self._combo_data_filter.currentData() or "all",
+            automatic_model=self._combo_calib_strategy.currentData() == 'auto_validated',
             parent=self,
         )
         worker.log.connect(self._log)

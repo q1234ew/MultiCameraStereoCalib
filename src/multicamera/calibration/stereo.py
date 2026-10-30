@@ -21,6 +21,20 @@ MIN_COMMON_CORNERS = 6
 MIN_FRAMES = 10
 
 
+def pinhole_stereo_flags(left, right, flags=0):
+    """Preserve serialized distortion semantics in both fixed and joint solves."""
+    flags = flags or cv2.CALIB_FIX_INTRINSIC
+    for intr in (left, right):
+        distortion = np.asarray(intr.dist_coeffs).ravel()
+        if distortion.size >= 8:
+            flags |= cv2.CALIB_RATIONAL_MODEL
+        if distortion.size >= 12 and np.any(distortion[8:12]):
+            flags |= cv2.CALIB_THIN_PRISM_MODEL
+        if distortion.size >= 14 and np.any(distortion[12:14]):
+            flags |= cv2.CALIB_TILTED_MODEL
+    return flags
+
+
 class StereoCalibrator:
     """Collects synchronised left/right detections and performs stereo calibration.
 
@@ -190,8 +204,7 @@ class StereoCalibrator:
     def _calibrate_pinhole(
         self, left: CameraIntrinsics, right: CameraIntrinsics, flags: int
     ) -> StereoCalibResult:
-        if flags == 0:
-            flags = cv2.CALIB_FIX_INTRINSIC
+        flags = pinhole_stereo_flags(left, right, flags)
 
         rms, K1, d1, K2, d2, R, T, E, F = cv2.stereoCalibrate(
             self._obj_points,
@@ -353,9 +366,12 @@ class StereoCalibrator:
             dist_coeffs=np.array(d, dtype=np.float64, copy=True),
         )
         self._validate_intrinsics(solved)
+        old_d, new_d = np.asarray(original.dist_coeffs).ravel(), solved.dist_coeffs.ravel()
+        count = max(old_d.size, new_d.size)
+        same_distortion = np.array_equal(np.pad(old_d, (0, count-old_d.size)),
+                                         np.pad(new_d, (0, count-new_d.size)))
         changed = (not np.array_equal(original.camera_matrix, solved.camera_matrix)
-                   or not np.array_equal(np.asarray(original.dist_coeffs).ravel(),
-                                         solved.dist_coeffs.ravel()))
+                   or not same_distortion)
         if changed:
             solved.rms_error = float("nan")
             solved.per_frame_errors = None

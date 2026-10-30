@@ -165,6 +165,67 @@ def _exercise_fisheye(report: dict) -> dict:
     }
 
 
+def _exercise_health(report: dict) -> dict:
+    import copy
+    import cv2
+    import numpy as np
+    from .board.charuco_board import CharucoBoard, CharucoBoardConfig
+    from .board.detector import DetectionResult
+    from .calibration.models import CameraIntrinsics
+    from .calibration.stereo import StereoCalibrator
+    from .calibration.health import check_intrinsics, check_stereo_health
+
+    report['stage'] = 'rational_fidelity_and_health'
+    board = CharucoBoard(CharucoBoardConfig())
+    matrix = np.array([[800., 0., 640.], [0., 800., 360.], [0., 0., 1.]])
+    distortion = np.array([.05, -.02, 0., 0., 0., .01, .002, 0.])
+    left = CameraIntrinsics(matrix, distortion, (1280, 720))
+    right = copy.deepcopy(left)
+    stereo = StereoCalibrator(board, min_frames=6)
+    ids = np.arange(board.num_corners, dtype=np.int32).reshape(-1, 1)
+    for i in range(8):
+        rv = np.array([.2*np.sin(i), .2*np.cos(i), .02*i])
+        tv = np.array([-.2, -.15, 1.+.05*i])
+        detections = []
+        for shift in (0., -.05):
+            points = cv2.projectPoints(board.object_points, rv, tv+[shift, 0., 0.],
+                                       matrix, distortion)[0].astype(np.float32)
+            detections.append(DetectionResult(points, ids, [], None, (1280, 720)))
+        stereo.add_detection_pair(*detections)
+    result = stereo.calibrate(left, right)
+    _check(left.dist_coeffs.size >= 8 and left.dist_coeffs.ravel()[5] == distortion[5],
+           'Rational denominator lost during stereo solve')
+    _check(np.isfinite(left.rms_error) and result.rms_error < .001,
+           'Rational fit metrics or fixed-intrinsic semantics lost')
+    good = check_stereo_health(left, right, result)
+    _check(good['status'] == 'ok', 'Healthy rational model rejected')
+    bad = copy.deepcopy(left)
+    bad.camera_matrix[:2, :2] = [[463., 0.], [0., 463.]]
+    bad.dist_coeffs = np.array([.058, -.034, .0002, .0001, -.0004])
+    _check(check_intrinsics(bad)['status'] == 'failed', 'Folded distortion not rejected')
+    zoomed = copy.deepcopy(result)
+    for projection in (zoomed.P1, zoomed.P2):
+        projection[0, 0] = projection[1, 1] = 8000.
+    _check(check_stereo_health(left, right, zoomed)['status'] == 'failed',
+           'Overzoomed rectification not rejected')
+    no_baseline = copy.deepcopy(result)
+    no_baseline.P2[:, 3] = 0.
+    _check(check_stereo_health(left, right, no_baseline)['status'] == 'failed',
+           'Projection baseline inconsistent with R/T not rejected')
+    no_q = copy.deepcopy(result)
+    no_q.Q[:] = 0.
+    _check(check_stereo_health(left, right, no_q)['status'] == 'failed',
+           'Zero Q not rejected')
+    wrong_scale = copy.deepcopy(result)
+    wrong_scale.Q[3] *= 2.
+    _check(check_stereo_health(left, right, wrong_scale)['status'] == 'failed',
+           'Wrong metric reconstruction scale not rejected')
+    return {'rational_stereo_rms': float(result.rms_error), 'health': good,
+            'invalid_lens_rejected': True, 'overzoom_rejected': True,
+            'rational_denominator_preserved': True, 'projection_baseline_rejected': True,
+            'zero_q_rejected': True, 'wrong_depth_scale_rejected': True}
+
+
 def _exercise_calibration(report: dict) -> dict:
     import cv2
     import numpy as np
@@ -250,6 +311,7 @@ def _exercise_calibration(report: dict) -> dict:
         "exports": exports,
         "coverage": "pinhole intrinsics, stereo, rectification, JSON/OpenCV readback, Kalibr export",
         "fisheye": _exercise_fisheye(report),
+        "health_checks": _exercise_health(report),
     }
 
 

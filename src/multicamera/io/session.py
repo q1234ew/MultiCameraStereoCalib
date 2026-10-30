@@ -331,10 +331,13 @@ class CalibrationSession:
         """Save an isolated generation, then atomically publish its latest pointer."""
         from .export import (
             KalibrDistortionError,
+            _validate_rig,
             export_rig_kalibr_yaml,
             export_rig_opencv_standard_yaml,
             export_rig_opencv_yaml,
         )
+
+        _validate_rig(rig)
 
         generation_id = uuid.uuid4().hex
         root = self.session_dir / self.RESULTS_DIR

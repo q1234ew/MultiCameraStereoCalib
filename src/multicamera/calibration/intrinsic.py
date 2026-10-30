@@ -108,7 +108,7 @@ class IntrinsicCalibrator:
             self._image_size = None
         return True
 
-    def calibrate(self, flags: int = 0) -> CameraIntrinsics:
+    def calibrate(self, flags: int = 0, initial: CameraIntrinsics | None = None) -> CameraIntrinsics:
         """Run camera calibration using all collected frames."""
         if not self.ready:
             raise ValueError(
@@ -119,9 +119,9 @@ class IntrinsicCalibrator:
             with perf_timer("fisheye intrinsic calibrate", threshold_ms=500.0):
                 return self._calibrate_fisheye(flags)
         with perf_timer("pinhole intrinsic calibrate", threshold_ms=500.0):
-            return self._calibrate_pinhole(flags)
+            return self._calibrate_pinhole(flags, initial)
 
-    def _calibrate_pinhole(self, flags: int) -> CameraIntrinsics:
+    def _calibrate_pinhole(self, flags: int, initial=None) -> CameraIntrinsics:
         board_corners = self.board.object_points
         # ChArUco IDs index board corners; detections can be partial and unordered.
         obj_points = [
@@ -136,12 +136,21 @@ class IntrinsicCalibrator:
             "Pinhole intrinsic calibration: OpenCV=%s api=cv2.calibrateCamera frames=%d size=%s",
             cv2.__version__, self.num_frames, self._image_size,
         )
+        seed_k, seed_d = None, None
+        if initial is not None:
+            if initial.model != CameraModel.PINHOLE or initial.image_size != self._image_size:
+                raise ValueError('初始化内参模型或尺寸不一致')
+            seed_k = np.array(initial.camera_matrix, dtype=float, copy=True)
+            seed_d = np.zeros((8 if flags & cv2.CALIB_RATIONAL_MODEL else 5, 1))
+            count = min(initial.dist_coeffs.size, seed_d.size)
+            seed_d[:count, 0] = np.asarray(initial.dist_coeffs).ravel()[:count]
+            flags |= cv2.CALIB_USE_INTRINSIC_GUESS
         rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
             obj_points,
             img_points,
             self._image_size,
-            None,
-            None,
+            seed_k,
+            seed_d,
             flags=flags,
         )
         logger.info("Pinhole intrinsic RMS: %.4f", rms)

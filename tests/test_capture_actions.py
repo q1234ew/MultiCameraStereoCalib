@@ -179,6 +179,43 @@ def test_conflicting_distance_stops_animation_and_resumes_in_correct_direction(
     assert guide.schematic.canvas._board_point(0, 0, 1)[2] < guide.schematic.canvas._board_point(0, 0, 0)[2]
 
 
+def test_tilt_target_not_presented_as_current_action_while_adjusting_distance(
+        stereo_bench, app, monkeypatch):
+    guide, _ = prepare(stereo_bench, app)
+    guide._analysis.recommendation = replace(guide._analysis.recommendation, tilt='up')
+    guide._apply_guidance_target()
+    area = [.2]
+    monkeypatch.setattr(guide, '_pose_measurement', lambda *args:
+                        {'yaw': 0., 'pitch': -25., 'depth': 1., 'distance_area': area[0],
+                         'distance_reliable': True})
+    _, samples = guide._current_samples()
+    for s in samples:
+        s.update(center=np.array([.5, .5]), sharp=True, stable=True)
+    guide.refresh()
+    assert guide._instruction_stage == 'distance'
+    assert '暂不倾斜' in guide.reason.text() and '上边近' not in guide.reason.text()
+    assert guide.schematic.target.tilt == BoardTilt.FRONT
+    assert '正对' in guide.instruction.text()
+    area[0] = .07
+    guide.refresh()
+    assert '上边近' in guide.reason.text()
+    assert guide.schematic.target.tilt == BoardTilt.TILT_UP
+
+
+def test_review_stage_stops_automatic_loop_but_allows_explicit_supplement(stereo_bench, app):
+    guide, _ = prepare(stereo_bench, app)
+    guide._analysis.recommendation = replace(guide._analysis.recommendation,
+                                           phase='review', sample_count=27, repair_count=4)
+    guide.refresh()
+    assert guide._instruction_stage == 'review'
+    assert '手动补拍' in guide.instruction.text()
+    assert '本轮引导结束' in guide.reason.text()
+    assert not guide.auto_ready()
+    guide.btn_near.click()
+    assert guide._distance_override == 'large'
+    assert guide._instruction_stage != 'review'
+
+
 def test_supplement_does_not_bypass_pose_gate(stereo_bench, app, monkeypatch):
     guide, _ = prepare(stereo_bench, app)
     guide.btn_near.click()

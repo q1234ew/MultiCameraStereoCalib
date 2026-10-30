@@ -32,6 +32,8 @@ def _measurement(board, observation, intrinsics):
 
 
 def _matches(recommendation, measurements):
+    if recommendation.phase == 'review':
+        return {'composition_match': None, 'reason': '本轮引导结束，自主补拍不按旧目标验收'}
     if not recommendation.feasible:
         return {'composition_match': False, 'reason': '无可用构图，请调整分辨率或标定板'}
     if not all(m['geometry_valid'] for m in measurements):

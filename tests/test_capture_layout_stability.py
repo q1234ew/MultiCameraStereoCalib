@@ -2,6 +2,7 @@
 
 import time
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 import numpy as np
@@ -72,6 +73,15 @@ def test_live_status_and_expansion_do_not_move_previews(stereo_bench, app, size,
     panel._on_white_balance_busy(False)
     guide.refresh()
     unchanged('prepared')
+    original = guide._analysis.recommendation
+    for phase, count, repairs in [('initial', 8, 0), ('repair', 23, 0), ('review', 27, 4)]:
+        guide._analysis.recommendation = replace(original, phase=phase,
+                                                 sample_count=count, repair_count=repairs,
+                                                 repairing_distance=phase == 'repair')
+        guide.refresh()
+        unchanged(phase)
+    guide._analysis.recommendation = original
+    guide.refresh()
     panel._pending_save_tokens.add('test-save')
     panel._lbl_capture_decision.setText('保存中 · 原图左右角点独立验收\n等待磁盘写入完成')
     panel._refresh_disk_hint()
@@ -134,6 +144,7 @@ def test_persistent_receipt_distinguishes_partial_saved_original(stereo_bench, a
     assert '已保存' in guide.receipt.text()
     assert '右124' in guide.receipt.text() and '部分角点可采纳' in guide.receipt.text()
     assert '下一步' in guide.receipt.toolTip()
+    assert '本组原图' not in guide.reason.text()
     item.quality_state = '待复核'
     guide.refresh()
     assert '可采纳' not in guide.receipt.text()
@@ -152,7 +163,7 @@ def test_initial_guidance_separates_goal_action_and_manual_next_step(stereo_benc
     for measurement in samples:
         measurement.update(center=np.array([.5, .5]), area=.07, distance_area=.07)
     guide.refresh()
-    assert guide.reason.text().startswith('目标：')
+    assert guide.reason.text().startswith('首轮 1/23 · 目标：')
     assert '建立初始模型' in guide.reason.text()
     assert '冷启动' not in guide.reason.text()
     assert guide.instruction.text().startswith('操作：')

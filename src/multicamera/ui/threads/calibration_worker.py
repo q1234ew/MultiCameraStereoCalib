@@ -15,6 +15,9 @@ from ...calibration.models import CameraIntrinsics, CameraModel, MultiCameraRig,
 from ...calibration.quality_summary import summarize_quality
 from ...calibration.selection import select_calibrators
 from ...calibration.stereo_diagnostics import measure_rectification
+from ...calibration.health import check_stereo_health
+from ...calibration.validated_selection import calibrate_validated
+from ...calibration.stereo import pinhole_stereo_flags
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class PairCalibrationWorker(QThread):
         strategy_name: str = "标准",
         data_filter_key: str = "all",
         parent=None,
+        automatic_model: bool = False,
     ):
         super().__init__(parent)
         self.pair_name = pair_name
@@ -66,6 +70,7 @@ class PairCalibrationWorker(QThread):
         self.stereo_flags = stereo_flags
         self.strategy_name = strategy_name
         self.data_filter_key = data_filter_key
+        self.automatic_model = automatic_model
 
     def run(self):
         try:
@@ -96,24 +101,27 @@ class PairCalibrationWorker(QThread):
                     )
                 )
             selected_sides = deepcopy(selection)
+            automatic = None
+            if self.automatic_model and self.left_intrinsics is None and self.right_intrinsics is None:
+                automatic = calibrate_validated(left_cal, right_cal, stereo_cal, self.log.emit)
             left_intr = deepcopy(self.left_intrinsics)
             if left_intr is None:
                 self.log.emit(f"标定内参: {self.left_id}...")
-                left_intr = left_cal.calibrate(flags=self.intrinsic_flags)
+                left_intr = automatic[0] if automatic else left_cal.calibrate(flags=self.intrinsic_flags)
             else:
                 selection["left"] = _provided_intrinsic_selection(left_intr, selected_sides.get("left"))
 
             right_intr = deepcopy(self.right_intrinsics)
             if right_intr is None:
                 self.log.emit(f"标定内参: {self.right_id}...")
-                right_intr = right_cal.calibrate(flags=self.intrinsic_flags)
+                right_intr = automatic[1] if automatic else right_cal.calibrate(flags=self.intrinsic_flags)
             else:
                 selection["right"] = _provided_intrinsic_selection(right_intr, selected_sides.get("right"))
 
             self.log.emit(f"标定外参: {self.pair_name}...")
             before = [(intr.camera_matrix.copy(), intr.dist_coeffs.copy())
                       for intr in (left_intr, right_intr)]
-            stereo = stereo_cal.calibrate(
+            stereo = automatic[2] if automatic else stereo_cal.calibrate(
                 left_intr, right_intr, flags=self.stereo_flags
             )
             fix_flag = (cv2.fisheye.CALIB_FIX_INTRINSIC if stereo.model == CameraModel.FISHEYE
@@ -136,16 +144,21 @@ class PairCalibrationWorker(QThread):
                                                else "selected_observations"),
                             "used_ids": list(intr.frame_ids), "used_count": len(intr.frame_ids),
                         }
-            info = {}
+            health = check_stereo_health(left_intr, right_intr, stereo)
+            if health['status'] != 'ok':
+                raise ValueError('不可用于立体校正：' + '；'.join(health['reasons'])
+                                 + '；请使用自动校验择模或补充观测后重试')
+            self.log.emit('有效性检查通过：边界反算、径向单调性及校正视野（数值采样）')
+            info = {'health': health}
             if selection:
                 rectification = measure_rectification(stereo_cal, left_intr, right_intr, stereo)
                 rectification['dataset'] = 'selected_stereo_observations'
-                info = {"opencv_version": cv2.__version__, "strategy": self.strategy_name,
+                info.update({"opencv_version": cv2.__version__, "strategy": self.strategy_name,
                         "intrinsic_flags": int(self.intrinsic_flags),
                         "stereo_flags": int(self.stereo_flags),
                         "camera_model": stereo.model.value,
                         "selection": selection, "board": stereo_cal.board.to_dict(),
-                        "rectification": rectification}
+                        "rectification": rectification})
                 self.log.emit(
                     f"同 ID 校正残差：{rectification['axis']}，{rectification['point_count']} 点，"
                     f"RMS={rectification['rms_px']} px（训练集，非独立验证）"
@@ -159,6 +172,26 @@ class PairCalibrationWorker(QThread):
                 stereo=stereo,
                 calibration_info=info,
             )
+            if automatic:
+                info['model_selection'] = automatic[3]
+                selected = automatic[3]['selected']
+                info['intrinsic_flags'] = (
+                    cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_USE_INTRINSIC_GUESS if selected == 'rational'
+                    else (cv2.fisheye.CALIB_FIX_K3 | cv2.fisheye.CALIB_FIX_K4
+                          if stereo.model == CameraModel.FISHEYE else cv2.CALIB_FIX_K3)
+                    if selected == 'constrained' else 0)
+                info['stereo_flags'] = ((cv2.fisheye.CALIB_FIX_INTRINSIC | cv2.fisheye.CALIB_FIX_SKEW
+                                         if stereo.model == CameraModel.FISHEYE else cv2.CALIB_FIX_INTRINSIC)
+                                        | (cv2.CALIB_RATIONAL_MODEL if selected == 'rational' else 0))
+            info['requested_stereo_flags'] = int(self.stereo_flags)
+            info['requested_intrinsic_flags'] = int(self.intrinsic_flags)
+            if stereo.model == CameraModel.PINHOLE:
+                info['stereo_flags'] = int(pinhole_stereo_flags(
+                    left_intr, right_intr, info.get('stereo_flags', self.stereo_flags)))
+            else:
+                info['stereo_flags'] = int(info.get('stereo_flags', self.stereo_flags)
+                                           or (cv2.fisheye.CALIB_FIX_INTRINSIC
+                                               | cv2.fisheye.CALIB_FIX_SKEW))
             quality = summarize_quality(MultiCameraRig(pairs={self.pair_name: pair_calib}))
             if not quality.valid:
                 raise ValueError("标定结果无效：" + "；".join(quality.risks))
