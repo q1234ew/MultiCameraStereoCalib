@@ -73,15 +73,17 @@ class CaptureTarget:
     tilt: BoardTilt
     status: CaptureStatus = CaptureStatus.PENDING
     scale: str = "medium"
+    target_center: tuple[float, float] | None = None
+    target_area: float | None = None  # Candidate reference only; distance band remains the gate.
 
     @property
     def norm_cx(self) -> float:
         """Normalised x-centre in [0,1]."""
-        return (self.zone_col + 0.5) / 3.0
+        return self.target_center[0] if self.target_center is not None else (self.zone_col + 0.5) / 3.0
 
     @property
     def norm_cy(self) -> float:
-        return (self.zone_row + 0.5) / 3.0
+        return self.target_center[1] if self.target_center is not None else (self.zone_row + 0.5) / 3.0
 
     @property
     def label(self) -> str:
@@ -128,29 +130,12 @@ def build_default_sequence() -> List[CaptureTarget]:
 
 
 def build_multimodal_sequence() -> List[CaptureTarget]:
-    """RGB_L + AUX 平面板采图序：覆盖视场 + 倾角，用于跨模态单目标定。"""
-    seq: List[CaptureTarget] = []
-    for r, c in (
-        (1, 1),
-        (1, 0),
-        (1, 2),
-        (0, 1),
-        (2, 1),
-        (0, 0),
-        (0, 2),
-        (2, 0),
-        (2, 2),
-    ):
-        seq.append(CaptureTarget(r, c, BoardTilt.FRONT))
+    """Independent planar plan: central distances/tilts, then grouped image heights."""
+    from ...calibration.aux_guidance import initial_plan
 
-    for tilt in (
-        BoardTilt.TILT_LEFT,
-        BoardTilt.TILT_RIGHT,
-        BoardTilt.TILT_UP,
-        BoardTilt.TILT_DOWN,
-    ):
-        seq.append(CaptureTarget(1, 1, tilt))
-    return seq
+    tilts = {'front': BoardTilt.FRONT, 'left': BoardTilt.TILT_LEFT,
+             'right': BoardTilt.TILT_RIGHT, 'up': BoardTilt.TILT_UP, 'down': BoardTilt.TILT_DOWN}
+    return [CaptureTarget(t.row, t.col, tilts[t.tilt], scale=t.scale) for t in initial_plan()]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -423,6 +408,8 @@ def draw_target_overlay(
     # centre of zone
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
+    if target.target_center is not None:
+        cx, cy = int(target.norm_cx * w), int(target.norm_cy * h)
 
     _draw_tilt_indicator(vis, cx, cy, zone_w, zone_h, target.tilt)
     _draw_opencv_pose_inset(vis, target.tilt, compact=compact)
@@ -589,6 +576,9 @@ class _LargeGuideDiagram(QWidget):
         self._total = 0
         self._finished = False
         self._targets = []
+        self.completion_message = None
+        self.show_distance = False
+        self.recommendations_only = False
         self.setMouseTracking(True)
         self.setMinimumHeight(220)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
@@ -609,6 +599,8 @@ class _LargeGuideDiagram(QWidget):
 
     @property
     def completion_title(self):
+        if self.completion_message:
+            return self.completion_message[0]
         done = sum(t.status == CaptureStatus.DONE for t in self._targets)
         return '采图计划已完成' if done == self._total else '引导已浏览完'
 
@@ -668,6 +660,7 @@ class _LargeGuideDiagram(QWidget):
             p.setPen(QColor(TEXT_DIM))
             p.drawText(
                 QRect(0, h // 2 + 4, w, 36), Qt.AlignCenter,
+                self.completion_message[1] if self.completion_message else
                 f"已采 {done} · 跳过 {skipped} · 可继续补拍",
             )
             return
@@ -680,10 +673,14 @@ class _LargeGuideDiagram(QWidget):
         t = self._target
         step_text = f"{self._step_index + 1}/{self._total}"
         label_text = t.label
+        if self.show_distance:
+            label_text = {'small': '远', 'medium': '中', 'large': '近'}[t.scale] + ' · ' + label_text
         status, status_color = {
             CaptureStatus.PENDING: ('待采', ACCENT), CaptureStatus.DONE: ('已采', SUCCESS),
             CaptureStatus.SKIPPED: ('已跳过', WARNING),
         }[t.status]
+        if self.recommendations_only and t.status == CaptureStatus.PENDING:
+            status = '建议'
 
         # ── header: badge | label | hint ──
         hdr_h = 28
@@ -790,10 +787,13 @@ class _LargeGuideDiagram(QWidget):
         p.setBrush(QBrush(highlight))
         p.setPen(QPen(QColor(ACCENT), 2.5))
         p.drawRect(zx + 1, zy + 1, int(cw) - 2, int(ch) - 2)
-        zcx = zx + int(cw) / 2.0
-        zcy = zy + int(ch) / 2.0
+        zcx = gx0 + t.norm_cx * gw
+        zcy = gy0 + t.norm_cy * gh
         paint_board_tilt_symbol(
-            p, zcx, zcy, float(min(cw, ch) * 0.34), t.tilt, line_scale=2.0,
+            p, zcx, zcy, float(min(cw, ch) * (
+                min(.55, .34 * np.sqrt(t.target_area / .07)) if t.target_area is not None else
+                {'small': .23, 'medium': .34, 'large': .46}[t.scale]
+                if self.show_distance else .34)), t.tilt, line_scale=2.0,
         )
 
         count = len(self._targets)
@@ -921,6 +921,7 @@ class CaptureSequenceWidget(QFrame):
         outer.addWidget(self._dots)
 
         self._sequence: Optional[CaptureSequence] = None
+        self.recommendations_only = False
 
         self.setFocusPolicy(Qt.StrongFocus)
         sc_l = QShortcut(QKeySequence(Qt.Key_Left), self)
@@ -943,6 +944,11 @@ class CaptureSequenceWidget(QFrame):
     def set_diagram_height(self, height):
         self._large_guide.setMinimumHeight(height)
         self._large_guide.setMaximumHeight(height + 4)
+
+    def set_completion_message(self, title, subtitle):
+        self._large_guide.completion_message = (title, subtitle) if title else None
+        if self._detail_dialog is not None:
+            self._detail_dialog.canvas.completion_message = self._large_guide.completion_message
 
     def _open_expanded_guide(self):
         if self._detail_dialog is None:
@@ -1043,11 +1049,16 @@ class CaptureSequenceWidget(QFrame):
         summary = f'已采 {done} · 跳过 {skipped} · 待采 {total - done - skipped}'
         self._btn_steps.setToolTip(summary + '\n姿态清单：查看记录状态并跳转')
         self._large_guide._targets = self._sequence.targets
+        self._large_guide.recommendations_only = self.recommendations_only
+        if self.recommendations_only:
+            self._btn_steps.setToolTip('建议姿态清单仅供浏览；图像数量和姿态验证另计')
         names = {CaptureStatus.DONE: ('已采', 'check', SUCCESS),
                  CaptureStatus.SKIPPED: ('跳过', 'circle-minus', WARNING),
                  CaptureStatus.PENDING: ('待采', 'scan-line', TEXT_DIM)}
         for index, (target, action) in enumerate(zip(self._sequence.targets, self._step_actions)):
             label, icon, color = names[target.status]
+            if self.recommendations_only and target.status == CaptureStatus.PENDING:
+                label = '建议'
             current = ' · 当前' if index == self._sequence.current_index else ''
             action.setText(f'{index + 1:02d}  {target.label}  · {label}{current}')
             action.setIcon(app_icon(icon, color))
@@ -1058,7 +1069,9 @@ class CaptureSequenceWidget(QFrame):
         self._dots.set_data(self._sequence.targets, idx)
 
         cur = self._sequence.current
-        accessible = f'{idx + 1}/{total}，{cur.label}；{summary}' if cur is not None else f'引导已浏览完；{summary}'
+        accessible = (f'{idx + 1}/{total}，{cur.label}；{summary}' if cur is not None else
+                      '；'.join(self._large_guide.completion_message)
+                      if self._large_guide.completion_message else f'引导已浏览完；{summary}')
         self._large_guide.setAccessibleName(accessible)
         self._large_guide.setToolTip(accessible + '\n记录状态不代表姿态覆盖已自动验证')
         if cur is not None:
@@ -1074,6 +1087,9 @@ class CaptureSequenceWidget(QFrame):
         self._btn_skip.setEnabled(n > 0 and idx < n)
         if self._detail_dialog is not None:
             detail = self._detail_dialog
+            detail.canvas.completion_message = self._large_guide.completion_message
+            detail.canvas.show_distance = self._large_guide.show_distance
+            detail.canvas.recommendations_only = self.recommendations_only
             detail.canvas._targets = self._sequence.targets
             detail.canvas.set_guide(cur, idx, total, self._sequence.finished)
             detail.canvas.setAccessibleName(accessible)

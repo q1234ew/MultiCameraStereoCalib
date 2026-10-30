@@ -35,7 +35,7 @@ MAX_DISTANCE_REPAIR_PER_SCALE = 2
 CANDIDATE_IMAGE_MARGIN = .04
 MIN_CORNER_SPACING_PX = 6.
 CANDIDATE_TILT_DEGREES = 25.
-TILTED_FOOTPRINT_PADDING = 1.08
+TILTED_FOOTPRINT_PADDING = 1.30
 MIN_BOARD_HULL_FRACTION = .5
 TILT_THRESHOLD_DEGREES = 12.
 MAX_REPROJECTION_RMS = 3.
@@ -44,7 +44,13 @@ MAX_DISTANCE_SPACING_ERROR = .10
 BOOTSTRAP_MIN_VIEWS = 6
 BOOTSTRAP_MAX_VIEWS = 30
 BOOTSTRAP_MAX_RMS = 2.5
+INITIAL_SAMPLE_BUDGET = 23
+# Scheduling preferences, not scientific acceptance thresholds or hard quotas.
+PREFERRED_DISTANCE_COUNTS = {'large': 8, 'medium': 11, 'small': 4}
+TILT_SAMPLE_GOAL = 2
+COVERAGE_SHAPE = (6, 8)
 _TILTS = ('front', 'left', 'right', 'up', 'down')
+TILT_LABELS = dict(zip(_TILTS, ('正面', '左边近', '右边近', '上边近', '下边近')))
 _SCALES = ('medium', 'small', 'large')
 
 
@@ -76,6 +82,11 @@ class GuidanceRecommendation:
     phase: str = 'initial'
     initial_total: int = 23
     repair_count: int = 0
+    target_center: tuple[float, float] | None = None
+    target_area: float | None = None
+    missing_tilts: tuple[str, ...] = ()
+    next_hint: str = ''
+    distribution_gaps: tuple[str, ...] = ()
 
 
 @dataclass
@@ -85,6 +96,8 @@ class GuidanceAnalysis:
     summary: str
     distance_counts: dict[str, int] = field(default_factory=dict)
     approximate_distance_counts: dict[str, int] = field(default_factory=dict)
+    tilt_counts: dict[str, int] = field(default_factory=dict)
+    image_coverage: dict[str, list[list[int]]] = field(default_factory=dict)
 
 
 def reliable_distance_pose(pose):
@@ -386,24 +399,40 @@ def _tilt(pose):
     return 'down' if pitch > 0 else 'up'
 
 
-def _candidate_feasible(board, candidate, image_sizes):
-    """Approximate footprint/spacing at a zone center in each known image size.
+def pose_matches_tilt(pose, tilt):
+    """Shared measured tilt acceptance, identical for live, raw and replay."""
+    yaw, pitch = pose['yaw'], pose['pitch']
+    if tilt == 'front':
+        return abs(yaw) < 15 and abs(pitch) < 15
+    primary, secondary, sign = {'left': (yaw, pitch, -1), 'right': (yaw, pitch, 1),
+                               'up': (pitch, yaw, -1), 'down': (pitch, yaw, 1)}[tilt]
+    return 15 <= sign * primary <= 40 and abs(secondary) < 20
 
-    Use the inner-corner extent, target hull area and modest tilt foreshortening,
-    with extra footprint padding for perspective. This is not a lens projection
-    or stereo co-visibility test: extrinsics, roll and actual tilt are unknown.
-    Unknown image sizes cannot be checked; no global feasibility is guaranteed.
+
+def _candidate_feasible(board, candidate, image_sizes):
+    return _candidate_geometry(board, candidate, image_sizes) is not None
+
+
+def _candidate_geometry(board, candidate, image_sizes):
+    """Search scale and in-zone position; bounds include the outer printed board.
+
+    This remains a per-image footprint approximation, not stereo projection or
+    a guarantee of co-visibility. The returned center is shared by UI and gates.
     """
     points = np.array(board.object_points, np.float64, copy=True)[:, :2]
+    if any(len(size) != 2 or any(isinstance(v, (bool, np.bool_))
+           or not isinstance(v, (int, np.integer)) or v <= 0 for v in size)
+           for size in image_sizes):
+        return None
     extent = np.ptp(points, axis=0)
     if not np.isfinite(points).all() or np.any(extent <= 0):
-        return False
+        return None
     spacing = []
     for axis in range(2):
         gaps = np.diff(np.unique(points[:, axis]))
         gaps = gaps[gaps > extent[axis] * 1e-6]
         if not len(gaps):
-            return False
+            return None
         spacing.append(float(gaps.min() / extent[axis]))
     row, col, tilt, scale = candidate
     aspect = extent[0] / extent[1]
@@ -412,22 +441,90 @@ def _candidate_feasible(board, candidate, image_sizes):
         aspect *= cosine
     elif tilt in ('up', 'down'):
         aspect /= cosine
-    center = np.array([(col + .5) / 3, (row + .5) / 3])
     padding = 1. if tilt == 'front' else TILTED_FOOTPRINT_PADDING
-    for size in image_sizes:
-        width, height = size
-        area_px = SCALE_AREA_TARGETS[scale] * width * height
-        rectangle = np.array([np.sqrt(area_px * aspect), np.sqrt(area_px / aspect)])
-        half = rectangle / np.array(size) * padding / 2
-        if (np.any(center - half < CANDIDATE_IMAGE_MARGIN)
-                or np.any(center + half > 1 - CANDIDATE_IMAGE_MARGIN)
-                or np.min(rectangle * spacing) < MIN_CORNER_SPACING_PX):
-            return False
-    return True
+    outer_ratio = (extent + 2 * board.config.square_length) / extent
+    nominal_center = np.array([(col + .5) / 3, (row + .5) / 3])
+    low, high = SCALE_AREA_RANGES[scale]
+    preferred = SCALE_AREA_TARGETS[scale]
+    # Try the nominal size first, then smaller AND larger sizes inside this band.
+    areas = sorted(set([preferred, *np.linspace(low * 1.08, high * .92, 9)]),
+                   key=lambda a: abs(np.log(a / preferred)))
+    for area in areas:
+        lower = np.array([col, row], float) / 3 + .005
+        upper = (np.array([col, row], float) + 1) / 3 - .005
+        rectangles = []
+        for size in image_sizes or [(1280, 720)]:
+            width, height = size
+            rectangle = np.array([np.sqrt(area * width * height * aspect),
+                                  np.sqrt(area * width * height / aspect)])
+            if np.min(rectangle * spacing) < MIN_CORNER_SPACING_PX:
+                break
+            half = rectangle / size * outer_ratio * padding / 2
+            lower = np.maximum(lower, half + CANDIDATE_IMAGE_MARGIN)
+            upper = np.minimum(upper, 1 - half - CANDIDATE_IMAGE_MARGIN)
+            rectangles.append(rectangle / size)
+        else:
+            if np.all(lower <= upper):
+                center = np.clip(nominal_center, lower, upper)
+                local = (points - (points.min(axis=0) + points.max(axis=0)) / 2) / extent
+                predicted = [local * rectangle + center for rectangle in rectangles]
+                return tuple(float(v) for v in center), float(area), predicted
+    return None
+
+
+def _coverage_cells(points, size=(1, 1)):
+    normalized = np.asarray(points).reshape(-1, 2) / size
+    cells = np.floor(normalized * np.array(COVERAGE_SHAPE[::-1])).astype(int)
+    cells = cells[(cells[:, 0] >= 0) & (cells[:, 0] < COVERAGE_SHAPE[1])
+                  & (cells[:, 1] >= 0) & (cells[:, 1] < COVERAGE_SHAPE[0])]
+    return np.unique(cells[:, ::-1], axis=0)
+
+
+def _move_cost(candidate, geometry, previous, previous_area, previous_tilt):
+    """Prefer similar height and depth when information benefits are close."""
+    center, area, _ = geometry
+    dx, dy = np.abs(np.asarray(center) - previous)
+    return (2.5 * dy + .6 * dx + .25 * abs(np.log(area / previous_area))
+            + .08 * (candidate[2] != previous_tilt))
+
+
+def _choose_candidate(candidates, geometries, coverage, distances, tilts, requests,
+                      previous, previous_area, previous_tilt, previous_target, observed=()):
+    """Bounded coverage/diversity heuristic, not Fisher-information optimization."""
+    scored = []
+    for candidate in candidates:
+        _, _, tilt, scale = candidate
+        geometry = geometries[candidate]
+        gains = []
+        for visits, points in zip(coverage, geometry[2]):
+            cells = _coverage_cells(points)
+            gains.append(sum(1 / (1 + visits[r, c]) for r, c in cells) / visits.size)
+        # Include both eyes while giving extra weight to the larger coverage gap.
+        coverage_gain = .5 * float(np.mean(gains)) + .5 * max(gains)
+        distance_need = max(0, 1 - distances[scale] / PREFERRED_DISTANCE_COUNTS[scale])
+        tilt_need = (max(0, 1 - tilts[tilt] / TILT_SAMPLE_GOAL) if tilt != 'front' else 0.)
+        # Requested poses are NOT verified evidence. A soft cost avoids repeatedly
+        # asking for an ignored tilt; outstanding gaps remain visible at review.
+        exploration = .12 * requests[tilt]
+        far_penalty = .55 if scale == 'small' and distances['small'] >= 4 else 0.
+        utility = 2.2 * coverage_gain + .9 * distance_need + .8 * tilt_need - exploration - far_penalty
+        similarity = max((np.exp(-np.sum((np.asarray(geometry[0]) - center) ** 2) / .07 ** 2
+                                 - (np.log(geometry[1] / area) / .18) ** 2)
+                          for center, area, seen_tilt in observed if seen_tilt == tilt), default=0.)
+        utility -= .9 * similarity
+        if candidate == previous_target:
+            utility -= .3
+        movement = _move_cost(candidate, geometry, previous, previous_area, previous_tilt)
+        scored.append((candidate, utility, movement))
+    best = max(value for _, value, _ in scored)
+    # Movement is a tie-break within a bounded benefit window, never a veto on gaps.
+    close = [item for item in scored if item[1] >= best - .18]
+    return min(close, key=lambda item: (item[2], -item[1], item[0]))[0]
 
 
 def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservation]],
-                     provided_intrinsics: dict[str, CameraIntrinsics]) -> GuidanceAnalysis:
+                     provided_intrinsics: dict[str, CameraIntrinsics],
+                     image_sizes: dict[str, tuple[int, int]] | None = None) -> GuidanceAnalysis:
     """Recommend one next composition from exactly two cameras, without mutation.
 
     Frame IDs match within the pair, not by list position. Conflicting repeated
@@ -481,22 +578,26 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             estimate = _bootstrap(board, model, [p[i] for p in unique])
             if estimate is not None:
                 intrinsics[camera] = estimate
-    zones, scales, tilts, joint = [Counter(), Counter()], [Counter(), Counter()], [Counter(), Counter()], Counter()
-    # Group heights: centre, middle row, upper row, lower row. No alternating corners.
+    coverage = [np.zeros(COVERAGE_SHAPE, dtype=int) for _ in cameras]
     zone_order = [(1, 1), (1, 0), (1, 2), (0, 2), (0, 1), (0, 0), (2, 0), (2, 1), (2, 2)]
-    image_sizes = []
+    known_sizes = []
     for i, camera in enumerate(cameras):
         if unique:
-            image_sizes.append(unique[0][i][0].image_size)
+            known_sizes.append(unique[0][i][0].image_size)
+        elif image_sizes and camera in image_sizes:
+            known_sizes.append(image_sizes[camera])
         elif camera in intrinsics:
-            image_sizes.append(intrinsics[camera].image_size)
+            known_sizes.append(intrinsics[camera].image_size)
         elif maps[camera]:
-            image_sizes.append(next(iter(maps[camera].values()))[0].image_size)
-    candidates = [candidate for (r, c), t, s in product(zone_order, _TILTS, _SCALES)
-                  if _candidate_feasible(board, candidate := (r, c, t, s), image_sizes)]
-    available_zones = {c[:2] for c in candidates}
-    initial_total = sum(len(CENTRAL_DISTANCE_PLAN) if z == (1, 1) else 2
-                        for z in available_zones)
+            known_sizes.append(next(iter(maps[camera].values()))[0].image_size)
+    geometries = {}
+    for (r, c), t, s in product(zone_order, _TILTS, _SCALES):
+        candidate = (r, c, t, s)
+        geometry = _candidate_geometry(board, candidate, known_sizes)
+        if geometry is not None:
+            geometries[candidate] = geometry
+    candidates = list(geometries)
+    initial_total = INITIAL_SAMPLE_BUDGET
     target = (1, 1, 'front', 'medium')
     if candidates and target not in candidates:
         target = candidates[0]
@@ -506,14 +607,16 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     approximate_distances = Counter()
     repair_requests = Counter()
     repairing_distance = False
-    requests, zone_requests, tilt_requests = Counter(), Counter(), Counter()
+    requests, paired_tilts, approximate_scales = Counter(), Counter(), Counter()
+    previous = np.array([.5, .5])
+    previous_area, previous_tilt = .07, 'front'
+    observed = []
+    bootstrap_tilts = ('front', 'left', 'right', 'up', 'down', 'left', 'right')
     for count, pair in enumerate(unique, 1):
         previous_target = target
         if repairing_distance:
             repair_requests[target[3]] += 1
-        requests[target] += 1
-        zone_requests[target[:2]] += 1
-        tilt_requests[target[2]] += 1
+        requests[target[2]] += 1
         poses = [measure_pose(board, g[0], intrinsics.get(camera))
                  for camera, g in zip(cameras, pair)]
         verified += int(all(p is not None for p in poses))
@@ -524,15 +627,11 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         for i, g in enumerate(pair):
             fraction = _hull_area(g[1][:, :2]) / _hull_area(np.asarray(board.object_points)[:, :2])
             distance_area = (poses[i]['distance_area'] if reliable_distance else g[3] / fraction)
-            zone, scale = _zone(g[2]), _scale(distance_area)
+            scale = _scale(distance_area)
             pair_scales.append(scale)
             pair_areas.append(distance_area)
-            zones[i][zone] += 1
-            scales[i][scale] += 1
-            if poses[i] is not None:
-                tilt = _tilt(poses[i])
-                tilts[i][tilt] += 1
-                joint[(*zone, tilt, scale)] += 1
+            cells = _coverage_cells(g[0].corners, g[0].image_size)
+            coverage[i][cells[:, 0], cells[:, 1]] += 1
         measurements = [dict(valid=True, pose=p, pose_expected=camera in intrinsics,
                              distance_area=a)
                         for camera, p, a in zip(cameras, poses, pair_areas)]
@@ -542,43 +641,28 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                 paired_distances[pair_scales[0]] += 1
             else:
                 approximate_distances[pair_scales[0]] += 1
-        def score(candidate):
-            r, c, t, s = candidate
-            coverage = sum(sc[s] + .7 * ti[t]
-                           for z, sc, ti in zip(zones, scales, tilts))
-            provisional = 0 if pose_available or t == _TILTS[count % len(_TILTS)] else 2
-            local_tilt_requests = sum(n for (rr, cc, tt, ss), n in requests.items()
-                                      if (rr, cc, tt) == (r, c, t))
-            # Requests guide scheduling only: they never count as verified pose coverage.
-            return (coverage + .7 * joint[candidate] + provisional
-                    + 3 * local_tilt_requests + 1.5 * tilt_requests[t] + .5 * requests[candidate])
-        alternatives = [c for c in candidates if c != target]
-        if alternatives:
-            available_zones = {c[:2] for c in alternatives}
-            remaining = [z for z in zone_order if z in available_zones
-                         and zone_requests[z] < (len(CENTRAL_DISTANCE_PLAN) if z == (1, 1) else 2)]
-            if remaining:
-                zone = remaining[0]
+        if pair_scales[0] == pair_scales[1]:
+            approximate_scales[pair_scales[0]] += 1
+        if reliable_distance:
+            tilt = _tilt(poses[0])
+            if tilt == _tilt(poses[1]) and all(pose_matches_tilt(p, tilt) for p in poses):
+                paired_tilts[tilt] += 1
+        previous = np.mean([g[2] for g in pair], axis=0)
+        previous_area = float(np.sqrt(np.prod(pair_areas)))
+        previous_tilt = _tilt(poses[0]) if reliable_distance else previous_target[2]
+        if reliable_distance and _tilt(poses[0]) == _tilt(poses[1]):
+            observed.append((previous.copy(), previous_area, previous_tilt))
+        if candidates:
+            if count < len(CENTRAL_DISTANCE_PLAN):
+                # Stable bootstrap instructions do not change when intrinsics arrive.
+                desired = CENTRAL_DISTANCE_PLAN[count]
+                target = min(candidates, key=lambda c: (
+                    c[:2] != (1, 1), c[3] != desired,
+                    c[2] != bootstrap_tilts[count], _TILTS.index(c[2])))
             else:
-                active_row = target[0]
-                zone = min(available_zones, key=lambda z: (
-                    sum(hist[z] for hist in zones), abs(z[0] - active_row), zone_order.index(z)))
-            local = [c for c in alternatives if c[:2] == zone]
-            if zone == (1, 1) and zone_requests[zone] < len(CENTRAL_DISTANCE_PLAN):
-                desired = CENTRAL_DISTANCE_PLAN[zone_requests[zone]]
-            else:
-                desired = 'medium'
-            at_distance = [c for c in local if c[3] == desired]
-            if at_distance:
-                local = at_distance
-            if count < initial_total:
-                # Bootstrap may change history measurements, never the first-pass itinerary.
-                step = zone_requests[zone]
-                tilt = (_TILTS[step % len(_TILTS)] if zone == (1, 1) else
-                        'front' if step == 0 else _TILTS[1 + zone_order.index(zone) % 4])
-                target = min(local, key=lambda c: (c[2] != tilt, _TILTS.index(c[2])))
-            else:
-                target = min(local, key=score)
+                target = _choose_candidate(candidates, geometries, coverage, approximate_scales,
+                    paired_tilts, requests, previous, previous_area, previous_tilt, previous_target,
+                    observed)
         repairing_distance = False
         if (initial_total <= count < initial_total + MAX_DISTANCE_REPAIR_REQUESTS
                 and sum(repair_requests.values()) < MAX_DISTANCE_REPAIR_REQUESTS):
@@ -591,7 +675,8 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                 # Group distance moves, but cap ignored gaps; vary tilt within a group.
                 target = min(repair_candidates, key=lambda c: (
                     missing.index(c[3]), paired_distances[c[3]] / DISTANCE_SAMPLE_GOALS[c[3]],
-                    joint[c] > 0, score(c)))
+                    c[2] == 'front', paired_tilts[c[2]], requests[c[2]],
+                    _move_cost(c, geometries[c], previous, previous_area, previous_tilt)))
                 repairing_distance = True
     phase = ('blocked' if not candidates else 'initial' if len(unique) < initial_total else
              'repair' if repairing_distance else 'review')
@@ -601,8 +686,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
     scale_text = {'small': '小', 'medium': '中', 'large': '大'}[scale]
     region = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))[row][col]
     status = '已有内参支持，倾角可估计' if pose_available else '冷启动：倾角未验证'
-    shortage = '区域观测不足' if min(z[row, col] for z in zones) == 0 else '已有观测，补足姿态组合'
-    reason = (f'{region}{shortage}；补充{tilt_text}、{scale_text}画面占比'
+    reason = (f'{region}实际角点覆盖补缺；补充{tilt_text}、{scale_text}画面占比'
               f'（{DISTANCE_LABELS[scale]}）。{status}。')
     if repairing_distance:
         reason = '距离缺口补采：' + reason
@@ -616,7 +700,7 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                              for s in ('large', 'medium', 'small'))
     summary = (f'有效双目样本 {len(unique)} 组，姿态可解 {verified} 组；引导内参 {len(intrinsics)}/2。'
                f'首轮 {min(len(unique), initial_total)}/{initial_total}：'
-               '中央中→近→远，再同高度补边缘，首轮结束后才补采；已建议不计姿态或距离覆盖。'
+               '中央建立约束，再按实际角点覆盖、倾角和距离补缺；相近收益优先少升降、少前后移动。'
                f'双路同档可信PnP距离样本：{distances}。'
                f'占比近似样本：{approximate}。'
                '占比近似不计为可信距离覆盖；内参可用后重新评估全部历史样本。'
@@ -634,8 +718,38 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                                                  for s in feasible_missing)))
         if exhausted:
             summary += '本轮补采建议已达上限，请先标定评估或自主补拍；缺口未清零，不代表距离采集完成。'
+    missing_tilts = tuple(t for t in _TILTS[1:] if paired_tilts[t] < TILT_SAMPLE_GOAL)
+    summary += ' 可信双路倾角：' + ' / '.join(f'{TILT_LABELS[t]} {paired_tilts[t]}' for t in _TILTS) + '。'
+    summary += '倾角待补：' + ('、'.join(TILT_LABELS[t] for t in missing_tilts) or '无') + '；建议次数不计实测覆盖。'
+    distribution_gaps = tuple(s for s in ('large', 'medium', 'small')
+                              if approximate_scales[s] < PREFERRED_DISTANCE_COUNTS[s])
+    summary += ' 距离分布调度偏好（非合格门槛，含占比近似）：' + ' / '.join(
+        f'{DISTANCE_LABELS[s]} {approximate_scales[s]}/{PREFERRED_DISTANCE_COUNTS[s]}'
+        for s in ('large', 'medium', 'small')) + '。'
+    center, target_area = (geometries[target][:2] if candidates else (None, None))
+    distance_gaps = [DISTANCE_LABELS[s] for s in distribution_gaps]
+    if phase == 'review':
+        gaps = [*distance_gaps, *(TILT_LABELS[t] for t in missing_tilts)]
+        next_hint = ('后续：前往标定评估；建议自主补' + '、'.join(gaps) if gaps else
+                     '后续：前往标定评估，检查校正和留出误差')
+        next_hint += '；本轮结束不代表精度达标'
+    elif phase == 'blocked':
+        next_hint = '后续：调整分辨率或板规格后重新规划，不会自动跳过受限目标'
+    elif len(unique) + 1 < len(CENTRAL_DISTANCE_PLAN):
+        step = len(unique) + 1
+        next_hint = (f'本张验收并保存后，预计：中央 · {DISTANCE_LABELS[CENTRAL_DISTANCE_PLAN[step]]}'
+                     f' · {TILT_LABELS[bootstrap_tilts[step]]}；未通过则不推进')
+    else:
+        priorities = '、'.join(distance_gaps[:2]) or '视场边缘覆盖'
+        angle_hint = '、'.join(TILT_LABELS[t] for t in missing_tilts[:2])
+        next_hint = f'后续预计：本张验收并保存后，优先补{priorities}'
+        if angle_hint:
+            next_hint += f'及{angle_hint}缺口'
+        next_hint += '；同等收益优先保持高度，最终以实拍结果更新'
     rec = GuidanceRecommendation(row, col, tilt, scale, reason, pose_available, len(unique),
                                  bool(candidates), repairing_distance, missing, phase,
-                                 initial_total, sum(repair_requests.values()))
+                                 initial_total, sum(repair_requests.values()), center, target_area,
+                                 missing_tilts, next_hint, distribution_gaps)
     return GuidanceAnalysis(rec, intrinsics, summary, dict(paired_distances),
-                            dict(approximate_distances))
+                            dict(approximate_distances), dict(paired_tilts),
+                            {camera: values.tolist() for camera, values in zip(cameras, coverage)})

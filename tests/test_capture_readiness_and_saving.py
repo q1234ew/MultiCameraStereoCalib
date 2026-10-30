@@ -148,7 +148,7 @@ def test_real_worker_save_failure_keeps_retry_job(capture_panel, monkeypatch, ap
     assert '失败 1' in panel._lbl_raw_save.text()
 
 
-def test_aux_save_failure_does_not_advance_data(capture_panel, monkeypatch):
+def test_aux_save_failure_does_not_advance_data(capture_panel, monkeypatch, finish_aux_tasks):
     from multicamera.streaming.stream_manager import AuxiliaryCameraConfig
 
     panel = capture_panel
@@ -162,6 +162,7 @@ def test_aux_save_failure_does_not_advance_data(capture_panel, monkeypatch):
 
     monkeypatch.setattr(panel._session, 'save_multimodal_pair', fail)
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert panel._aux_capture_count == 0
     assert not panel._aux_images and not panel._aux_pairs
     assert '未增加采集记录' in panel._log_text.toPlainText()

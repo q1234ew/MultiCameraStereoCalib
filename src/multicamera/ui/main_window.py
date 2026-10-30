@@ -70,6 +70,9 @@ class MainWindow(QMainWindow):
         self._camera_model = CameraModel.PINHOLE
         self._session_manager = SessionManager(sessions_dir())
         self._current_session: CalibrationSession | None = None
+        self._creating_session = False
+        self._empty_created_session = None
+        self._empty_session_config = None
         self._rig: MultiCameraRig | None = None
         self._connection_expected: set[str] = set()
         self._connection_connected: set[str] = set()
@@ -505,6 +508,9 @@ class MainWindow(QMainWindow):
             budget = self._session_button.maximumWidth() - 70
             self._session_button.setText(self._session_button.fontMetrics().elidedText(name, Qt.ElideMiddle, budget))
             self._session_button.setToolTip(f'{name}\n{self._current_session.session_dir.resolve()}')
+        else:
+            self._session_button.setText('未创建会话')
+            self._session_button.setToolTip('选择“新建标定会话”，或采图时自动创建；创建会话不会自动拍照')
 
     def _init_statusbar(self):
         self._statusbar = QStatusBar()
@@ -546,6 +552,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.sequence_updated.connect(
             self._stream_view.set_capture_sequence
         )
+        self._calib_panel._aux_guide.bind_preview(self._stream_view)
         self._calib_panel.images_imported.connect(self._stream_view.show_static_images)
         self._calib_panel.aux_images_imported.connect(self._stream_view.show_multimodal_images)
         self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
@@ -561,7 +568,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.export_requested.connect(self._on_export)
         self._calib_panel.open_results_requested.connect(self._open_result_directory)
         self._calib_panel.capture_started.connect(self._stream_view.end_review)
-        self._calib_panel.create_session_requested.connect(self._on_new_session)
+        self._calib_panel.create_session_requested.connect(self._ensure_session_for_capture)
         self._gallery.pair_selected.connect(self._on_gallery_pair_selected)
         self._stream_view.review_changed.connect(self._on_review_changed)
         self._stream_view.presentation_changed.connect(self._on_presentation_changed)
@@ -679,7 +686,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _open_session_directory(self):
         if self._current_session is None:
-            self._on_new_session()
+            self._session_button.showMenu()
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_session.session_dir.resolve())))
 
@@ -810,12 +817,54 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_new_session(self):
+        self._create_session(preserve_observations=False)
+
+    @Slot()
+    def _ensure_session_for_capture(self):
+        if self._current_session is None:
+            self._create_session(preserve_observations=True)
+        elif self._calib_panel._session is None:
+            self._calib_panel.set_session(self._current_session)
+            self._refresh_session_button()
+
+    def _session_configuration(self):
+        return dict(board=self._board.to_dict(), model=self._camera_model.value,
+            pairs=[(p.name, p.left.camera_id, p.left.url, p.right.camera_id, p.right.url)
+                   for p in self._stream_manager.stereo_pairs.values()],
+            auxiliary=self._stream_manager.auxiliary_camera.to_dict()
+                      if self._stream_manager.auxiliary_camera is not None else None)
+
+    def _create_session(self, *, preserve_observations):
+        if self._creating_session:
+            self._statusbar.showMessage('正在创建会话，请稍候；请勿重复操作')
+            return
         if self._background_tasks_block("新建会话"):
             return
         pairs = list(self._stream_manager.stereo_pairs.values())
         if not pairs:
             QMessageBox.warning(self, "提示", "请先配置相机")
             return
+        configuration = self._session_configuration()
+        current = self._current_session
+        if (current is not None and current is self._empty_created_session
+                and self._empty_session_config == configuration
+                and not self._calib_panel.has_session_data and current.is_pristine()):
+            self._refresh_session_button()
+            text = f'当前会话尚未采图，继续使用 {current.name}；未重复创建目录'
+            self._statusbar.showMessage(text)
+            self._calib_panel.append_log(text)
+            return
+        if (not preserve_observations and self._calib_panel.has_session_data
+                and QMessageBox.question(self, '新建独立会话',
+                    '新会话将清空当前内存中的采图、引导和标定结果。磁盘历史文件不会删除。\n'
+                    '尚未落盘的导入数据仍保留在源目录。是否新建？',
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes):
+            return
+        self._creating_session = True
+        self._act_new_session.setEnabled(False)
+        self._session_button.setEnabled(False)
+        previous = self._calib_panel._session
+        session = None
         logger.info("Create calibration session: pairs=%d", len(pairs))
         try:
             session = self._session_manager.create_session(
@@ -824,13 +873,31 @@ class MainWindow(QMainWindow):
             )
             self._calib_panel.set_session(session)
         except Exception as exc:
+            if session is not None and session is not previous:
+                if self._calib_panel._session is session:
+                    self._calib_panel._session = previous
+                session.discard_unpublished()
             logger.exception("Create calibration session failed")
             self._calib_panel.append_log(f"创建会话失败，未采图：{exc}")
             self._statusbar.showMessage(f"创建会话失败：{exc}")
             QMessageBox.warning(self, "创建会话失败", str(exc).splitlines()[0])
             return
+        finally:
+            self._creating_session = False
+            self._act_new_session.setEnabled(True)
+            self._session_button.setEnabled(True)
         self._current_session = session
-        self._statusbar.showMessage(f"✓  新建会话: {self._current_session.name}")
+        if not preserve_observations:
+            multimodal = self._calib_panel._active_step == 2
+            self._calib_panel._reset_all()
+            self._calib_panel.show_workflow('capture', multimodal)
+            self._stream_view.begin_capture_session()
+            self._stereo_capture.refresh()
+        self._empty_created_session = session
+        self._empty_session_config = deepcopy(configuration)
+        self._refresh_session_button()
+        self._statusbar.showMessage(f'新建会话成功：{session.name}；尚未采图')
+        self._calib_panel.append_log(f'新建会话成功：{session.name}；点击采集后才保存原图')
 
     @Slot()
     def _on_load_session(self):
@@ -853,6 +920,9 @@ class MainWindow(QMainWindow):
                 logger.exception("Load calibration session failed: %s", dir_path)
                 return
             self._current_session = session
+            self._empty_created_session = None
+            self._empty_session_config = None
+            self._refresh_session_button()
             self._statusbar.showMessage(f"✓  加载会话: {self._current_session.name}")
 
     @Slot()
@@ -1040,6 +1110,7 @@ class MainWindow(QMainWindow):
                     camera_model=self._camera_model.value,
                 )
                 self._calib_panel.set_session(self._current_session, preserve_model_assessment=True)
+                self._refresh_session_button()
             saved, errors = self._current_session.save_calibration_results(rig)
         except Exception as exc:
             logger.exception("Automatic calibration result save failed")

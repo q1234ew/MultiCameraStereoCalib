@@ -33,7 +33,7 @@ def board_image():
 
 
 @pytest.fixture
-def panel(app, tmp_path, monkeypatch):
+def panel(app, tmp_path, monkeypatch, finish_aux_tasks):
     manager = StreamManager()
     manager.add_virtual_stereo_pair(StereoPairConfig(
         'rgb', CameraConfig('left', ''), CameraConfig('right', ''),
@@ -47,6 +47,7 @@ def panel(app, tmp_path, monkeypatch):
     value.show_workflow('capture', True)
     monkeypatch.setattr(value, '_prepare_white_balance', lambda *args: True)
     yield value
+    finish_aux_tasks(value)
     value._aux_readiness_timer.stop()
     manager.stop_all()
     value.close()
@@ -88,6 +89,7 @@ def add_result(panel, tmp_path):
 def live_frames(panel, monkeypatch, image=None):
     image = board_image() if image is None else image
     monkeypatch.setattr(panel, '_aux_live_frames', lambda: ((image, image, .01), 'ready'))
+    monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
     return image
 
 
@@ -136,9 +138,10 @@ def test_import_without_session_never_claims_missing_source_photos(panel, tmp_pa
     assert panel._session is None
 
 
-def test_capture_before_rgb_intrinsics_saves_raw_but_cannot_calibrate(panel, monkeypatch):
+def test_capture_before_rgb_intrinsics_saves_raw_but_cannot_calibrate(panel, monkeypatch, finish_aux_tasks):
     image = live_frames(panel, monkeypatch)
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 1
     assert panel._aux_saved_count == 1
     assert '实时原图已落盘 1 组' in panel._lbl_raw_save.text()
@@ -153,7 +156,7 @@ def test_capture_before_rgb_intrinsics_saves_raw_but_cannot_calibrate(panel, mon
     assert panel._aux_board_config() == PatternBoardConfig.ir_chessboard()
 
 
-def test_failed_capture_does_not_claim_saved_or_invalidate_result(panel, tmp_path, monkeypatch):
+def test_failed_capture_does_not_claim_saved_or_invalidate_result(panel, tmp_path, monkeypatch, finish_aux_tasks):
     rig, _, saved = add_result(panel, tmp_path)
     live_frames(panel, monkeypatch)
 
@@ -162,6 +165,7 @@ def test_failed_capture_does_not_claim_saved_or_invalidate_result(panel, tmp_pat
 
     monkeypatch.setattr(panel._session, 'save_multimodal_pair', fail)
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert panel._aux_saved_count == 0
     assert not panel._aux_pairs
     assert panel.rig is rig and 'ir' in rig.aux_cameras
@@ -170,13 +174,14 @@ def test_failed_capture_does_not_claim_saved_or_invalidate_result(panel, tmp_pat
 
 
 @pytest.mark.parametrize('operation', ['capture', 'import', 'configuration'])
-def test_aux_updates_keep_rgb_and_historical_directory(panel, tmp_path, monkeypatch, operation):
+def test_aux_updates_keep_rgb_and_historical_directory(panel, tmp_path, monkeypatch, operation, finish_aux_tasks):
     rig, intr, saved = add_result(panel, tmp_path)
     previous = saved[0].parent
     originals = {p: p.read_bytes() for p in saved}
     if operation == 'capture':
         live_frames(panel, monkeypatch)
         panel._on_capture_aux()
+        finish_aux_tasks(panel)
     elif operation == 'import':
         import_pairs(panel)
     else:
@@ -199,26 +204,28 @@ def test_aux_updates_keep_rgb_and_historical_directory(panel, tmp_path, monkeypa
     assert not json.loads(exported.read_text())['aux_cameras']
 
 
-def test_offline_then_live_counts_only_live_files_as_saved(panel, tmp_path, monkeypatch):
+def test_offline_then_live_counts_only_live_files_as_saved(panel, tmp_path, monkeypatch, finish_aux_tasks):
     import_pairs(panel, folder=str(tmp_path / 'source'))
     live_frames(panel, monkeypatch)
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 4
     assert '离线 3 组' in panel._lbl_raw_save.text()
     assert '实时原图已落盘 1 组' in panel._lbl_raw_save.text()
     assert panel._session.metadata['multimodal_frame_count'] == 1
-    assert panel._aux_capture_sequence.done_count == 1
+    assert panel._aux_capture_sequence.done_count == 0  # Counts do not certify guided poses.
     import_pairs(panel, 2)
     assert panel._aux_saved_count == 0
     assert '实时原图已落盘' not in panel._lbl_raw_save.text()
     assert panel._session.metadata['multimodal_frame_count'] == 1  # Old photos are untouched.
 
 
-def test_frame_ids_remain_unique_after_import_and_supplement(panel, monkeypatch):
+def test_frame_ids_remain_unique_after_import_and_supplement(panel, monkeypatch, finish_aux_tasks):
     image = live_frames(panel, monkeypatch)
     det = PlanarPatternDetector(panel._aux_board_config()).detect(image)
     panel._on_import_aux_images_ready([('live_0000', image, image, det, det)])
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert [key for key, _, _ in panel._aux_pairs] == ['live_0000', 'live_0001']
 
 

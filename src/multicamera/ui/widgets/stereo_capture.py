@@ -20,6 +20,7 @@ from ...calibration.models import CameraModel
 from ...calibration.adaptive_guidance import (
     DISTANCE_LABELS, GuidanceObservation, evaluate_distance, measure_pose, measure_composition,
     _candidate_feasible, reliable_distance_pose, MAX_DISTANCE_REPAIR_REQUESTS, SCALE_AREA_RANGES,
+    pose_matches_tilt,
 )
 from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
@@ -58,8 +59,11 @@ class StereoCaptureWorkspace(QWidget):
         self._instruction_stage = 'waiting'
         self._adaptive_sequence = CaptureSequence([CaptureTarget(1, 1, BoardTilt.FRONT)])
         self.banner = QWidget()
-        banner = QHBoxLayout(self.banner)
-        banner.setContentsMargins(14, 8, 14, 8)
+        banner_layout = QVBoxLayout(self.banner)
+        banner_layout.setContentsMargins(14, 2, 14, 2)
+        banner_layout.setSpacing(0)
+        banner = QHBoxLayout()
+        banner_layout.addLayout(banner)
         self.banner.setObjectName('stereoCaptureBanner')
         self.banner.setStyleSheet(
             f"QWidget#stereoCaptureBanner {{background:#202830; border-bottom:1px solid {BORDER};}}"
@@ -86,6 +90,11 @@ class StereoCaptureWorkspace(QWidget):
         self.pair.setAccessibleName("双目采集目标")
         self.pair.currentTextChanged.connect(self._select_pair)
         banner.addWidget(self.pair)
+        self.next_step = StableTextLabel('后续安排：等待相机与采集任务就绪', lines=1)
+        self.next_step.setAccessibleName('后续采图安排')
+        self.next_step.setWordWrap(True)
+        self.next_step.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        banner_layout.addWidget(self.next_step)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 0, 6, 0)
@@ -236,7 +245,8 @@ class StereoCaptureWorkspace(QWidget):
         elif self._analysis is not None:
             rec = self._analysis.recommendation
             tilts = dict(zip(('front', 'left', 'right', 'up', 'down'), BoardTilt))
-            target = CaptureTarget(rec.zone_row, rec.zone_col, tilts[rec.tilt], scale=rec.scale)
+            target = CaptureTarget(rec.zone_row, rec.zone_col, tilts[rec.tilt], scale=rec.scale,
+                                   target_center=rec.target_center, target_area=rec.target_area)
         else:
             return
         self._adaptive_sequence = CaptureSequence([target])
@@ -270,10 +280,16 @@ class StereoCaptureWorkspace(QWidget):
                           self.panel._intrinsics[cid].dist_coeffs.tobytes())
                          for cid in ids if cid in self.panel._intrinsics)
         key = (id(self.panel._board), id(self.panel._session), name, self.panel._camera_model,
+               tuple((c.camera_id, c.url, self._live_image_size(c.camera_id))
+                     for c in (pair.left, pair.right)),
                tuple((id(c), c.data_revision if c else 0) for c in cals),
                tuple(self.panel._live_preview_indices.get(name, [])), intr_key,
                tuple(sorted(self.panel._guidance_failed_saves)))
         return key, (name, ids, cals)
+
+    def _live_image_size(self, camera_id):
+        entry = self.panel._sm.get_latest_frame(camera_id)
+        return tuple(entry[0].shape[1::-1]) if entry is not None else None
 
     def _request_guidance(self):
         key, context = self._guidance_context()
@@ -300,6 +316,7 @@ class StereoCaptureWorkspace(QWidget):
             key, self.panel._board, self.panel._camera_model, observations,
             copy.deepcopy({cid: self.panel._intrinsics[cid] for cid in ids
                            if cid in self.panel._intrinsics}),
+            image_sizes={cid: size for cid in ids if (size := self._live_image_size(cid))},
         )
         worker.signals.completed.connect(self._guidance_completed)
         self._requested_key = key
@@ -320,10 +337,12 @@ class StereoCaptureWorkspace(QWidget):
                 self._apply_guidance_target()
                 logger.info('Capture guidance updated: pair=%s samples=%s target=%s/%s/%s/%s '
                             'pose_available=%s feasible=%s phase=%s initial_total=%s '
-                            'repairs=%s distance_counts=%s missing=%s', context[0], rec.sample_count,
+                            'repairs=%s distance_counts=%s missing=%s center=%s area=%s tilts=%s',
+                            context[0], rec.sample_count,
                             rec.zone_row, rec.zone_col, rec.tilt, rec.scale,
                             rec.pose_available, rec.feasible, rec.phase, rec.initial_total,
-                            rec.repair_count, result.distance_counts, rec.missing_distances)
+                            rec.repair_count, result.distance_counts, rec.missing_distances,
+                            rec.target_center, rec.target_area, result.tilt_counts)
         self.refresh()
 
     def _target(self):
@@ -386,16 +405,8 @@ class StereoCaptureWorkspace(QWidget):
         if not poses or any(p is None for p in poses):
             return False, '倾角待内参；可手动采集基础样本'
         def matches(p):
-            yaw, pitch = p['yaw'], p['pitch']
-            if target.tilt == BoardTilt.FRONT:
-                return abs(yaw) < 15 and abs(pitch) < 15
-            primary, secondary, sign = {
-                BoardTilt.TILT_LEFT: (yaw, pitch, -1),
-                BoardTilt.TILT_RIGHT: (yaw, pitch, 1),
-                BoardTilt.TILT_UP: (pitch, yaw, -1),
-                BoardTilt.TILT_DOWN: (pitch, yaw, 1),
-            }[target.tilt]
-            return 15 <= sign * primary <= 40 and abs(secondary) < 20
+            tilt = dict(zip(BoardTilt, ('front', 'left', 'right', 'up', 'down')))[target.tilt]
+            return pose_matches_tilt(p, tilt)
         if all(matches(p) for p in poses):
             return True, '姿态接近建议范围'
         angles = ' / '.join(f'左右 {p["yaw"]:+.0f}°、上下 {p["pitch"]:+.0f}°' for p in poses)
@@ -849,8 +860,13 @@ class StereoCaptureWorkspace(QWidget):
                 goal = '当前构图受限 · 请检查分辨率和标定板'
             if self._instruction_stage == 'review':
                 goal = '本轮引导结束 · 可进入标定评估'
-                missing = '、'.join(DISTANCE_LABELS[s] for s in rec.missing_distances)
-                subtitle = (f'待补：{missing}；可自主补拍' if missing else '距离数量已满足')
+                missing = '、'.join(DISTANCE_LABELS[s] for s in dict.fromkeys(
+                    (*rec.missing_distances, *rec.distribution_gaps)))
+                subtitle = (f'建议补：{missing}；可自主补拍' if missing else '距离基础数量已满足')
+                if rec.missing_tilts:
+                    subtitle += '；倾角待补：' + '、'.join(tilts[dict(zip(
+                        ('front', 'left', 'right', 'up', 'down'), BoardTilt))[t]]
+                        for t in rec.missing_tilts)
                 subtitle += '；不代表精度达标'
             self.reason.setText(f'{goal}\n状态：{subtitle}')
             poses = [self._pose_measurement(camera.camera_id, sample)
@@ -881,6 +897,17 @@ class StereoCaptureWorkspace(QWidget):
             self.instruction.setText('正在更新采图建议，请保持当前位置' if not self._guidance_error else
                                      '自适应分析不可用，请检查固定计划')
         adaptive_action = using_adaptive and not self.view.review_key and not offline
+        hint = ('后续：退出原图回看后继续采集' if self.view.review_key else
+                '后续：检查导入数据后前往标定' if offline else
+                '后续：原图验收并保存后，继续当前固定计划')
+        if live and not using_adaptive:
+            hint = '后续：等待当前配置分析完成，旧建议暂不生效'
+        elif adaptive_action:
+            hint = (self._analysis.recommendation.next_hint if not self._distance_override else
+                    '后续：本张验收并保存后检查本档缺口；点击返回推荐继续自适应规划')
+        self.next_step.setText(hint)
+        self.next_step.setToolTip(hint)
+        self.instruction.setToolTip(self.instruction.text())
         self.schematic.set_target(
             replace(target, tilt=BoardTilt.FRONT)
             if adaptive_action and self._instruction_stage in ('distance', 'position') else target,
@@ -977,6 +1004,7 @@ class StereoCaptureWorkspace(QWidget):
 
     def set_compact(self, compact):
         self._compact = compact
+        self.instruction.set_lines(1 if compact else 2)
         self.schematic.set_compact(compact)
         self.pose.setMinimumWidth(145 if compact else 165)
         self.status.setMinimumWidth(185 if compact else 205)

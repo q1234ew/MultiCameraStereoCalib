@@ -14,16 +14,18 @@ class GuidanceSignals(QObject):
 
 
 class GuidanceWorker(QRunnable):
-    def __init__(self, key, board, model, observations, intrinsics):
+    def __init__(self, key, board, model, observations, intrinsics, image_sizes=None):
         super().__init__()
         self.signals = GuidanceSignals()
         self.key, self.board, self.model = key, board, model
         self.observations, self.intrinsics = observations, intrinsics
+        self.image_sizes = dict(image_sizes or {})
 
     def run(self):
         try:
             result = analyze_guidance(
                 self.board, self.model, self.observations, self.intrinsics,
+                image_sizes=self.image_sizes,
             )
             self.signals.completed.emit(self.key, result, '')
         except Exception as exc:

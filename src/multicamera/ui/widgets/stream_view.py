@@ -29,7 +29,7 @@ from ...perf import perf_timer
 from ...streaming.stream_manager import StreamManager
 from ..opencv_unicode_text import TextPainter
 from ..theme import BG_CARD, BG_DARK, BORDER, TEXT, TEXT_DIM, TEXT_HINT, SUCCESS, DANGER, standard_icon
-from .capture_guide import CaptureSequence, CaptureTarget, draw_target_overlay
+from .capture_guide import BoardTilt, CaptureSequence, CaptureTarget, draw_target_overlay
 from .stable_text import StableTextLabel
 
 
@@ -737,6 +737,16 @@ class MultiStreamView(QWidget):
                 y = int(target.norm_cy * h)
                 extent = {'small': .09, 'medium': .14, 'large': .20}.get(target.scale, .14)
                 rx, ry = int(w * extent), int(h * extent)
+                if target.target_area is not None:
+                    shape = np.ptp(self._board.object_points[:, :2], axis=0)
+                    aspect = shape[0] / shape[1]
+                    cosine = np.cos(np.radians(25.))
+                    if target.tilt in (BoardTilt.TILT_LEFT, BoardTilt.TILT_RIGHT):
+                        aspect *= cosine
+                    elif target.tilt in (BoardTilt.TILT_UP, BoardTilt.TILT_DOWN):
+                        aspect /= cosine
+                    rx = int(np.sqrt(target.target_area * w * h * aspect) / 2)
+                    ry = int(np.sqrt(target.target_area * w * h / aspect) / 2)
                 # A suggested image region, not a calibrated 3D target projection.
                 for start, end in (
                     ((x - rx, y - ry), (x + rx, y - ry)),
@@ -757,6 +767,14 @@ class MultiStreamView(QWidget):
                 vis, (self._planar_board.cols, self._planar_board.rows),
                 result.charuco_corners, True,
             )
+            points = result.charuco_corners.reshape(-1, 2)
+            origin = tuple(np.rint(points[0]).astype(int))
+            cv2.circle(vis, origin, 4, (255, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(vis, '0', (max(0, origin[0] - 10), max(10, origin[1] - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 0), 1, cv2.LINE_AA)
+            if len(points) > self._planar_board.cols:
+                cv2.arrowedLine(vis, origin, tuple(np.rint(points[1]).astype(int)),
+                                (255, 255, 0), 1, cv2.LINE_AA, tipLength=.25)
         return vis
 
     def set_show_guide(self, show: bool):
@@ -893,6 +911,27 @@ class MultiStreamView(QWidget):
     def reset_trackers(self):
         self._trackers.clear()
         self._mode_trackers.clear()
+
+    def begin_capture_session(self):
+        """Drop old offline/review evidence without disconnecting live camera streams."""
+        static_ids = {cid for images in self._static_images.values() for cid in images}
+        static_ids.update(self._review_images or {})
+        self._static_images.clear()
+        self._cancel_review()
+        self.reset_trackers()
+        self._last_detect_ts.clear()
+        self._last_render_ts.clear()
+        self._last_detection.clear()
+        for cid in static_ids:
+            view = self._views.get(cid)
+            if view is not None:
+                view.clear_frame('新会话，等待实时相机画面')
+                view.set_connected(self._connection_state.get(cid, (False, ''))[0])
+            self._preview_frames.pop(cid, None)
+        for cid in list(self._views):
+            entry = self._stream_manager.get_latest_frame(cid)
+            if entry is not None:
+                self._on_frame(cid, entry[0], entry[1])
 
     def notify_capture(self, camera_id: str, result: DetectionResult | PlanarDetectionResult):
         tracker = self._trackers.get(camera_id)

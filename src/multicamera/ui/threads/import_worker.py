@@ -15,6 +15,7 @@ from PySide6.QtCore import QThread, Signal
 
 from ...board.detector import CharucoDetector
 from ...calibration.assessment import DataAssessor
+from ...calibration.aux_capture_quality import assess_aux_frame, quality_reason_text
 from ...calibration.planar import PlanarPatternDetector
 
 
@@ -89,10 +90,12 @@ class AuxImageImportWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, folder: str, board_config, parent=None):
+    def __init__(self, folder: str, board_config, parent=None, *, modality='ir'):
         super().__init__(parent)
         self.folder = folder
         self.board_config = board_config
+        self.modality = modality
+        self.frame_reviews = {}
 
     def run(self):
         try:
@@ -112,6 +115,23 @@ class AuxImageImportWorker(QThread):
                     continue
                 rgb_det = detector.detect(rgb)
                 aux_det = detector.detect(aux)
+                qualities = [assess_aux_frame(image, det, self.board_config,
+                    modality='rgb' if i == 0 or self.modality == 'acoustic_rgb' else 'ir')
+                    for i, (image, det) in enumerate(((rgb, rgb_det), (aux, aux_det)))]
+                reasons = [f'{name}：' + quality_reason_text(reason)
+                           for name, quality in zip(('RGB', 'IR/辅助'), qualities)
+                           for reason in quality.reasons]
+                review_path = Path(rgb_files[key]).with_name(f'quality_{key}.json')
+                if review_path.exists():
+                    prior = json.loads(review_path.read_text(encoding='utf-8'))
+                    if prior.get('state') != '可采纳':
+                        reasons += ['原采图验收未通过，不能仅凭重新检测自动纳入']
+                        reasons += prior.get('reasons', [])
+                self.frame_reviews[key] = dict(schema_version=1,
+                    detected=bool(rgb_det.valid and aux_det.valid),
+                    state='待复核' if reasons else '可采纳', reasons=reasons,
+                    metrics=[q.metrics for q in qualities], temporal_stability='not_verified_offline',
+                    physical_corner_order='requires_manual_confirmation')
                 imported.append((key, rgb, aux, rgb_det, aux_det))
 
             if not imported:

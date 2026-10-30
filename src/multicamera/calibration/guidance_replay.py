@@ -7,6 +7,7 @@ import numpy as np
 
 from .adaptive_guidance import (
     _geometry, _scale, analyze_guidance, evaluate_distance, measure_composition, measure_pose,
+    pose_matches_tilt,
 )
 
 
@@ -14,6 +15,7 @@ def _snapshot(analysis):
     return {'recommendation': asdict(analysis.recommendation), 'summary': analysis.summary,
             'intrinsic_cameras': sorted(analysis.intrinsics),
             'distance_counts': analysis.distance_counts,
+            'tilt_counts': analysis.tilt_counts, 'image_coverage': analysis.image_coverage,
             'approximate_distance_counts': analysis.approximate_distance_counts}
 
 
@@ -38,8 +40,8 @@ def _matches(recommendation, measurements):
         return {'composition_match': False, 'reason': '无可用构图，请调整分辨率或标定板'}
     if not all(m['geometry_valid'] for m in measurements):
         return {'composition_match': False, 'reason': '双路检测或几何有效性不足'}
-    center = np.array([(recommendation.zone_col + .5) / 3,
-                       (recommendation.zone_row + .5) / 3])
+    center = np.array(recommendation.target_center or ((recommendation.zone_col + .5) / 3,
+                                                      (recommendation.zone_row + .5) / 3))
     if not all(np.linalg.norm(np.array(m['center']) - center) < .16 for m in measurements):
         return {'composition_match': False, 'reason': '位置不符合此前建议'}
     distance_ready, distance_message, _, _ = evaluate_distance(recommendation.scale, measurements)
@@ -48,13 +50,7 @@ def _matches(recommendation, measurements):
     if any(m['pose'] is None for m in measurements):
         return {'composition_match': None, 'reason': '位置和大小接近；历史内参不足或姿态不可解，倾角不评估'}
     for m in measurements:
-        yaw, pitch = m['pose']['yaw'], m['pose']['pitch']
-        if recommendation.tilt == 'front':
-            matched = abs(yaw) < 15 and abs(pitch) < 15
-        else:
-            primary, secondary, sign = {'left': (yaw, pitch, -1), 'right': (yaw, pitch, 1),
-                                        'up': (pitch, yaw, -1), 'down': (pitch, yaw, 1)}[recommendation.tilt]
-            matched = 15 <= sign * primary <= 40 and abs(secondary) < 20
+        matched = pose_matches_tilt(m['pose'], recommendation.tilt)
         if not matched:
             return {'composition_match': False, 'reason': '倾角或方向不符合此前建议'}
     return {'composition_match': True, 'reason': '双路构图接近此前建议范围（非自动采集合格判定）'}

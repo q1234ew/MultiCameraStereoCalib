@@ -3,6 +3,7 @@
 import time
 import os
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -117,6 +118,7 @@ def test_cold_start_never_automatically_accepts_unknown_tilt(stereo_bench, app):
     det, frame, _ = sample(win)
     publish(win, det, frame)
     publish(win, det, frame)
+    settle(guide, app)  # First live dimensions invalidate the initial unknown-size snapshot.
     assert not guide.auto_ready()
     assert '待内参' in guide.pose_status.text() or '占比' in guide.pose_status.text()
     QThreadPool.globalInstance().waitForDone(15000)
@@ -137,6 +139,7 @@ def test_adaptive_layout_and_background_failure_fallback(stereo_bench, app, tmp_
     for width, height in ((1440, 1024), (1280, 800), (1000, 680)):
         win.resize(width, height)
         app.processEvents()
+        settle(guide, app)
         assert win._preview_scroll.horizontalScrollBar().maximum() == 0
         assert guide.instruction.height() >= guide.instruction.fontMetrics().height()
         button = win._calib_panel._btn_capture
@@ -158,9 +161,68 @@ def test_calibrated_adaptive_auto_requires_both_camera_poses(stereo_bench, app):
     win._calib_panel._intrinsics.update({LEFT: deepcopy(intr), RIGHT: deepcopy(intr)})
     guide = activate(win, app)
     publish_stable(win, det, frame)
+    settle(guide, app)
     for s in guide.samples.values():
         s['sharp'] = True
     assert guide.auto_ready()
     guide.samples[RIGHT]['detection'] = deepcopy(det)
     guide.samples[RIGHT]['detection'].image_size = (640, 480)
     assert not guide.auto_ready()
+
+
+def test_dynamic_target_center_is_shared_by_preview_raw_gate_and_schematic(stereo_bench, app, monkeypatch):
+    from multicamera.calibration.guidance_replay import _matches
+    from multicamera.ui.widgets.capture_guide import BoardTilt
+
+    win = stereo_bench
+    guide = activate(win, app)
+    det, frame, _ = sample(win)
+    pts = det.charuco_corners.reshape(-1, 2)
+    pts[:] += np.array([.32 * 1280, .32 * 720]) - pts.mean(axis=0)
+    publish_stable(win, det, frame)
+    settle(guide, app)
+    rec = replace(guide._analysis.recommendation, zone_row=0, zone_col=0, tilt='front',
+                  target_center=(.32, .32), target_area=.055)
+    guide._analysis.recommendation = rec
+    guide._apply_guidance_target()
+    pose = dict(yaw=0., pitch=0., depth=1., distance_area=.055, distance_reliable=True)
+    monkeypatch.setattr(guide, '_pose_measurement', lambda *args: pose)
+    original = guide._detection_sample
+
+    def sharp_sample(detection, image):
+        return dict(original(detection, image), sharp=True)
+
+    monkeypatch.setattr(guide, '_detection_sample', sharp_sample)
+    for s in guide.samples.values():
+        s['sharp'] = True
+    guide.refresh()
+    target = guide._target()
+    assert target.tilt == BoardTilt.FRONT
+    assert (target.norm_cx, target.norm_cy) == (.32, .32)
+    assert guide.schematic.target.target_center == rec.target_center
+    assert guide.auto_ready()
+    assert guide.validate_capture('rgb', frame, frame, det, det)[0]
+    measurements = [dict(s, geometry_valid=True, pose=pose) for s in guide.samples.values()]
+    assert _matches(rec, measurements)['composition_match']
+    guide._analysis.recommendation = replace(rec, target_center=(1 / 6, 1 / 6))
+    guide._apply_guidance_target()
+    assert not guide.auto_ready()
+
+
+def test_camera_address_or_dimensions_invalidate_pending_guidance(stereo_bench, app):
+    from multicamera.streaming.stream_manager import FrameEntry
+
+    win = stereo_bench
+    guide = activate(win, app)
+    old_key, old_result = guide._analysis_key, guide._analysis
+    win._stream_manager.stereo_pairs['rgb'].left.url = 'http://new-device.test:8080/stream'
+    assert guide._guidance_context()[0] != old_key
+    guide._guidance_completed(old_key, old_result, '')
+    settle(guide, app)
+    assert guide._analysis_key != old_key
+    key = guide._analysis_key
+    win._stream_manager._latest_frames[LEFT] = FrameEntry(np.zeros((480, 640, 3), np.uint8), time.time())
+    assert guide._guidance_context()[0] != key
+    guide.refresh()
+    settle(guide, app)
+    assert guide._analysis_key != key

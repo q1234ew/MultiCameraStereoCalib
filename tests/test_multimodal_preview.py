@@ -20,10 +20,11 @@ LEFT, RIGHT, IR = "z_rgb_left", "rgb_right", "a_ir_middle"
 
 
 @pytest.fixture
-def window(app, tmp_path, monkeypatch):
+def window(app, tmp_path, monkeypatch, finish_aux_tasks):
     monkeypatch.setattr(main_window, "sessions_dir", lambda: tmp_path / "sessions")
     win = main_window.MainWindow()
     yield win
+    finish_aux_tasks(win._calib_panel)
     win._calib_panel._auto_timer.stop()
     win._stream_manager.stop_all()
     win.close()
@@ -148,7 +149,7 @@ def test_offline_aux_preview_uses_actual_left_id_and_restores_each_workflow(wind
     assert "24/24" in view._views[IR]._info.text()
 
 
-def test_live_capture_saves_raw_left_and_ir_not_right(window, tmp_path):
+def test_live_capture_saves_raw_left_and_ir_not_right(window, tmp_path, monkeypatch, finish_aux_tasks):
     manager = configure(window)
     panel, view = window._calib_panel, window._stream_view
     left = cv2.resize(board_image(), (768, 576), interpolation=cv2.INTER_NEAREST)
@@ -161,7 +162,9 @@ def test_live_capture_saves_raw_left_and_ir_not_right(window, tmp_path):
         tmp_path, window._board, list(manager.stereo_pairs.values()), manager.auxiliary_camera,
     )
     panel.set_session(session)
+    monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 1
     assert set(view._views) == {LEFT, IR}
     assert view._trackers[LEFT].total_frames == view._trackers[IR].total_frames == 1
@@ -302,7 +305,7 @@ def test_closed_offline_tiles_do_not_reappear_and_all_can_be_restored(window):
     assert all(tile._last_frame is not None for tile in view._views.values())
 
 
-def test_fusion_capture_works_with_closed_previews_and_preserves_coverage(window, tmp_path):
+def test_fusion_capture_works_with_closed_previews_and_preserves_coverage(window, tmp_path, monkeypatch, finish_aux_tasks):
     manager = configure(window)
     panel, view = window._calib_panel, window._stream_view
     frame = board_image()
@@ -312,10 +315,13 @@ def test_fusion_capture_works_with_closed_previews_and_preserves_coverage(window
     panel.set_session(CalibrationSession.create(
         tmp_path, window._board, list(manager.stereo_pairs.values()), manager.auxiliary_camera,
     ))
+    monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     tracker = view._trackers[IR]
     view.close_preview(IR)
     panel._on_capture_aux()
+    finish_aux_tasks(panel)
     assert IR not in view._views
     assert tracker.total_frames == 2
     assert len(panel._aux_pairs) == 2

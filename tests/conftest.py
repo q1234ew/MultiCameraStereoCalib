@@ -2,12 +2,26 @@
 
 import gc
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
+
+
+@pytest.fixture
+def finish_aux_tasks(app):
+    def finish(panel):
+        deadline = time.monotonic() + 15
+        while panel._aux_capture_worker or panel._aux_guide._worker or panel._aux_import_worker:
+            app.processEvents()
+            if time.monotonic() >= deadline:
+                pytest.fail('Auxiliary capture/guidance did not finish')
+            time.sleep(.002)
+        app.processEvents()
+    return finish
 
 
 @pytest.fixture(scope="session")

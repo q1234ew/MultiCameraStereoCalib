@@ -77,7 +77,8 @@ def test_live_status_and_expansion_do_not_move_previews(stereo_bench, app, size,
     for phase, count, repairs in [('initial', 8, 0), ('repair', 23, 0), ('review', 27, 4)]:
         guide._analysis.recommendation = replace(original, phase=phase,
                                                  sample_count=count, repair_count=repairs,
-                                                 repairing_distance=phase == 'repair')
+                                                 repairing_distance=phase == 'repair',
+                                                 next_hint='后续预计：本张保存后重新核对距离与倾角缺口' * 8)
         guide.refresh()
         unchanged(phase)
     guide._analysis.recommendation = original
@@ -159,6 +160,7 @@ def test_initial_guidance_separates_goal_action_and_manual_next_step(stereo_benc
     guide = activate(win, app)
     det, frame, _ = sample(win)
     publish_stable(win, det, frame)
+    settle(guide, app)
     _, samples = guide._current_samples()
     for measurement in samples:
         measurement.update(center=np.array([.5, .5]), area=.07, distance_area=.07)
@@ -169,3 +171,5 @@ def test_initial_guidance_separates_goal_action_and_manual_next_step(stereo_benc
     assert guide.instruction.text().startswith('操作：')
     assert '手动点击采集' in guide.instruction.text()
     assert guide.schematic.description.text() == guide.instruction.text()
+    assert '预计' in guide.next_step.text()
+    assert '原图' not in guide.next_step.text() or '验收' in guide.next_step.text()

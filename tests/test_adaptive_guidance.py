@@ -208,7 +208,7 @@ def test_both_cameras_affect_shortages(board):
     # The bounded medium-distance bootstrap stays central; both eyes affect evidence.
     assert (ra.zone_row, ra.zone_col) == (rb.zone_row, rb.zone_col) == (1, 1)
     assert ra.scale == rb.scale == 'medium'
-    assert ra.reason != rb.reason
+    assert analyze(board, a).image_coverage != analyze(board, b).image_coverage
     assert analyze(board, a).summary != analyze(board, b).summary
     # Swap roles: a symmetric aggregate must give the same next target.
     swapped = {'L': b['R'], 'R': b['L']}
@@ -368,11 +368,12 @@ def test_failed_latest_pose_does_not_change_intrinsic_capability(board, monkeypa
 
 
 @pytest.mark.parametrize('tilt', ag._TILTS)
-def test_corner_footprint_reduces_size(board, tilt):
+def test_corner_footprint_searches_medium_without_forcing_small(board, tilt):
     sizes = [(1280, 960), (1280, 720)]
     for row, col in [(0, 0), (0, 2), (2, 0), (2, 2)]:
-        assert not ag._candidate_feasible(board, (row, col, tilt, 'large'), sizes)
-        assert not ag._candidate_feasible(board, (row, col, tilt, 'medium'), sizes)
+        center, area, predicted = ag._candidate_geometry(board, (row, col, tilt, 'medium'), sizes)
+        assert ag._zone(center) == (row, col) and .04 <= area < .12
+        assert all(np.all((points > 0) & (points < 1)) for points in predicted)
         assert ag._candidate_feasible(board, (row, col, tilt, 'small'), sizes)
     assert ag._candidate_feasible(board, (1, 1, tilt, 'large'), sizes)
 
@@ -382,7 +383,7 @@ def test_bootstrap_keeps_center_before_requesting_corner_coverage(board):
     rec = result.recommendation
     assert (rec.zone_row, rec.zone_col) == (1, 1)
     assert rec.scale == 'medium'
-    assert '中央已有观测' in rec.reason
+    assert '中央实际角点覆盖补缺' in rec.reason
     assert '中画面占比' in rec.reason and '冷启动' in rec.reason
     assert len(rec.reason) < 65
     assert '几何近似' in result.summary and '不保证双目共视' in result.summary
@@ -391,8 +392,10 @@ def test_bootstrap_keeps_center_before_requesting_corner_coverage(board):
 def test_extreme_second_camera_aspect_filters_candidate(board):
     candidate = (1, 0, 'front', 'small')
     assert ag._candidate_feasible(board, candidate, [(1280, 960)])
-    assert not ag._candidate_feasible(board, candidate, [(1280, 960), (480, 1280)])
-    assert not ag._candidate_feasible(board, candidate, [(480, 1280), (1280, 960)])
+    forward = ag._candidate_geometry(board, candidate, [(1280, 960), (480, 1280)])
+    reverse = ag._candidate_geometry(board, candidate, [(480, 1280), (1280, 960)])
+    assert forward[:2] == reverse[:2]
+    assert forward[0][0] > 1 / 6  # The narrow eye moves the shared target inward.
     for cam_sizes in ([(1280, 960), (480, 1280)], [(480, 1280), (1280, 960)]):
         supplied = {}
         for cam, size in zip(('L', 'R'), cam_sizes):

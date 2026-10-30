@@ -8,6 +8,7 @@ import shutil
 import hashlib
 import uuid
 from contextlib import contextmanager
+from copy import deepcopy
 from threading import RLock
 from datetime import datetime
 from pathlib import Path
@@ -110,8 +111,58 @@ class CalibrationSession:
             "frame_count": 0,
             "multimodal_frame_count": 0,
         }
-        session._save_metadata()
+        session._creation_metadata = deepcopy(session._metadata)
+        try:
+            session._save_metadata()
+        except Exception:
+            session.discard_unpublished()
+            raise
         return session
+
+    def is_pristine(self) -> bool:
+        """Only metadata and empty folders; counters alone cannot establish emptiness."""
+        if self.frame_count or self._metadata.get('multimodal_frame_count', 0):
+            return False
+        if self.session_dir.is_symlink() or not self.session_dir.is_dir():
+            return False
+        metadata = self.session_dir / self.METADATA_FILE
+        return not any(path.is_symlink() or (path.is_file() and path != metadata)
+                       for path in self.session_dir.rglob('*'))
+
+    def discard_unpublished(self) -> bool:
+        """Remove only this object's newly created, unused directory, never loaded history."""
+        original = getattr(self, '_creation_metadata', None)
+        if original is None or self._metadata != original or self.session_dir.is_symlink():
+            return False
+        metadata = self.session_dir / self.METADATA_FILE
+        folders = [self.session_dir / name for name in
+                   (self.IMAGES_DIR, self.MULTIMODAL_DIR, self.RESULTS_DIR)]
+        with self._io_lock:
+            try:
+                if metadata.exists() and json.loads(metadata.read_text(encoding='utf-8')) != original:
+                    return False
+                allowed = set(folders + [metadata])
+                if (any(path not in allowed or path.is_symlink() for path in self.session_dir.iterdir())
+                        or any(folder.exists() and any(folder.iterdir()) for folder in folders)):
+                    return False
+                for folder in folders:
+                    if folder.exists():
+                        folder.rmdir()
+                metadata.unlink(missing_ok=True)
+                self.session_dir.rmdir()
+                self._creation_metadata = None
+                return True
+            except (OSError, ValueError):
+                # A late writer wins: keep its files and restore session metadata if needed.
+                if self.session_dir.exists():
+                    try:
+                        self._ensure_dirs()
+                        if not metadata.exists():
+                            self._atomic_json(metadata, original)
+                    except OSError:
+                        logger.exception('Could not restore unpublished session metadata')
+                logger.warning('Could not discard unused session: %s', self.session_dir, exc_info=True)
+                return False
 
     @classmethod
     def load(cls, session_dir: Path) -> CalibrationSession:
@@ -257,13 +308,22 @@ class CalibrationSession:
 
         mm_dir = self.session_dir / self.MULTIMODAL_DIR
         mm_dir.mkdir(parents=True, exist_ok=True)
-        self._save_image_pair(mm_dir, "rgb_left", "aux", rgb_left, aux, frame_idx, "multimodal_frame_count")
+        self._save_image_pair(mm_dir, "rgb_left", "aux", rgb_left, aux, frame_idx,
+                              "multimodal_frame_count", pending_review=True)
         return frame_idx
 
-    def _save_image_pair(self, directory, first_name, second_name, first, second, index, counter):
+    def save_multimodal_review(self, frame_idx: int, review: dict) -> None:
+        """Keep raw admission evidence next to the successfully saved pair."""
+        self._atomic_json(self.session_dir / self.MULTIMODAL_DIR / f'quality_{frame_idx:04d}.json',
+                          review)
+
+    def _save_image_pair(self, directory, first_name, second_name, first, second, index, counter,
+                         *, pending_review=False):
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
             raise ValueError("图片索引必须为非负整数")
         targets = [directory / f"{name}_{index:04d}.png" for name in (first_name, second_name)]
+        if pending_review:
+            targets.append(directory / f'quality_{index:04d}.json')
         with self._io_lock:
             if any(path.exists() for path in targets):
                 raise FileExistsError(f"采图目标已存在，未覆盖历史图片：{targets[0]}")
@@ -275,6 +335,10 @@ class CalibrationSession:
                     for path, image in zip(staged, (first, second)):
                         if not cv2.imwrite(str(path), image):
                             raise OSError(f"无法保存图片：{path.name}")
+                    if pending_review:
+                        self._atomic_json(staged[-1], dict(schema_version=1, state='待复核',
+                            reasons=['原图已落盘，验收尚未提交；请勿自动纳入标定'],
+                            physical_corner_order='requires_manual_confirmation'))
                     for source, target in zip(staged, targets):
                         source.replace(target)
                         committed.append(target)

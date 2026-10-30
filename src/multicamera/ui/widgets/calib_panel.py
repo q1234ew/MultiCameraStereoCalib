@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPointF, QSignalBlocker, QThread, QEvent
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPointF, QSignalBlocker, QThread, QEvent, QThreadPool
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -58,6 +58,8 @@ from ...calibration.assessment import (
 )
 from ...calibration.intrinsic import IntrinsicCalibrator
 from ...calibration.capture_quality import assess_stereo_capture
+from ...calibration.aux_capture_quality import assess_aux_frame, quality_reason_text
+from ...calibration.aux_guidance import duplicate_pair
 from ...calibration.models import (
     AuxCameraCalibration,
     CameraIntrinsics,
@@ -69,7 +71,6 @@ from ...calibration.multiview import MultiViewCalibrator
 from ...calibration.planar import (
     PatternBoardConfig,
     PlanarDetectionResult,
-    PlanarPatternDetector,
 )
 from ...calibration.stereo import StereoCalibrator
 from ...calibration.quality_summary import summarize_quality
@@ -79,6 +80,7 @@ from ...streaming.stream_manager import StreamManager
 from ..threads.calibration_worker import AuxCalibrationWorker, PairCalibrationWorker
 from ..threads.import_worker import AuxImageImportWorker, StereoImageImportWorker
 from ..threads.save_worker import FrameSaveWorker
+from ..threads.aux_capture_worker import AuxCaptureWorker
 from ..threads.white_balance_worker import WhiteBalanceGuard
 from ..theme import (
     ACCENT, BG_CARD, BG_DARK, BG_INPUT,
@@ -93,6 +95,7 @@ from .capture_guide import (
     build_multimodal_sequence,
 )
 from .pair_gallery import PreviewPair
+from .aux_capture import AuxCaptureGuide
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +489,9 @@ class CalibrationPanel(QWidget):
         self._live_preview_indices: dict[str, list[tuple[int, int, str]]] = {}
         self._capture_reviews: dict[str, list[PreviewPair]] = {}
         self._aux_reviews: list[PreviewPair] = []
+        self._aux_quality_records = []
+        self._aux_capture_worker = None
+        self._pending_aux_capture = None
         self._result_directory = None
         self._result_files = []
         self._result_errors = []
@@ -610,6 +616,14 @@ class CalibrationPanel(QWidget):
         return bool(self._failed_save_jobs)
 
     @property
+    def has_session_data(self) -> bool:
+        return bool(any(cal.num_frames for cal in self._intr_cals.values())
+                    or self._aux_pairs or self._aux_images or self._capture_reviews
+                    or self._intrinsics or self._aux_intrinsics
+                    or self._offline_import_records or self._pair_calibs or self._rig
+                    or self._result_files or self._aux_quality_records)
+
+    @property
     def has_active_operations(self) -> bool:
         return bool(self._auto_timer.isActive() or self._model_worker or self._calib_worker or self._aux_worker or
                     self._stereo_import_worker or self._aux_import_worker or
@@ -672,6 +686,7 @@ class CalibrationPanel(QWidget):
                 self._aux_pairs.clear()
                 self._aux_images.clear()
                 self._aux_reviews.clear()
+                self._aux_quality_records.clear()
                 self._aux_intrinsics = None
                 self._aux_capture_count = 0
                 self._aux_saved_count = 0
@@ -680,6 +695,8 @@ class CalibrationPanel(QWidget):
                 self._aux_observation_board = None
                 self._aux_capture_sequence = CaptureSequence(build_multimodal_sequence())
                 self._aux_seq_widget.set_sequence(self._aux_capture_sequence)
+                self._aux_guide.reset()
+                self._check_aux_order.setChecked(False)
                 self._aux_cap_progress.setValue(0)
                 self._lbl_aux_status.setText("辅助配置已更新，等待重新采集或导入")
                 self._sections[2].set_status_hint("")
@@ -1249,9 +1266,24 @@ class CalibrationPanel(QWidget):
         l2.addWidget(self._aux_board_section)
 
         self._aux_seq_widget = CaptureSequenceWidget()
+        self._aux_seq_widget.recommendations_only = True
         self._aux_seq_widget.set_compact_mode(True)
         self._aux_seq_widget.set_sequence(self._aux_capture_sequence)
+        self._aux_guide = AuxCaptureGuide(self)
+        l2.addWidget(self._aux_guide)
         l2.addWidget(self._aux_seq_widget)
+        l2.addWidget(self._aux_guide.details)
+
+        self._check_aux_order = QCheckBox('已核对两路角点对应')
+        self._check_aux_order.setToolTip(
+            '对称棋盘可能被两路反向编号。请回看全部原图中的0点和行方向标记，核对同一物理点；'
+            '低重投影误差不能证明对应正确。程序不自动翻转。新增或替换数据后需重新确认。')
+        self._check_aux_order.toggled.connect(self._refresh_aux_readiness)
+        l2.addWidget(self._check_aux_order)
+        self._lbl_aux_order = StableTextLabel(
+            '逐组核对两路0点及箭头，确认同一物理角点起点和行方向；不自动翻转。', lines=3)
+        self._lbl_aux_order.setToolTip(self._check_aux_order.toolTip())
+        l2.addWidget(self._lbl_aux_order)
 
         self._aux_cap_progress = QProgressBar()
         self._aux_cap_progress.setFormat("%v / %m")
@@ -1542,6 +1574,17 @@ class CalibrationPanel(QWidget):
         calibration.addWidget(self._btn_view_results)
 
         auxiliary = page()
+        receipt_row = QHBoxLayout()
+        self._aux_guide.receipt.set_lines(1)
+        receipt_row.addWidget(self._aux_guide.receipt, 1)
+        self._btn_aux_quality_details = QToolButton()
+        self._btn_aux_quality_details.setIcon(app_icon('list-checks'))
+        self._btn_aux_quality_details.setAccessibleName('融合原图验收详情')
+        self._btn_aux_quality_details.setToolTip('查看最近原图的完整验收结果及未计入原因')
+        self._btn_aux_quality_details.clicked.connect(lambda: QMessageBox.information(
+            self, '融合原图验收详情', self._aux_guide.receipt.text()))
+        receipt_row.addWidget(self._btn_aux_quality_details)
+        auxiliary.addLayout(receipt_row)
         self._btn_capture_aux.setText("采集配对图像")
         self._btn_capture_aux.setIcon(app_icon('camera', '#ffffff'))
         self._btn_capture_aux.setMinimumHeight(40)
@@ -1633,13 +1676,14 @@ class CalibrationPanel(QWidget):
 
     def _apply_inspector_density(self):
         capture = self._workflow_phase == 'capture'
-        compact = capture and self.height() < 720
+        compact = capture and (self.height() < 720 or self._active_step == 2)
         key = (compact, capture, self._active_step)
         if getattr(self, '_inspector_density_key', None) == key:
             return
         self._inspector_density_key = key
         for guide in (self._seq_widget, self._aux_seq_widget):
-            guide.set_diagram_height(200 if compact else 260)
+            guide.set_diagram_height(180 if compact and self._active_step == 2
+                                     else 200 if compact else 260)
         outer = self._inspector_scroll.widget().layout()
         margin = 8 if compact else 16
         outer.setContentsMargins(margin, margin, margin, margin)
@@ -1651,6 +1695,8 @@ class CalibrationPanel(QWidget):
         for name in ('sensor', 'calibration'):
             self._aux_task_labels[name].setVisible(not compact)
             self._aux_task_values[name].setVisible(not compact)
+        for widget in (self._aux_task_labels['intrinsics'], self._aux_task_values['intrinsics']):
+            widget.setVisible(not (capture and self._active_step == 2))
         layout = self._sections[2].content_layout
         layout.setSpacing(4 if compact else 8)
         layout.removeWidget(self._aux_board_section)
@@ -1672,6 +1718,10 @@ class CalibrationPanel(QWidget):
         auxiliary = self._active_step == 2
         capture = self._workflow_phase == "capture"
         self._aux_seq_widget.setVisible(auxiliary and capture)
+        self._aux_guide.setVisible(auxiliary and capture)
+        self._aux_guide.details.setVisible(auxiliary and capture)
+        self._check_aux_order.setVisible(auxiliary and not capture and not result)
+        self._lbl_aux_order.setVisible(auxiliary and not capture and not result)
         self._aux_cap_progress.setVisible(auxiliary and capture)
         self._aux_progress_header.setVisible(auxiliary and capture)
         if not auxiliary:
@@ -1750,6 +1800,8 @@ class CalibrationPanel(QWidget):
         self.sequence_updated.emit(sequence)
         self.preview_mode_changed.emit(step == 2)
         self._apply_workflow_layout()
+        if step == 2:
+            self._refresh_aux_readiness()
         self.workflow_changed.emit(self._workflow_phase, step == 2)
         self._refresh_preview_pairs()
 
@@ -1764,6 +1816,7 @@ class CalibrationPanel(QWidget):
     @Slot()
     def _on_aux_sequence_user_nav(self):
         """User changed active multimodal guide step."""
+        self._aux_guide.manual_navigation()
         self._activate_step(2)
 
     # ── Pair selector ────────────────────────────────────────
@@ -3325,16 +3378,66 @@ class CalibrationPanel(QWidget):
         if frames is None:
             self._log(problem)
             return
-        rgb_frame, aux_frame, _ = frames
+        rgb_frame, aux_frame, dt = frames
         self.capture_started.emit()
 
         board_cfg = self._aux_board_config()
         if self._aux_pairs and self._aux_observation_board != board_cfg:
             self._log("辅助板参数已变更，请重新导入图片或通过配置重置后重新采集")
             return
-        detector = PlanarPatternDetector(board_cfg)
-        rgb_det = detector.detect(rgb_frame)
-        aux_det = detector.detect(aux_frame)
+        images = (rgb_frame.copy(), aux_frame.copy())
+        key = self._aux_guide.context_key()
+        self._pending_aux_capture = dict(key=key, images=images, board=deepcopy(board_cfg),
+            session=self._session, rgb_id=rgb_left_id, aux_id=aux.camera_id,
+            timestamp=time.time(), pair_delta_ms=float(dt * 1000),
+            stability=(self._aux_guide._clock(), deepcopy(self._aux_guide._samples)))
+        worker = AuxCaptureWorker(key, images, deepcopy(board_cfg), self._aux_guide.intrinsics(),
+                                  self._aux_modality())
+        self._aux_capture_worker = worker
+        worker.signals.completed.connect(self._on_aux_capture_ready)
+        QThreadPool.globalInstance().start(worker)
+        self._aux_guide.receipt.setText('正在检查本次原图；保存与验收结果将持续显示')
+        self._refresh_aux_readiness()
+
+    @Slot(object, object, str)
+    def _on_aux_capture_ready(self, key, result, error):
+        pending = self._pending_aux_capture
+        self._aux_capture_worker = self._pending_aux_capture = None
+        if pending is None or key != self._aux_guide.context_key():
+            self._log('融合采图上下文已变化，未保存或纳入过期原图')
+            self._refresh_aux_readiness()
+            return
+        if error:
+            self._log('融合原图检测失败，未保存或增加记录：' + error)
+            self._aux_guide.receipt.setText('原图检查失败，未增加记录：' + error)
+            self._refresh_aux_readiness()
+            return
+        (rgb_det, aux_det), qualities = result
+        rgb_frame, aux_frame = pending['images']
+        board_cfg = pending['board']
+        rgb_left_id = pending['rgb_id']
+        self._aux_guide.last_qualities = qualities
+        reasons = [f'{name}：' + quality_reason_text(reason)
+                   for name, quality in zip(('RGB', 'IR/辅助'), qualities)
+                   for reason in quality.reasons]
+        stability = self._aux_guide.stability_reasons((rgb_det, aux_det), pending['stability'])
+        reasons += stability
+        if self._aux_pairs and any(det.image_size != self._aux_pairs[0][i + 1].image_size
+                                   for i, det in enumerate((rgb_det, aux_det))):
+            reasons.append('分辨率与已有配对不同，请重新导入或重建数据集')
+        admitted = not reasons
+        duplicate = admitted and duplicate_pair((rgb_det, aux_det),
+                                                [(rgb, aux) for _, rgb, aux in self._aux_pairs])
+        note = '近似重复构图；原图保留，但不推进非重复进度' if duplicate else ''
+        review = dict(schema_version=1, detected=bool(rgb_det.valid and aux_det.valid),
+                      state='可采纳' if admitted else '待复核', reasons=reasons,
+                      board=board_cfg.to_dict(), pairing='software_not_hardware',
+                      pair_delta_ms=pending['pair_delta_ms'],
+                      metrics=[quality.metrics for quality in qualities],
+                      stability=dict(verified=not stability, min_samples=3, min_seconds=.6,
+                                     max_detection_age_seconds=1.5, evaluated_at='capture_snapshot'),
+                      physical_corner_order='requires_manual_confirmation',
+                      guidance_note=note)
         capture_index = self._aux_capture_count
         idx = f"live_{capture_index:04d}"
         existing_ids = {key for key, _, _ in self._aux_pairs}
@@ -3343,32 +3446,44 @@ class CalibrationPanel(QWidget):
             idx = f"live_{capture_index:04d}"
         if self._session is not None:
             try:
-                self._session.save_multimodal_pair(rgb_frame, aux_frame)
+                disk_index = self._session.save_multimodal_pair(rgb_frame, aux_frame)
             except Exception as exc:
                 self._log(f"{idx}: 多模态图片保存失败，未增加采集记录，请重试采集 — {str(exc).splitlines()[0]}")
+                self._aux_guide.receipt.setText(f'{idx} 原图保存失败，未增加记录；请重试')
+                self._refresh_aux_readiness()
                 return
             self._aux_saved_count += 1
+            try:
+                self._session.save_multimodal_review(disk_index, review)
+            except Exception as exc:
+                admitted = False
+                reasons.append('验收记录写入失败，原图保留但未计入：' + str(exc).splitlines()[0])
+                review.update(state='待复核', reasons=reasons)
         self._aux_images.append((rgb_frame.copy(), aux_frame.copy()))
+        self._aux_quality_records.append(review)
+        if admitted:
+            with QSignalBlocker(self._check_aux_order):
+                self._check_aux_order.setChecked(False)
         self._aux_reviews.append(PreviewPair(
-            f'融合 {idx}', rgb_left_id, aux.camera_id, *self._aux_images[-1],
+            f'融合 {idx}', rgb_left_id, pending['aux_id'], *self._aux_images[-1],
             deepcopy(rgb_det), deepcopy(aux_det), '采图原图', board_cfg.cols * board_cfg.rows,
-            save_state='已保存' if self._session is not None else '仅内存原图'))
+            save_state='已保存' if self._session is not None else '仅内存原图',
+            quality_state=review['state'], quality_reasons=tuple(reasons + ([note] if note else []))))
 
-        if rgb_det.valid and aux_det.valid:
+        if admitted:
             self._invalidate_aux_result()
             self._aux_observation_board = board_cfg
             self._aux_pairs.append((idx, rgb_det, aux_det))
             self.frame_captured.emit(rgb_left_id, rgb_det)
-            self.frame_captured.emit(aux.camera_id, aux_det)
+            self.frame_captured.emit(pending['aux_id'], aux_det)
             self._log(f"{idx}: RGB_L={rgb_det.num_points} AUX={aux_det.num_points}")
-            if not self._aux_capture_sequence.finished:
-                self._aux_capture_sequence.advance()
-                self._aux_seq_widget.refresh()
-                self.sequence_updated.emit(self._aux_capture_sequence)
         else:
-            self._log(f"{idx}: 平面板检测失败 RGB_L={rgb_det.valid} AUX={aux_det.valid}")
+            self._log(f"{idx}: 原图已保存，待复核，未计入质量可用数据 — " + '；'.join(reasons))
 
         self._aux_capture_count = capture_index + 1
+        self._aux_guide.record_receipt(idx, review['state'], reasons + ([note] if note else []),
+                                       (rgb_det, aux_det))
+        self._aux_guide.data_changed()
         self._refresh_aux_capture_state()
 
     @Slot()
@@ -3387,7 +3502,7 @@ class CalibrationPanel(QWidget):
         board_cfg = self._aux_board_config()
         self._log(f"正在后台导入多模态图片，板参数: {board_cfg.to_dict()}")
         self._set_aux_import_busy(True)
-        worker = AuxImageImportWorker(folder, board_cfg, parent=self)
+        worker = AuxImageImportWorker(folder, board_cfg, parent=self, modality=self._aux_modality())
         worker.finished_ok.connect(self._on_import_aux_images_ready)
         worker.failed.connect(self._on_import_aux_images_failed)
         worker.finished.connect(worker.deleteLater)
@@ -3408,28 +3523,44 @@ class CalibrationPanel(QWidget):
         self._aux_pairs.clear()
         self._aux_images.clear()
         self._aux_reviews.clear()
+        self._aux_quality_records.clear()
         self._aux_capture_count = 0
         self._aux_saved_count = 0
         self._aux_imported_count = len(img_pairs)
         self._aux_source_folder = getattr(worker, 'folder', None)
         self._aux_capture_sequence.reset()
+        with QSignalBlocker(self._check_aux_order):
+            self._check_aux_order.setChecked(False)
 
         for key, rgb, aux, rgb_det, aux_det in img_pairs:
+            review = getattr(worker, 'frame_reviews', {}).get(key)
+            if review is None:
+                qualities = [assess_aux_frame(image, det, board_cfg,
+                    modality='rgb' if i == 0 or self._aux_modality() == 'acoustic_rgb' else 'ir')
+                    for i, (image, det) in enumerate(((rgb, rgb_det), (aux, aux_det)))]
+                reasons = [f'{name}：' + quality_reason_text(reason)
+                           for name, quality in zip(('RGB', 'IR/辅助'), qualities)
+                           for reason in quality.reasons]
+                review = dict(detected=bool(rgb_det.valid and aux_det.valid),
+                              state='待复核' if reasons else '可采纳', reasons=reasons)
+            self._aux_quality_records.append(review)
             self._aux_images.append((rgb, aux))
             self._aux_reviews.append(PreviewPair(
                 f'融合 {key}', self._rgb_left_camera_id() or 'RGB_L', self._aux_camera_id(),
                 rgb, aux, deepcopy(rgb_det), deepcopy(aux_det), '导入原图',
-                board_cfg.cols * board_cfg.rows, save_state='源目录原图'))
-            if rgb_det.valid and aux_det.valid:
+                board_cfg.cols * board_cfg.rows, save_state='源目录原图',
+                quality_state=review['state'], quality_reasons=tuple(review['reasons'])))
+            if review['state'] == '可采纳' and rgb_det.valid and aux_det.valid:
                 self._aux_pairs.append((key, rgb_det, aux_det))
                 self._log(f"  [{key}] RGB_L={rgb_det.num_points} AUX={aux_det.num_points}")
             else:
-                self._log(f"  [{key}] 检测失败 RGB_L={rgb_det.valid} AUX={aux_det.valid}")
+                self._log(f"  [{key}] 待复核，未纳入 — " + '；'.join(review['reasons']))
 
         valid = len(self._aux_pairs)
         # Imported board detections do not identify which guided poses were achieved.
         self._aux_seq_widget.refresh()
         self.sequence_updated.emit(self._aux_capture_sequence)
+        self._aux_guide.reset()
         self._refresh_aux_capture_state()
         if self._aux_images:
             rgb, aux = self._aux_images[-1]
@@ -3566,12 +3697,12 @@ class CalibrationPanel(QWidget):
 
     def _refresh_aux_capture_state(self):
         valid = len(self._aux_pairs)
-        total = self._aux_capture_sequence.total
+        total = len(build_multimodal_sequence())
         self._aux_cap_progress.setMaximum(total)
         self._aux_cap_progress.setValue(min(valid, total))
         self._aux_cap_progress.setFormat(f'图像配对 {valid} 组 · 建议 {total} 组')
         self._refresh_aux_readiness()
-        self._lbl_aux_status.setText(f"最少 3 组 · 建议 {total} 组")
+        self._lbl_aux_status.setText(f"求解最少 3 组 · 基础计划 {len(build_multimodal_sequence())} 组；数量不代表精度")
         self._refresh_preview_pairs()
         self._refresh_disk_hint()
 
@@ -3618,6 +3749,8 @@ class CalibrationPanel(QWidget):
             return "标定未就绪：配对 RGB 图像分辨率与左目内参不一致，请重新标定或采集"
         if len({aux.image_size for _, _, aux in self._aux_pairs}) > 1:
             return "标定未就绪：辅助图像分辨率不一致，请使用同一分辨率重新采集或导入"
+        if not self._check_aux_order.isChecked():
+            return '标定未就绪：请逐组核对两路0点及行方向，再确认物理角点对应'
         return ""
 
     def _invalidate_aux_result(self):
@@ -3637,7 +3770,7 @@ class CalibrationPanel(QWidget):
             self.set_result_storage(None)
 
     def _aux_dataset_busy(self) -> bool:
-        return bool(self._model_worker or self._aux_ui_busy or self._aux_import_busy or self._aux_worker or self._aux_import_worker or
+        return bool(self._aux_capture_worker or self._model_worker or self._aux_ui_busy or self._aux_import_busy or self._aux_worker or self._aux_import_worker or
                     self._white_balance_guard.busy)
 
     def _ensure_capture_session(self):
@@ -3752,11 +3885,12 @@ class CalibrationPanel(QWidget):
                 value.setStyleSheet(f'color:{color}; font-size:12px; background:transparent;')
         self._aux_task_values['capture'].setToolTip(capture_status)
         self._aux_task_values['calibration'].setToolTip(calibration_status)
-        self._btn_rgb_prerequisite.setVisible(not intrinsics_ready)
+        self._btn_rgb_prerequisite.setVisible(not intrinsics_ready and
+                                              not (self._active_step == 2 and self._workflow_phase == 'capture'))
         self._lbl_aux_pair_count.setText(
-            f"{len(self._aux_pairs)} 组 · 建议 {self._aux_capture_sequence.total} 组")
+            f"{len(self._aux_pairs)} 组质量可用 · 基础 {len(build_multimodal_sequence())} 组")
         self._lbl_aux_pair_count.setToolTip(
-            '有效平面板配对数 / 建议采图组数；与引导步骤记录独立，不代表姿态覆盖或标定精度')
+            '质量可用可能包含重复；非重复进度与姿态可解数单列，不代表姿态覆盖或标定精度')
         self._btn_capture_aux.setEnabled(not busy and frames is not None)
         self._btn_capture_aux.setToolTip(capture_status)
         self._btn_calib_aux.setEnabled(not busy and not problem)
@@ -3771,6 +3905,7 @@ class CalibrationPanel(QWidget):
         else:
             hint = "✓ 可标定"
         self._sections[2].set_status_hint(hint)
+        self._aux_guide.refresh()
 
     def _aux_board_config(self) -> PatternBoardConfig:
         aux = self._sm.auxiliary_camera
@@ -3937,6 +4072,8 @@ class CalibrationPanel(QWidget):
         return frames[max(0, min(idx, len(frames) - 1))]
 
     def _reset_all(self):
+        self._lbl_capture_decision.clear()
+        self._lbl_capture_decision.setToolTip('保存成功不代表通过标定验收；请核对本次原图结果。')
         self._clear_rect_preview()
         self._model_report = None
         self._model_report_key = None
@@ -3948,6 +4085,7 @@ class CalibrationPanel(QWidget):
         self._live_preview_indices.clear()
         self._capture_reviews.clear()
         self._aux_reviews.clear()
+        self._aux_quality_records.clear()
         self._intr_cals.clear()
         self._intrinsics.clear()
         self._stereo_cals.clear()
@@ -3972,6 +4110,8 @@ class CalibrationPanel(QWidget):
         self._quality_report.clear()
         self._aux_capture_sequence = CaptureSequence(build_multimodal_sequence())
         self._aux_seq_widget.set_sequence(self._aux_capture_sequence)
+        self._aux_guide.reset()
+        self._check_aux_order.setChecked(False)
         self._aux_cap_progress.setMaximum(self._aux_capture_sequence.total)
         self._aux_cap_progress.setValue(0)
         self._btn_calib_aux.setEnabled(False)

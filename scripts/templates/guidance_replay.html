@@ -20,7 +20,7 @@ const $=id=>document.getElementById(id), steps=report.steps;
 let index=0,timer=null;
 const regions=[['左上','上方','右上'],['左侧','中央','右侧'],['左下','下方','右下']];
 const tilts={front:'正对镜头',left:'左边近',right:'右边近',up:'上边近',down:'下边近'}, scales={small:'小',medium:'中',large:'大'};
-const recText=r=>`${regions[r.zone_row][r.zone_col]} · ${tilts[r.tilt]} · ${scales[r.scale]}画面占比`;
+const recText=r=>`${regions[r.zone_row][r.zone_col]} · ${tilts[r.tilt]} · ${scales[r.scale]}画面占比`+(r.target_center?` · 目标中心 ${r.target_center.map(v=>v.toFixed(2)).join(', ')}`:'')+(r.target_area?` · 参考角点包络 ${(r.target_area*100).toFixed(1)}%（非固定验收值）`:'');
 $('dataset').textContent=`${steps.length} 对图像 · ${report.model} · 文件编号顺序`;
 $('slider').max=steps.length-1;
 steps.forEach((s,i)=>{const o=document.createElement('option');o.value=i;o.textContent=s.frame_id;$('stepSelect').append(o);const tr=document.createElement('tr');tr.tabIndex=0;[s.frame_id,`${s.before.intrinsic_cameras.length}/2`,`${s.unique_sample_change>=0?'+':''}${s.unique_sample_change}`,s.verdict.reason].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});tr.onclick=()=>show(i);tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();show(i)}};$('rows').append(tr)});

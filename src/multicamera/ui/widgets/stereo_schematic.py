@@ -34,11 +34,15 @@ def board_point(x, y, progress, target, motion='plan'):
     """Camera axes: X right, Y down, Z forward; pivot edge stays fixed."""
     if target is None:
         return x, y, 4.7
+    shift_x = (target.norm_cx - .5) * 3 * 1.25
+    shift_y = (target.norm_cy - .5) * 3 * .8
+    depth_shift = {'small': 1.6, 'medium': 0., 'large': -1.}.get(target.scale, 0.)
+    if target.target_area is not None:
+        depth_shift = 4.7 * (math.sqrt(.07 / target.target_area) - 1)
     if motion in ('approach', 'retreat'):
-        end_z = 4.7 + {'small': 1.6, 'medium': 0., 'large': -1.}.get(target.scale, 0.)
+        end_z = 4.7 + depth_shift
         start_offset = 1. if motion == 'approach' else -1.
-        return (x + (target.zone_col - 1) * 1.25,
-                y + (target.zone_row - 1) * .8, end_z + start_offset * (1. - progress))
+        return (x + shift_x, y + shift_y, end_z + start_offset * (1. - progress))
     if motion == 'hold':
         progress = 1.
     tilt = target.tilt
@@ -47,10 +51,8 @@ def board_point(x, y, progress, target, motion='plan'):
     # combine a translation with a rotation around a supposedly fixed edge.
     shift = progress if tilt == BoardTilt.FRONT else 1.
     # The board is a fixed-size object: vary camera-axis distance, not its dimensions.
-    depth_shift = {'small': 1.6, 'medium': 0., 'large': -1.}.get(target.scale, 0.)
     depth_shift *= progress if tilt == BoardTilt.FRONT else 1.
-    return (x + (target.zone_col - 1) * 1.25 * shift,
-            y + (target.zone_row - 1) * .8 * shift, z + depth_shift)
+    return (x + shift_x * shift, y + shift_y * shift, z + depth_shift)
 
 
 VIEW_EYE = (6., -6., 10.)
@@ -293,7 +295,8 @@ class StereoSchematic(QWidget):
         self.caption.setText(text)
 
     def set_target(self, target, *, active=True, instruction=None, motion='plan'):
-        key = (target.zone_row, target.zone_col, target.tilt, target.scale, motion) if target else None
+        key = (target.zone_row, target.zone_col, target.tilt, target.scale,
+               target.target_center, target.target_area, motion) if target else None
         enabled = bool(active and target is not None and motion != 'hold')
         description = instruction if instruction is not None else motion_description(target)
         if (key == self._key and enabled == self._enabled

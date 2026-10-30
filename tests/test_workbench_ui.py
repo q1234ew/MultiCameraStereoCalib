@@ -24,12 +24,13 @@ from test_multimodal_preview import LEFT, RIGHT, IR, board_image, configure
 
 
 @pytest.fixture
-def bench(app, monkeypatch, tmp_path):
+def bench(app, monkeypatch, tmp_path, finish_aux_tasks):
     configure_application_style(app)
     monkeypatch.setattr(main_window, "sessions_dir", lambda: tmp_path / "sessions")
     window = main_window.MainWindow()
     manager = configure(window)
     panel = window._calib_panel
+    monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
     rgb = np.full((720, 1280, 3), 245, np.uint8)
     rgb[:, 160:1120] = cv2.resize(board_image(), (960, 720), interpolation=cv2.INTER_NEAREST)
     ir = cv2.applyColorMap(cv2.cvtColor(board_image(), cv2.COLOR_BGR2GRAY), cv2.COLORMAP_INFERNO)
@@ -50,7 +51,9 @@ def bench(app, monkeypatch, tmp_path):
     ])
     publish(window, rgb, ir)
     app.processEvents()
+    finish_aux_tasks(panel)
     yield window, rgb, ir
+    finish_aux_tasks(panel)
     manager.stop_all()
     panel._auto_timer.stop()
     window.close()
@@ -211,7 +214,7 @@ def test_focus_close_restore_and_escape_are_coherent(bench, app):
     assert view.presentation_mode == "aux_focus"
 
 
-def test_gallery_review_is_explicit_and_does_not_replace_capture_source(bench, app):
+def test_gallery_review_is_explicit_and_does_not_replace_capture_source(bench, app, finish_aux_tasks):
     win, rgb, ir = bench
     gallery, view, panel = win._gallery, win._stream_view, win._calib_panel
     pair = gallery._pairs[-1]
@@ -229,6 +232,7 @@ def test_gallery_review_is_explicit_and_does_not_replace_capture_source(bench, a
     assert view.review_matches({LEFT: pair.left, IR: pair.right})
     panel._btn_capture_aux.click()
     app.processEvents()
+    finish_aux_tasks(panel)
     assert not view.review_key
     assert not win._review_bar.isVisible()
     session = win._current_session.session_dir
@@ -374,9 +378,9 @@ def test_sidebar_summary_uses_actual_board_and_live_readiness(bench):
     assert panel._aux_board_values['geometry'].text() == '7 列 × 5 行格子'
     assert panel._aux_board_values['spacing'].text() == '80 mm'
     assert '24 点' in panel._aux_board_values['points'].text()
-    assert panel._lbl_aux_pair_count.text() == '8 组 · 建议 13 组'
-    assert panel._aux_seq_widget._title_lbl.text() == '引导步骤 · 已记录 0/13'
-    assert '独立于图像配对数量' in panel._aux_seq_widget._title_lbl.toolTip()
+    assert panel._lbl_aux_pair_count.text() == '8 组质量可用 · 基础 17 组'
+    assert panel._aux_seq_widget._title_lbl.text() == '建议构图 · 位置以 IR/辅助画面为准'
+    assert '不等于已验证姿态' in panel._aux_seq_widget._title_lbl.toolTip()
     assert not panel._lbl_aux_readiness.isVisible()
     assert not panel._lbl_aux_board.isVisible()
     assert not panel._aux_seq_widget._dots.isVisible()
@@ -397,6 +401,8 @@ def test_sidebar_rgb_prerequisite_navigates_without_losing_auxiliary_data(bench,
     pairs = panel._aux_pairs
     panel._intrinsics.pop(LEFT)
     panel._refresh_aux_readiness()
+    assert not panel._btn_rgb_prerequisite.isVisible()  # RGB intrinsics are not a capture prerequisite.
+    panel.show_workflow('calibration', True)
     assert panel._btn_rgb_prerequisite.isVisible()
     assert panel._aux_task_values['intrinsics'].text() == '未完成'
     assert panel._aux_task_values['calibration'].text() == '需先标定 RGB'

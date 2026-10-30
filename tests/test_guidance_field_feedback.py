@@ -65,8 +65,9 @@ def test_grouped_height_route_and_local_pose_variation(board):
             {c: intrinsics() for c in data}).recommendation for n in range(23)]
     assert all((r.zone_row, r.zone_col) == (1, 1) for r in recs[:6])
     assert len({r.tilt for r in recs[:6]}) >= 4
-    heights = [r.zone_row for r in recs]
-    assert [h for i, h in enumerate(heights) if not i or h != heights[i - 1]] == [1, 0, 2]
+    # Height is now a cost among similarly useful candidates, not a fixed itinerary.
+    assert all(r.scale != 'small' for r in recs[7:])  # Existing distant views need closeups.
+    assert all(r.target_center is not None for r in recs)
     assert all(ag._candidate_feasible(board, (r.zone_row, r.zone_col, r.tilt, r.scale),
                                      [(1280, 960)] * 2) for r in recs)
 

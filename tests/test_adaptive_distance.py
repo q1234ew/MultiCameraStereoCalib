@@ -33,8 +33,9 @@ def test_explicit_middle_near_far_then_height_groups(board):
     # The first pass does not restart distance gaps when bootstrap becomes available.
     assert tuple(r.scale for r in recs[:7]) == ag.CENTRAL_DISTANCE_PLAN
     assert all((r.zone_row, r.zone_col) == (1, 1) for r in recs[:7])
-    heights = [r.zone_row for r in recs]
-    assert [h for i, h in enumerate(heights) if i == 0 or h != heights[i - 1]] == [1, 0, 2]
+    # After bootstrap the route depends on actual observations, not a hard-coded tour.
+    assert all(r.target_center is not None and r.target_area is not None for r in recs)
+    assert all(r.initial_total == ag.INITIAL_SAMPLE_BUDGET for r in recs)
     assert len({r.tilt for r in recs[:7]}) >= 4
     # Re-analysis and duplicate frames cannot consume scheduling slots.
     once = ag.analyze_guidance(board, CameraModel.PINHOLE, data, {})

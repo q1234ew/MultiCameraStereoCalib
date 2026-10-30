@@ -70,6 +70,7 @@ def calibrated(window):
     det = PlanarDetectionResult(True, obj, points, (640, 480), board.pattern_type)
     panel._aux_pairs = [(str(i), det, det) for i in range(3)]
     panel._aux_images = [(np.zeros((480, 640, 3), np.uint8),) * 2]
+    panel._check_aux_order.setChecked(True)  # This fixture represents an already reviewed dataset.
     window._rig = rig
     window._act_export.setEnabled(True)
     panel.refresh_pairs()
