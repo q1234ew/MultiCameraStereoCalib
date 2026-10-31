@@ -133,6 +133,9 @@ def test_small_sample_bad_pairing_fails_instead_of_publishing_success(app):
 def test_healthy_small_sample_still_retains_standard_model():
     _, _, _, report = calibrate_validated(*calibrators(8))
     assert report['selected'] == 'standard'
+    assert report['validation_status'] == 'insufficient_views'
+    assert report['candidates']['standard']['validation_status'] == 'insufficient_views'
+    assert '未完成留出验证' in report['reason']
 
 
 @pytest.mark.parametrize('defect', ['zero_baseline', 'scale_baseline', 'reverse_baseline',
@@ -200,6 +203,8 @@ def test_standard_is_retained_without_unnecessary_model_switches():
     left, right, stereo, report = calibrate_validated(*cals)
     assert report['selected'] == 'standard'
     assert set(report['candidates']) == {'standard'}
+    assert report['validation_status'] == 'passed'
+    assert len(report['candidates']['standard']['validation']['folds']) == 3
     assert check_stereo_health(left, right, stereo)['status'] == 'ok'
     for old, new in zip(before, cals[2]._img_points_left):
         np.testing.assert_array_equal(old, new)
@@ -213,11 +218,11 @@ def test_no_healthy_candidate_never_publishes_a_winner(monkeypatch):
         calibrate_validated(*calibrators())
 
 
-def test_automatic_strategy_is_explicit_and_quality_report_explains_it(model_window, app):
+def test_automatic_strategy_is_default_and_quality_report_explains_it(model_window, app):
     from test_real_pairs_ui import wait_for
     panel = model_window._calib_panel
-    assert panel._combo_calib_strategy.currentData() == 'standard'
-    panel._combo_calib_strategy.setCurrentIndex(panel._combo_calib_strategy.findData('auto_validated'))
+    assert panel._combo_calib_strategy.currentData() == 'auto_validated'
+    assert panel._calib_strategy_key == 'auto_validated'
     panel._calibrate_pair('test')
     wait_for(app, lambda: not panel.has_active_background_tasks())
     pair = panel._pair_calibs['test']
@@ -225,6 +230,56 @@ def test_automatic_strategy_is_explicit_and_quality_report_explains_it(model_win
     assert pair.calibration_info['health']['status'] == 'ok'
     assert '自动校验择模' in panel._quality_report.toPlainText()
     assert '有效性检查' in panel._quality_report.toPlainText()
+
+
+def test_explicit_manual_strategy_does_not_silently_select_models(model_window, app):
+    from test_real_pairs_ui import wait_for
+    panel = model_window._calib_panel
+    panel._combo_calib_strategy.setCurrentIndex(panel._combo_calib_strategy.findData('standard'))
+    assert panel._calib_strategy_key == 'standard'
+    panel._calibrate_pair('test')
+    wait_for(app, lambda: not panel.has_active_background_tasks())
+    assert 'model_selection' not in panel._pair_calibs['test'].calibration_info
+
+
+@pytest.mark.parametrize('count,folds', [(9, 3), (15, 5)])
+def test_low_error_standard_still_requires_disjoint_holdouts(count, folds):
+    _, _, _, report = calibrate_validated(*calibrators(count))
+    assert report['selected'] == 'standard'
+    validation = report['candidates']['standard']['validation']
+    assert len(validation['folds']) == folds
+    held_out = []
+    for fold in validation['folds']:
+        assert not set(fold['train_ids']) & set(fold['test_ids'])
+        held_out.extend(fold['test_ids'])
+    assert sorted(held_out) == sorted(report['evaluated_ids'])
+
+
+def test_low_error_standard_with_failed_holdout_uses_validated_fallback(monkeypatch):
+    from multicamera.calibration import validated_selection as selection
+    calls = []
+
+    def validate(left, right, stereo, candidate, ids, log):
+        calls.append(candidate)
+        if candidate == 'standard':
+            raise ValueError('simulated fold failure')
+        return {'rms_px': .2 if candidate == 'constrained' else .3, 'folds': []}
+
+    monkeypatch.setattr(selection, '_cross_validate', validate)
+    _, _, _, report = calibrate_validated(*calibrators())
+    assert calls == ['standard', 'constrained', 'rational']
+    assert report['selected'] == 'constrained'
+    assert report['candidates']['standard']['status'] == 'failed'
+    assert 'fold failure' in report['candidates']['standard']['error']
+
+
+@pytest.mark.parametrize('error', [float('nan'), float('inf'), -.1, 2.1])
+def test_invalid_or_excessive_holdouts_cannot_use_low_training_rms(monkeypatch, error):
+    from multicamera.calibration import validated_selection as selection
+    monkeypatch.setattr(selection, '_cross_validate',
+                        lambda *args: {'rms_px': error, 'folds': []})
+    with pytest.raises(ValueError, match='没有通过'):
+        calibrate_validated(*calibrators())
 
 
 def test_fallback_requires_disjoint_training_without_reusing_final_seeds(monkeypatch):

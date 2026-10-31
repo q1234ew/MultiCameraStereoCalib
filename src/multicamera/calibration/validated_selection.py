@@ -72,14 +72,16 @@ def _cross_validate(left, right, stereo, candidate, ids, log):
 def calibrate_validated(left, right, stereo, log=lambda _: None):
     """Never change pinhole/fisheye family or treat failed candidates as usable.
 
-    A healthy low-error standard solution is retained without costly fallback.
+    A healthy low-error standard solution is retained after available holdouts.
     Alternatives need matched-view holdouts, trained without final-fit seeds.
     """
     names = ['standard', 'constrained']
     if stereo.model == CameraModel.PINHOLE:
         names.append('rational')
     report = {'method': 'health_gated_within_family_selection', 'candidates': {},
-              'selected': None, 'limits': '同序列留出及全视场数值采样，非独立测量精度验收'}
+              'selected': None, 'policy_version': 2,
+              'validation_min_views': MIN_MODEL_VIEWS,
+              'limits': '同序列留出及全视场数值采样，非独立测量精度验收'}
     fitted = {}
     for cal in (left, right, stereo):
         if len(cal.frame_ids) != len(set(cal.frame_ids)):
@@ -105,18 +107,32 @@ def calibrate_validated(left, right, stereo, log=lambda _: None):
             if health['status'] != 'ok':
                 raise ValueError('；'.join(health['reasons']))
             fitted[name] = lintr, rintr, result
-            if name == 'standard' and result.rms_error <= MAX_UNVALIDATED_RMS_PX:
-                report.update(selected=name, reason='标准模型通过有效性检查且训练误差较低，保留原模型')
+            if (name == 'standard' and len(ids) < MIN_MODEL_VIEWS
+                    and result.rms_error <= MAX_UNVALIDATED_RMS_PX):
+                report.update(selected=name, validation_status='insufficient_views',
+                    reason=f'仅{len(ids)}对共同观测，不足{MIN_MODEL_VIEWS}对；'
+                           '标准模型仅通过基础有效性及训练误差检查，未完成留出验证')
                 row['status'] = 'ok'
+                row['validation_status'] = 'insufficient_views'
+                log(report['reason'])
                 return (*fitted[name], report)
             if len(ids) < MIN_MODEL_VIEWS:
                 raise ValueError(f'仅{len(ids)}对共同观测，标准双目RMS={result.rms_error:.3f} px'
                                  f'超过未验证解门槛{MAX_UNVALIDATED_RMS_PX:g} px；'
                                  f'请补足{MIN_MODEL_VIEWS}对观测并核对左右配对')
             row['validation'] = _cross_validate(left, right, stereo, name, ids, log)
-            if row['validation']['rms_px'] > 2.:
+            metric = row['validation']['rms_px']
+            if not np.isfinite(metric) or metric < 0:
+                raise ValueError('留出跨相机投影误差无效')
+            if metric > 2.:
                 raise ValueError('留出跨相机投影误差超过2 px')
             row['status'] = 'ok'
+            row['validation_status'] = 'passed'
+            if name == 'standard' and result.rms_error <= MAX_UNVALIDATED_RMS_PX:
+                report.update(selected=name, validation_status='passed',
+                    reason='标准模型通过有效性及留出验证，且训练误差较低，优先保留标准模型')
+                log(f'已保留标准模型，留出投影 RMS={metric:.3f} px')
+                return (*fitted[name], report)
         except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
             row['error'] = str(exc)
             log(f'候选 {name} 不可用：{exc}')
@@ -129,6 +145,7 @@ def calibrate_validated(left, right, stereo, log=lambda _: None):
     standard = report['candidates']['standard']
     if standard['status'] == 'ok' and standard['validation']['rms_px'] - score < .03:
         selected = 'standard'
-    report.update(selected=selected, reason='仅在有效性和全部留出检查通过的候选中比较；差异不足0.03 px时保留标准模型')
+    report.update(selected=selected, validation_status='passed',
+                  reason='仅在有效性和全部留出检查通过的候选中比较；差异不足0.03 px时保留标准模型')
     log(f'已选择 {selected}，留出投影 RMS={report["candidates"][selected]["validation"]["rms_px"]:.3f} px')
     return (*fitted[selected], report)

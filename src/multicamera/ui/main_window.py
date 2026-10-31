@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         self._guide_scroll.setMinimumWidth(300)
         self._guide_scroll.setMaximumWidth(440)
         self._guide_scroll.setWidget(self._stereo_capture)
+        self._calib_panel.set_stereo_receipt(self._stereo_capture.receipt)
         self._capture_preview_splitter.addWidget(self._guide_scroll)
         self._capture_preview_splitter.setStretchFactor(0, 1)
         self._capture_preview_splitter.setStretchFactor(1, 0)
@@ -646,6 +647,7 @@ class MainWindow(QMainWindow):
             self._show_review_pair(pair)
         else:
             self._stream_view.show_review_images(key, images)
+        self._calib_panel.show_review_rectification(key, images)
 
     def _show_review_pair(self, pair):
         recorded = pair.left_detection is not None and pair.right_detection is not None

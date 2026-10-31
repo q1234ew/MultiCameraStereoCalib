@@ -80,7 +80,7 @@ def test_current_preview_counts_are_distinct_from_cumulative_coverage(offline_wi
     win._stereo_capture.refresh()
     text = win._stereo_capture.compact_summary.text()
     assert '当前预览角点' in text and '数据集累计' in text
-    assert '缩放检测' in text
+    assert '原图分辨率检测' in text and '缩放检测' not in text
     assert '累计' in win._stereo_capture.coverage_button.toolTip()
     assert '预览角点' in win._stream_view._views[pair.left_id]._info.text()
 
@@ -104,7 +104,7 @@ def test_review_summary_updates_immediately_with_recorded_original_counts(offlin
     assert '回看' not in win._stereo_capture.instruction.text()
     text = win._stereo_capture.compact_summary.text()
     counts = win._stream_view.displayed_corner_counts()
-    assert '缩放检测' in text
+    assert '原图分辨率检测' in text and '缩放检测' not in text
     assert f'左目 {counts[pair.left_id]}/{win._board.num_corners}' in text
     assert f'右目 {counts[pair.right_id]}/{win._board.num_corners}' in text
 

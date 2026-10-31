@@ -274,7 +274,9 @@ def test_recalibrate_after_supplement_uses_all_observations(app, window, monkeyp
     assert panel._pair_rows["rgb"].btn.isEnabled()
     panel._calibrate_pair("rgb")
     wait_until(app, lambda: panel._calib_worker is None)
-    assert used_counts == [8, 8, 9, 9]
+    assert used_counts == [8, 8, 9, 9] + [6] * 6
+    choice = panel._pair_calibs['rgb'].calibration_info['model_selection']
+    assert choice['validation_status'] == 'passed'
     assert window._act_export.isEnabled()
     assert window._current_session is session
     np.testing.assert_allclose(

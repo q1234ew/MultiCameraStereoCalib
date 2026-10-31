@@ -448,7 +448,7 @@ class MultiStreamView(QWidget):
 
     UI_FPS_CAP = 15
     DETECT_FPS_CAP = 2.0
-    DETECT_MAX_WIDTH = 960
+    PLANAR_DETECT_MAX_WIDTH = 960
     MAX_PREVIEW_FRAME_AGE_SEC = 0.35
     MAX_DETECTION_AGE_SEC = .75
 
@@ -1010,11 +1010,12 @@ class MultiStreamView(QWidget):
         h, w = frame.shape[:2]
         scale = 1.0
         detect_frame = frame
-        if w > self.DETECT_MAX_WIDTH:
-            scale = self.DETECT_MAX_WIDTH / float(w)
+        # Keep source pixels for ChArUco decoding; only auxiliary planar previews resize.
+        if self._multimodal_mode and w > self.PLANAR_DETECT_MAX_WIDTH:
+            scale = self.PLANAR_DETECT_MAX_WIDTH / float(w)
             detect_frame = cv2.resize(
                 frame,
-                (self.DETECT_MAX_WIDTH, max(1, int(h * scale))),
+                (self.PLANAR_DETECT_MAX_WIDTH, max(1, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
             )
         with perf_timer("preview board detect", threshold_ms=40.0):

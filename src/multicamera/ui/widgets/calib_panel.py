@@ -429,7 +429,7 @@ class _PairRow(QFrame):
         self._lbl_name.setStyleSheet(f"font-size:13px; font-weight:bold; color:{TEXT};")
         top.addWidget(self._lbl_name, 1)
         self.btn = QPushButton("标定")
-        self.btn.setProperty("class", "primary")
+        self.btn.setProperty("class", "secondary")
         self.btn.setMinimumWidth(104)
         self.btn.setEnabled(False)
         top.addWidget(self.btn)
@@ -514,6 +514,8 @@ class CalibrationPanel(QWidget):
         self._aux_capture_sequence = CaptureSequence(build_multimodal_sequence())
         self._sections: List[CollapsibleSection] = []
         self._pair_rows: Dict[str, _PairRow] = {}
+        self._pair_failures = {}
+        self._active_calibration_pair = None
         self._undo_stack: List[tuple[List[_UndoCaptureEntry], bool]] = []
         self._pair_capture_press_count: Dict[str, int] = {}
         self._next_session_frame_idx: Optional[int] = None
@@ -549,7 +551,7 @@ class CalibrationPanel(QWidget):
         self._offline_lr_swapped = False
         self._offline_source_folder = None
         self._pending_import_folder = None
-        self._calib_strategy_key = "standard"
+        self._calib_strategy_key = "auto_validated"
         self._data_filter_key = "all"
         self._unavailable_cameras: set[str] = set()
         self._aux_ui_busy = False
@@ -807,6 +809,7 @@ class CalibrationPanel(QWidget):
 
     def _refresh_result_summary(self):
         rig = self._rig
+        validation_lines = []
         if rig is None:
             self._lbl_result_metrics.clear()
             self._lbl_result_summary.setText("采集数据已变化，请重新标定" if self._results_outdated else "尚无标定结果")
@@ -825,6 +828,8 @@ class CalibrationPanel(QWidget):
             metrics.extend(f'{aux.camera_id} · 融合 RMS {aux.rms_error:.3f} px · '
                            f'{aux.frame_count} 组' for aux in rig.aux_cameras.values())
             self._lbl_result_metrics.setText('\n'.join(metrics))
+            for name, pair in rig.pairs.items():
+                validation_lines.extend([name, *self._result_validation_lines(pair)])
             color = DANGER if decision.level == 'poor' else WARNING if decision.level == 'fair' else SUCCESS
             self._lbl_result_decision.setText(decision.title)
             self._lbl_result_decision.setStyleSheet(f'color:{color}; font-size:15px; font-weight:bold;')
@@ -835,6 +840,7 @@ class CalibrationPanel(QWidget):
                 lines.extend([name, f"左右内参 RMS  {pair.left_intrinsics.rms_error:.3f} / "
                               f"{pair.right_intrinsics.rms_error:.3f} px",
                               f"双目 RMS  {pair.stereo.rms_error:.3f} px", ""])
+                lines.extend(self._result_validation_lines(pair))
                 for key, title in (('left', '左内参'), ('right', '右内参'), ('stereo', '双目')):
                     selected = pair.calibration_info.get('selection', {}).get(key, {})
                     if not selected:
@@ -849,6 +855,8 @@ class CalibrationPanel(QWidget):
                 lines.extend([aux.camera_id, f"融合 RMS  {aux.rms_error:.3f} px · {aux.frame_count} 组", ""])
             lines.extend(['', *decision.details, '', *decision.risks])
             self._lbl_result_summary.setText("\n".join(lines).rstrip())
+        self._lbl_result_validation.setText('\n'.join(validation_lines))
+        self._lbl_result_validation.setVisible(bool(validation_lines))
         if self._result_directory is not None:
             directory = Path(self._result_directory)
             saved = [Path(path).name for path in self._result_files
@@ -890,6 +898,44 @@ class CalibrationPanel(QWidget):
         self._btn_open_results.setEnabled(self._result_directory is not None)
         self._btn_copy_results.setEnabled(self._result_directory is not None)
         self._btn_view_results.setEnabled(rig is not None)
+
+    @staticmethod
+    def _result_validation_lines(pair):
+        def number(value):
+            return (f'{value:.3f}' if isinstance(value, (int, float, np.number))
+                    and not isinstance(value, (bool, np.bool_)) and np.isfinite(value)
+                    and value >= 0 else '未记录')
+
+        info = pair.calibration_info
+        choice = info.get('model_selection', {})
+        lines = []
+        if choice.get('selected'):
+            selected = choice['selected']
+            label = {'standard': '标准', 'constrained': '受约束', 'rational': '有理模型'}.get(selected, selected)
+            row = choice.get('candidates', {}).get(selected, {})
+            validation = row.get('validation', {})
+            metric = number(validation.get('rms_px'))
+            lines.append('自动择模：' + label)
+            if metric != '未记录':
+                lines.append(f'留出预测 RMS {metric} px · {len(validation.get("folds", []))} 折（同序列）')
+            else:
+                lines.append('未完成留出验证：共同观测不足9对' if
+                    row.get('validation_status') == 'insufficient_views' else '留出验证未记录')
+            if choice.get('reason'):
+                lines.append('选择依据：' + choice['reason'])
+        else:
+            lines.append('自动择模与留出验证未记录（手动策略或历史结果）')
+        alignment = info.get('rectification', {})
+        if alignment.get('status') == 'ok':
+            lines.append(f'校正残差 RMS {number(alignment.get("rms_px"))} px · '
+                         f'P95 {number(alignment.get("p95_abs_px"))} px')
+            frames = [row for row in alignment.get('per_frame', [])
+                      if row.get('status') == 'ok' and number(row.get('max_abs_px')) != '未记录']
+            worst = max(frames, key=lambda row: row['max_abs_px']) if frames else None
+            source = f' · 帧 {worst.get("frame_id", "未记录")}' if worst else ' · 源帧未记录'
+            lines.append(f'最大单点校正残差 {number(alignment.get("max_abs_px"))} px'
+                         + source + '；建议逐帧复核')
+        return lines
 
     # ── UI construction ───────────────────────────────────────
 
@@ -1080,6 +1126,7 @@ class CalibrationPanel(QWidget):
         self._combo_model_pair = QComboBox()
         self._combo_model_pair.setAccessibleName('模型评估对象')
         self._combo_model_pair.currentTextChanged.connect(self._refresh_model_choice_ui)
+        model_row.addWidget(QLabel('评估对象'))
         model_row.addWidget(self._combo_model_pair, 1)
         self._btn_assess_model = QToolButton()
         self._btn_assess_model.setText('自动评估模型')
@@ -1107,6 +1154,20 @@ class CalibrationPanel(QWidget):
         self._btn_apply_model.hide()
         l1.addWidget(self._btn_apply_model)
 
+        self._btn_calibration_options = QToolButton()
+        self._btn_calibration_options.setText('标定设置')
+        self._btn_calibration_options.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_calibration_options.setIcon(app_icon('chevron-right'))
+        self._btn_calibration_options.setCheckable(True)
+        self._btn_calibration_options.setToolTip('优化策略与数据筛选')
+        l1.addWidget(self._btn_calibration_options)
+        self._calibration_options = QWidget()
+        options = QVBoxLayout(self._calibration_options)
+        options.setContentsMargins(0, 0, 0, 0)
+        options.setSpacing(6)
+        self._calibration_options.hide()
+        self._btn_calibration_options.toggled.connect(self._toggle_calibration_options)
+        l1.addWidget(self._calibration_options)
         strategy_row = QHBoxLayout()
         strategy_row.addWidget(QLabel("优化策略"))
         self._combo_calib_strategy = QComboBox()
@@ -1116,12 +1177,14 @@ class CalibrationPanel(QWidget):
         self._combo_calib_strategy.addItem("稳健：固定切向畸变/高阶畸变", "robust")
         self._combo_calib_strategy.addItem("联合精修：允许双目阶段微调内参", "joint_refine")
         self._combo_calib_strategy.addItem("自动校验择模：异常拦截与候选比较（推荐）", "auto_validated")
+        self._combo_calib_strategy.setCurrentIndex(self._combo_calib_strategy.findData('auto_validated'))
         self._combo_calib_strategy.setToolTip(
             "切换策略清空旧结果、保留原图观测；自动校验择模仅在当前针孔/鱼眼类型内比较，"
-            "自动更换候选至少需要9对共同观测，检查失败不生成可用结果"
+            "共同观测至少9对时标准模型也进行留出验证；不足时不自动更换候选，"
+            "检查失败不生成可用结果"
         )
         strategy_row.addWidget(self._combo_calib_strategy, 1)
-        l1.addLayout(strategy_row)
+        options.addLayout(strategy_row)
 
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("数据筛选"))
@@ -1135,7 +1198,7 @@ class CalibrationPanel(QWidget):
             "鱼眼兼容模式须明确选择：保留全部有效帧，双目阶段只使用跨帧共同 ID 的角点。"
         )
         filter_row.addWidget(self._combo_data_filter, 1)
-        l1.addLayout(filter_row)
+        options.addLayout(filter_row)
 
         # pair rows will be added here dynamically
         self._calib_container = QVBoxLayout()
@@ -1160,6 +1223,16 @@ class CalibrationPanel(QWidget):
         self._lbl_rect_preview.setStyleSheet(f"background:{BG_DARK};border-radius:4px;")
         self._lbl_rect_preview.hide()
         l1.addWidget(self._lbl_rect_preview)
+        self._btn_rect_expand = QToolButton()
+        self._btn_rect_expand.setText('放大校正图')
+        self._btn_rect_expand.setIcon(app_icon('maximize-2'))
+        self._btn_rect_expand.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_rect_expand.setToolTip('放大检查当前配对的校正图与参考线')
+        self._btn_rect_expand.clicked.connect(self._open_rectification_viewer)
+        self._btn_rect_expand.hide()
+        self._rect_preview_image = None
+        self._rectification_viewer = None
+        l1.addWidget(self._btn_rect_expand)
 
         self._quality_report = QTextEdit()
         self._quality_report.setReadOnly(True)
@@ -1367,6 +1440,11 @@ class CalibrationPanel(QWidget):
         self._lbl_result_metrics.setTextFormat(Qt.PlainText)
         self._lbl_result_metrics.setTextInteractionFlags(Qt.TextSelectableByMouse)
         results.addWidget(self._lbl_result_metrics)
+        self._lbl_result_validation = _WrappingLabel()
+        self._lbl_result_validation.setTextFormat(Qt.PlainText)
+        self._lbl_result_validation.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._lbl_result_validation.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        results.addWidget(self._lbl_result_validation)
         self._lbl_result_risks = _WrappingLabel()
         self._lbl_result_risks.setWordWrap(True)
         self._lbl_result_risks.setTextFormat(Qt.PlainText)
@@ -1647,7 +1725,7 @@ class CalibrationPanel(QWidget):
         self._action_footer.layout().setDirection(
             QBoxLayout.LeftToRight if compact else QBoxLayout.TopToBottom,
         )
-        self._footer_info.setMaximumWidth(280 if compact else 16777215)
+        self._footer_info.setMaximumWidth(300 if compact else 16777215)
         self._action_footer.layout().setStretch(0, 1 if compact else 0)
         self._action_footer.layout().setStretch(1, 2 if compact else 0)
         self._footer_info.layout().setSpacing(2 if compact else 6)
@@ -1655,10 +1733,27 @@ class CalibrationPanel(QWidget):
         self._lbl_capture_decision.setVisible(self._workflow_phase == 'capture'
                                               and self._active_step != 2 and not self.offline_selection)
 
+    def set_stereo_receipt(self, receipt):
+        _detach_from_layout(receipt)
+        self._capture_footer_layout.insertWidget(0, receipt)
+
     def _set_board_details(self, expanded):
         self._aux_board_details.setVisible(expanded)
         self._btn_board_details.setArrowType(Qt.NoArrow)
         self._btn_board_details.setIcon(app_icon('chevron-down' if expanded else 'chevron-right'))
+
+    def _toggle_calibration_options(self, expanded):
+        self._calibration_options.setVisible(expanded)
+        self._btn_calibration_options.setIcon(
+            app_icon('chevron-down' if expanded else 'chevron-right'))
+
+    def _refresh_calibration_options(self):
+        filtering = {'all': '全部数据', 'quality': '质量筛选', 'corners': '角点优先',
+                     'fisheye_common': '共同角点'}[self._combo_data_filter.currentData() or 'all']
+        self._btn_calibration_options.setText(
+            f'标定设置 · {self._calib_strategy_label().split("：")[0]} · {filtering}')
+        self._btn_calibration_options.setToolTip(
+            self._calib_strategy_label() + '\n' + self._data_filter_label())
 
     def _toggle_result_details(self, expanded):
         self._lbl_result_summary.setVisible(expanded)
@@ -1842,6 +1937,8 @@ class CalibrationPanel(QWidget):
 
     @Slot(str)
     def _on_capture_target_changed(self, text):
+        if text in self._sm.stereo_pairs:
+            self._combo_model_pair.setCurrentText(text)
         self._update_capture_stats()
         self._refresh_preview_pairs()
         self._refresh_capture_source_ui()
@@ -1899,13 +1996,20 @@ class CalibrationPanel(QWidget):
 
     def _sync_pair_states(self):
         self._refresh_model_choice_ui()
+        self._refresh_calibration_options()
         any_ready = False
         all_calibrated = True
+        populated = {name for name, cal in self._stereo_cals.items() if cal.num_frames}
 
         for name, row in self._pair_rows.items():
             cal = self._stereo_cals.get(name)
             done = name in self._pair_calibs
             ready = self._pair_data_ready(name)
+            row.setVisible(not populated or name in populated or done)
+            failure = self._pair_failures.get(name)
+            if failure and failure[0] != self._pair_failure_key(name):
+                self._pair_failures.pop(name, None)
+                failure = None
 
             if done:
                 pc = self._pair_calibs[name]
@@ -1950,10 +2054,30 @@ class CalibrationPanel(QWidget):
                 row.btn.setEnabled(False)
                 row.btn.setText("标定")
                 all_calibrated = False
+            if self._active_calibration_pair == name:
+                row.set_status('正在计算左右内参、双目外参及有效性检查…', ACCENT)
+                row.btn.setText('计算中')
+            elif failure:
+                summary = failure[1].split('；')[0]
+                row.set_status(f'标定未通过 · {summary}\n请检查模型或数据后重试', WARNING)
+                row._lbl_status.setToolTip(failure[1])
+                row.btn.setText('重试标定')
+            else:
+                row._lbl_status.setToolTip(row._lbl_status.text())
 
         self._btn_calib_all.setEnabled(any_ready)
         self._btn_frame_diagnostics.setEnabled(bool(self._pair_calibs))
-        self._btn_calib_all.setText('开始标定' if len(self._pair_rows) == 1 else '标定全部就绪组')
+        ready_names = [name for name in self._pair_rows if self._pair_data_ready(name)]
+        if self._active_calibration_pair:
+            self._btn_calib_all.setText('正在标定…')
+        elif len(ready_names) == 1:
+            self._btn_calib_all.setText('重新标定当前组' if ready_names[0] in self._pair_calibs
+                                        else '开始标定当前组')
+        else:
+            self._btn_calib_all.setText(f'标定全部就绪组（{len(ready_names)}）'
+                                        if ready_names else '等待有效数据')
+        self._btn_calib_all.setToolTip('标定对象：' + '、'.join(ready_names)
+                                       if ready_names else '左右内参与配对均须达到最少数量')
         if (self._calib_worker is not None or self._aux_dataset_busy() or self._stereo_import_worker is not None
                 or self._pending_save_tokens or self._failed_save_jobs):
             self._btn_calib_all.setEnabled(False)
@@ -2609,6 +2733,7 @@ class CalibrationPanel(QWidget):
 
         self._reset_offline_pair(pair_name, lid, rid, min_f)
         self._combo_pair.setCurrentText(pair_name)
+        self._combo_model_pair.setCurrentText(pair_name)
 
         for idx, img_l, img_r, det_l, det_r in img_pairs:
             if swapped:
@@ -2705,6 +2830,7 @@ class CalibrationPanel(QWidget):
         self._log('离线导入失败：' + message.splitlines()[0])
 
     def _reset_offline_pair(self, pair_name: str, lid: str, rid: str, min_f: int):
+        self._pair_failures.pop(pair_name, None)
         self._live_preview_indices.pop(pair_name, None)
         self._capture_reviews.pop(pair_name, None)
         from ...streaming.stream_manager import CameraConfig, StereoPairConfig
@@ -2808,7 +2934,7 @@ class CalibrationPanel(QWidget):
         self._lbl_capture_count.setText(f'{prefix} {mn_st} / {min_f}')
         if mn_st >= min_f:
             self._lbl_capture_count.setText(
-                f'{prefix} {mn_st} / {min_f} · 已达建议数量，可继续补拍；不代表精度达标')
+                f'{prefix} {mn_st} / {min_f} · 达到计算门槛；覆盖与精度待验证')
         self._lbl_capture_count.setWordWrap(True)
         self._cap_progress.setValue(min(mn_st, min_f))
         self._cap_progress.setVisible(mn_st > 0)
@@ -2913,9 +3039,12 @@ class CalibrationPanel(QWidget):
             for name, candidate in choice['candidates'].items():
                 metric = candidate.get('validation', {}).get('rms_px')
                 message = (f'留出 RMS {metric:.3f} px' if metric is not None else
-                           '有效性检查通过，未触发留出比较' if candidate['status'] == 'ok' else
+                           '共同观测不足9对，仅基础检查；未完成留出验证'
+                           if candidate.get('validation_status') == 'insufficient_views' else
+                           '未记录留出验证' if candidate['status'] == 'ok' else
                            candidate.get('error', '检查失败'))
-                lines.append(f"  - {labels.get(name, name)}: {message}")
+                state = '通过' if candidate['status'] == 'ok' else '未通过'
+                lines.append(f"  - {labels.get(name, name)}（{state}）: {message}")
 
         worst = min((q_l, q_r, q_s), key=lambda q: q.score)
         lines.append("")
@@ -2986,6 +3115,8 @@ class CalibrationPanel(QWidget):
         left_cal, right_cal, stereo_cal = self._intr_cals[lid], self._intr_cals[rid], cal
 
         self._invalidate_pair_result(pair_name)
+        self._pair_failures.pop(pair_name, None)
+        self._active_calibration_pair = pair_name
         self._set_calibration_busy(True)
         worker = PairCalibrationWorker(
             pair_name=pair_name,
@@ -3006,6 +3137,7 @@ class CalibrationPanel(QWidget):
         worker.failed.connect(self._on_pair_calibration_failed)
         worker.finished.connect(worker.deleteLater)
         self._calib_worker = worker
+        self._sync_pair_states()
         self._refresh_aux_readiness()
         worker.start()
 
@@ -3063,6 +3195,7 @@ class CalibrationPanel(QWidget):
         self._log(f"已切换数据筛选策略：{self._data_filter_label()}")
 
     def _clear_calibration_results(self):
+        self._pair_failures.clear()
         if self._pair_calibs or self._rig is not None or self._result_directory is not None:
             self._mark_results_outdated()
         self._clear_rect_preview()
@@ -3117,6 +3250,8 @@ class CalibrationPanel(QWidget):
         pair_calib,
     ):
         self._calib_worker = None
+        self._active_calibration_pair = None
+        self._pair_failures.pop(pair_name, None)
         self._intrinsics[lid] = intr_l
         self._intrinsics[rid] = intr_r
         self._pair_calibs[pair_name] = pair_calib
@@ -3151,6 +3286,8 @@ class CalibrationPanel(QWidget):
     @Slot(str, str)
     def _on_pair_calibration_failed(self, pair_name: str, message: str):
         self._calib_worker = None
+        self._active_calibration_pair = None
+        self._pair_failures[pair_name] = (self._pair_failure_key(pair_name), message.splitlines()[0])
         self._log(f"  {pair_name}: 标定失败 — {message.splitlines()[0]}")
         self._sync_pair_states()
         self._start_next_calibration()
@@ -3191,11 +3328,20 @@ class CalibrationPanel(QWidget):
                 tuple((id(cal), cal.data_revision if cal else None) for cal in cals),
                 id(stereo), tuple(stereo.frame_ids) if stereo else ())
 
+    def _pair_failure_key(self, name):
+        key = self._model_snapshot_key(name)
+        # Binding the first output session does not change failed observations.
+        return (self._camera_model, *key[:2], *key[3:]) if key is not None else None
+
     def _refresh_model_choice_ui(self, *_):
         if not hasattr(self, '_btn_assess_model'):
             return
         busy = self.has_active_background_tasks() or self._white_balance_guard.busy or self.has_failed_saves
-        self._btn_assess_model.setEnabled(not busy and bool(self._combo_model_pair.currentText()))
+        name = self._combo_model_pair.currentText()
+        stereo = self._stereo_cals.get(name)
+        self._btn_assess_model.setEnabled(not busy and stereo is not None and stereo.num_frames > 0)
+        self._btn_assess_model.setToolTip(f'评估 {name} 的针孔与鱼眼模型'
+                                         if stereo is not None and stereo.num_frames else '当前组没有可评估的观测')
         self._combo_model_pair.setEnabled(not busy)
         valid = (self._model_report is not None and self._model_report_key ==
                  self._model_snapshot_key(self._combo_model_pair.currentText()))
@@ -3306,30 +3452,42 @@ class CalibrationPanel(QWidget):
         self.data_source_changed.emit()
         self._log(f'已应用推荐模型 {self._camera_model.value}；原始观测保留，请重新标定')
 
-    def _clear_rect_preview(self):
+    def _clear_rect_preview(self, *, close_viewer=True):
+        self._rect_preview_image = None
+        self._btn_rect_expand.hide()
+        if close_viewer and self._rectification_viewer is not None:
+            self._rectification_viewer.close()
+            self._rectification_viewer.clear_image()
         self._lbl_rect_preview.clear()
         self._lbl_rect_preview.hide()
         self._lbl_rect_context.clear()
         self._lbl_rect_context.hide()
 
-    def _show_rect_preview(self, pair_name: str, pair: StereoPairCalibration):
-        self._clear_rect_preview()
-        sync = self._sm.get_sync_pair(pair_name)
+    def _show_rect_preview(self, pair_name: str, pair: StereoPairCalibration, *,
+                           images=None, source=None):
+        self._clear_rect_preview(close_viewer=False)
+        sync = images if images is not None else self._sm.get_sync_pair(pair_name)
         if sync is not None:
             left, right = sync
-            source = '实时配对'
+            source = source or '实时配对'
         else:
             frames = getattr(self, '_imported_pair_frames', {}).get(pair_name, [])
             if not frames:
+                self._clear_rect_preview()
                 return
             left, right = frames[-1]
             source = '该组最后导入配对'
         for image, intr in ((left, pair.left_intrinsics), (right, pair.right_intrinsics)):
             if image.shape[1::-1] != tuple(intr.image_size):
+                self._clear_rect_preview()
                 raise ValueError('预览原图尺寸与标定尺寸不一致，已隐藏校正预览')
         preview = self._evaluator.generate_rectification_preview(
             left, right, pair.stereo, num_lines=15
         )
+        rgb_full = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+        height, width = rgb_full.shape[:2]
+        self._rect_preview_image = QImage(
+            rgb_full.data, width, height, rgb_full.strides[0], QImage.Format_RGB888).copy()
         h, w = preview.shape[:2]
         tw = max(self._inspector_scroll.viewport().width() - 64, 100)
         sc = min(tw / max(w, 1), 160.0 / max(h, 1))
@@ -3341,9 +3499,36 @@ class CalibrationPanel(QWidget):
             self._lbl_rect_preview.setPixmap(QPixmap.fromImage(qimg))
             model = '鱼眼' if pair.stereo.model == CameraModel.FISHEYE else '针孔'
             self._lbl_rect_context.setText(f'校正预览 · {pair_name} · {model}模型 · {source}')
-            self._lbl_rect_context.setToolTip('左侧为左目、右侧为右目；参考线不代表已验证匹配。此图不随原图缩略图选择变化。')
+            self._lbl_rect_context.setToolTip('左侧为左目、右侧为右目；参考线不代表已验证匹配。选择原图可同步检查该帧校正图。')
             self._lbl_rect_context.show()
             self._lbl_rect_preview.show()
+            self._btn_rect_expand.show()
+            if self._rectification_viewer is not None:
+                self._rectification_viewer.set_image(self._rect_preview_image,
+                                                     self._lbl_rect_context.text())
+
+    def show_review_rectification(self, key, images):
+        for name, pair in self._pair_calibs.items():
+            if key.startswith(name + ' ') and pair.left_id in images and pair.right_id in images:
+                try:
+                    self._show_rect_preview(name, pair,
+                        images=(images[pair.left_id], images[pair.right_id]), source=f'原图 {key}')
+                except Exception as exc:
+                    self._clear_rect_preview()
+                    self._log(f'{name}: 所选帧校正预览失败：{exc}')
+                return
+        self._clear_rect_preview()
+
+    def _open_rectification_viewer(self):
+        if self._rect_preview_image is None:
+            return
+        if self._rectification_viewer is None:
+            from .rectification_viewer import RectificationViewer
+            self._rectification_viewer = RectificationViewer(self)
+        self._rectification_viewer.set_image(self._rect_preview_image, self._lbl_rect_context.text())
+        self._rectification_viewer.show()
+        self._rectification_viewer.fit()
+        self._rectification_viewer.raise_()
 
     # ── Multimodal auxiliary mono calibration ────────────────
 
@@ -4072,6 +4257,8 @@ class CalibrationPanel(QWidget):
         return frames[max(0, min(idx, len(frames) - 1))]
 
     def _reset_all(self):
+        self._pair_failures.clear()
+        self._active_calibration_pair = None
         self._lbl_capture_decision.clear()
         self._lbl_capture_decision.setToolTip('保存成功不代表通过标定验收；请核对本次原图结果。')
         self._clear_rect_preview()

@@ -101,6 +101,7 @@ class StereoCaptureWorkspace(QWidget):
         outer.setSpacing(6)
         outer.setAlignment(Qt.AlignTop)
         body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
         schematic_column = QVBoxLayout()
         self.schematic_title = QLabel("相机与目标示意")
         self.schematic_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -122,7 +123,6 @@ class StereoCaptureWorkspace(QWidget):
         self.status.setWordWrap(True)
         self.status.setMinimumWidth(205)
         body.addWidget(self.status, 1)
-        outer.addLayout(body)
         self.compact_summary = StableTextLabel(lines=7)
         self.compact_summary.setWordWrap(True)
         self.compact_summary.hide()
@@ -134,6 +134,28 @@ class StereoCaptureWorkspace(QWidget):
         self.receipt = StableTextLabel('本次原图：尚未采集', lines=2)
         self.receipt.setAccessibleName('最近原图采集结果')
         outer.addWidget(self.receipt)
+        # Keep acceptance feedback ahead of the optional illustration in short windows.
+        self.schematic_toggle = QToolButton()
+        self.schematic_toggle.setText('相机与目标示意')
+        self.schematic_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.schematic_toggle.setCheckable(True)
+        self.schematic_toggle.setChecked(True)
+        self.schematic_toggle.setIcon(app_icon('chevron-down'))
+        self.schematic_toggle.setToolTip('展开或收起姿态示意；不影响采图验收')
+        self.schematic_toggle.toggled.connect(self._toggle_schematic)
+        self.schematic_body = QWidget()
+        self.schematic_body.setLayout(body)
+        schematic_actions = QHBoxLayout()
+        schematic_actions.addWidget(self.schematic_toggle)
+        schematic_actions.addStretch()
+        for button in (self.schematic.pause, self.schematic.replay, self.schematic.expand):
+            self.schematic.layout().itemAt(0).layout().removeWidget(button)
+            schematic_actions.addWidget(button)
+        self.schematic_actions = QWidget()
+        schematic_actions.setContentsMargins(0, 0, 0, 0)
+        self.schematic_actions.setLayout(schematic_actions)
+        outer.addWidget(self.schematic_actions)
+        outer.addWidget(self.schematic_body)
 
         self.distance_tools = QWidget()
         distance_row = QGridLayout(self.distance_tools)
@@ -165,7 +187,7 @@ class StereoCaptureWorkspace(QWidget):
         distance_row.addWidget(self.btn_resume_guidance, 0, 2)
         distance_row.setColumnStretch(3, 1)
         self.distance_tools.installEventFilter(self)
-        outer.insertWidget(0, self.distance_tools)
+        outer.insertWidget(1, self.distance_tools)
 
         self.coverage_button = QToolButton()
         self.coverage_button.setCheckable(True)
@@ -419,6 +441,10 @@ class StereoCaptureWorkspace(QWidget):
     def _toggle_details(self, expanded):
         self.details.setVisible(expanded)
         self.coverage_button.setIcon(app_icon('chevron-down' if expanded else 'chevron-right'))
+
+    def _toggle_schematic(self, expanded):
+        self.schematic_body.setVisible(expanded)
+        self.schematic_toggle.setIcon(app_icon('chevron-down' if expanded else 'chevron-right'))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -948,9 +974,9 @@ class StereoCaptureWorkspace(QWidget):
                                        + '\n' + self.pose_status.toolTip())
         if offline:
             counts = self.view.displayed_corner_counts()
-            origin = self.view.review_detection_origin if self.view.review_key else '缩放检测'
+            origin = self.view.review_detection_origin if self.view.review_key else '原图分辨率检测'
             if origin == '预览重检':
-                origin += '，缩放检测'
+                origin += '，原图分辨率检测'
             current = '  '.join(
                 f'{label} {counts.get(camera.camera_id) if counts.get(camera.camera_id) is not None else "未显示"}'
                 f'/{self.board.num_corners}' for label, camera in cameras
@@ -961,10 +987,15 @@ class StereoCaptureWorkspace(QWidget):
                 '\n数据集累计：板角点 ID / 视场网格\n' + '  '.join(self._coverage_summary)
             )
             self.status.setText(self.compact_summary.text())
+        self.compact_summary.set_lines(8 if offline else 4)
+        self.schematic_toggle.setVisible(not offline)
+        self.schematic_actions.setVisible(not offline)
+        self.schematic_body.setVisible(not offline and self.schematic_toggle.isChecked())
+        self.schematic_title.setVisible(not self._compact)
         self.coverage_button.setToolTip(
             self.panel._lbl_capture_count.text() + '\n' + '  '.join(self._coverage_summary) +
             "\n数据集累计：所有已采图出现过的板角点 ID 比例 / 4×4 视场网格占比。"
-            "不是当前帧完整度或姿态覆盖率；当前预览角点可能因缩放检测少于原图检测。",
+            "不是当前帧完整度或姿态覆盖率；预览按原图分辨率检测，与点击采图并非同一帧。",
         )
         self.coverage_button.setText(
             "数据分析" if self._compact else

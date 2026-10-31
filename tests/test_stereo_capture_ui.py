@@ -113,7 +113,9 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
             assert control.height() >= control.minimumSizeHint().height()
         assert guide.instruction.height() >= guide.instruction.fontMetrics().height()
         assert win._preview_scroll.horizontalScrollBar().maximum() == 0
-        assert win._preview_scroll.verticalScrollBar().maximum() == 0
+        assert win._preview_scroll.verticalScrollBar().maximum() == 0, (
+            win.size(), panel._action_footer.height(), win._preview_scroll.height(),
+            guide.minimumSizeHint(), panel._footer_pages.sizeHint())
         assert win._guide_scroll.horizontalScrollBar().maximum() == 0
         viewport = win._preview_scroll.viewport()
         for tile in win._stream_view._views.values():
