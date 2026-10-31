@@ -1161,6 +1161,10 @@ class CalibrationPanel(QWidget):
         self._btn_calibration_options.setCheckable(True)
         self._btn_calibration_options.setToolTip('优化策略与数据筛选')
         l1.addWidget(self._btn_calibration_options)
+        self._lbl_calibration_options_summary = _WrappingLabel()
+        self._lbl_calibration_options_summary.setTextFormat(Qt.PlainText)
+        self._lbl_calibration_options_summary.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        l1.addWidget(self._lbl_calibration_options_summary)
         self._calibration_options = QWidget()
         options = QVBoxLayout(self._calibration_options)
         options.setContentsMargins(0, 0, 0, 0)
@@ -1750,8 +1754,8 @@ class CalibrationPanel(QWidget):
     def _refresh_calibration_options(self):
         filtering = {'all': '全部数据', 'quality': '质量筛选', 'corners': '角点优先',
                      'fisheye_common': '共同角点'}[self._combo_data_filter.currentData() or 'all']
-        self._btn_calibration_options.setText(
-            f'标定设置 · {self._calib_strategy_label().split("：")[0]} · {filtering}')
+        self._lbl_calibration_options_summary.setText(
+            f'策略：{self._calib_strategy_label().split("：")[0]} · 数据：{filtering}')
         self._btn_calibration_options.setToolTip(
             self._calib_strategy_label() + '\n' + self._data_filter_label())
 

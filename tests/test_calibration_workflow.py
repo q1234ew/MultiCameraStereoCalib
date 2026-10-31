@@ -414,12 +414,17 @@ def test_toolbar_tools_and_session_remain_accessible_at_all_sizes(window, app, s
     assert window.statusBar().toolTip() == ''
 
 
-@pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
+@pytest.mark.parametrize('control_metrics', ['default', 'wide'])
+@pytest.mark.parametrize('size', [(1000, 680), (1001, 681), (1280, 800), (1440, 1024)])
 @pytest.mark.parametrize('phase', ['calibration', 'results'])
-def test_long_result_text_wraps_without_clipping_or_horizontal_scroll(window, rig, app, size, phase):
+def test_long_result_text_wraps_without_clipping_or_horizontal_scroll(
+        window, rig, app, size, phase, control_metrics):
     configure_application_style(app)
     seed_observations(window)
     panel = window._calib_panel
+    if control_metrics == 'wide':
+        # Exercise larger platform/font metrics without depending on installed Windows fonts.
+        panel.setStyleSheet('QToolButton { font-size:16px; padding-left:9px; padding-right:10px; }')
     panel._pair_calibs = dict(rig.pairs)
     panel._sync_pair_states()
     panel.set_result_model(rig)
@@ -431,9 +436,16 @@ def test_long_result_text_wraps_without_clipping_or_horizontal_scroll(window, ri
     panel.show_workflow(phase)
     app.processEvents()
     app.processEvents()
-    assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
+    scroll = panel._inspector_scroll
+    assert scroll.horizontalScrollBar().maximum() == 0, {
+        'phase': phase, 'size': size, 'metrics': control_metrics,
+        'viewport': scroll.viewport().size().toTuple(),
+        'content': scroll.widget().size().toTuple(),
+        'minimum': scroll.widget().minimumSizeHint().toTuple(),
+    }
     labels = ([panel._lbl_result_storage, panel._lbl_result_decision] if phase == 'results'
-              else [panel._pair_rows['rgb']._lbl_status, panel._lbl_calib_hint, panel._lbl_model_choice])
+              else [panel._pair_rows['rgb']._lbl_status, panel._lbl_calib_hint,
+                    panel._lbl_model_choice, panel._lbl_calibration_options_summary])
     for label in labels:
         assert label.isVisible()
         assert label.hasHeightForWidth()

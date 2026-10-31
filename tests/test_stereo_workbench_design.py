@@ -106,6 +106,38 @@ def test_calibration_settings_and_primary_action_hierarchy(window, app):
     assert 'rgb' in panel._btn_calib_all.toolTip()
 
 
+def test_calibration_summary_tracks_options_without_widening_button(window, app):
+    seed_observations(window)
+    panel = window._calib_panel
+    panel.show_workflow('calibration', False)
+    window.resize(1000, 680)
+    window.show()
+    app.processEvents()
+    button = panel._btn_calibration_options
+    width = button.minimumSizeHint().width()
+    summary = panel._lbl_calibration_options_summary
+    for strategy in ('standard', 'joint_refine', 'auto_validated'):
+        panel._combo_calib_strategy.setCurrentIndex(panel._combo_calib_strategy.findData(strategy))
+        for filtering in ('quality', 'fisheye_common', 'all'):
+            panel._combo_data_filter.setCurrentIndex(panel._combo_data_filter.findData(filtering))
+            app.processEvents()
+            assert button.text() == '标定设置'
+            assert button.minimumSizeHint().width() == width
+            assert panel._calib_strategy_label().split('：')[0] in summary.text()
+            assert '数据：' in summary.text()
+            assert summary.isVisible() and summary.wordWrap()
+            assert summary.height() >= summary.heightForWidth(summary.width())
+            assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
+            button.click()
+            app.processEvents()
+            assert not panel._calibration_options.isHidden()
+            assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
+            button.click()
+            app.processEvents()
+            assert panel._calibration_options.isHidden()
+            assert summary.isVisible()
+
+
 def test_busy_and_failed_rows_never_claim_ready(window):
     seed_observations(window)
     panel = window._calib_panel
