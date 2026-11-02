@@ -56,6 +56,7 @@ from ...calibration.assessment import (
     Grade,
 )
 from ...calibration.intrinsic import IntrinsicCalibrator
+from ...calibration.frame_review import frame_review_log_lines, review_pair_frames
 from ...calibration.capture_quality import assess_stereo_capture
 from ...calibration.aux_capture_quality import assess_aux_frame, quality_reason_text
 from ...calibration.aux_guidance import duplicate_pair
@@ -551,6 +552,7 @@ class CalibrationPanel(QWidget):
         self._pending_aux_context = None
         self._offline_import_records = []
         self._offline_frame_qualities = {}
+        self._offline_source_paths = {}
         self._offline_lr_swapped = False
         self._offline_source_folder = None
         self._pending_import_folder = None
@@ -680,6 +682,7 @@ class CalibrationPanel(QWidget):
             self._undo_stack = [(entries, advanced) for entries, advanced in self._undo_stack if entries]
             if "offline" in impact.changed_pairs:
                 self._offline_import_records.clear()
+                self._offline_source_paths.clear()
                 self._btn_swap_offline.setVisible(False)
                 for attr in ("_imported_frames", "_import_last_pair", "_import_view_idx"):
                     if hasattr(self, attr):
@@ -2960,6 +2963,7 @@ class CalibrationPanel(QWidget):
     @Slot(object)
     def _on_import_images_ready(self, img_pairs):
         self._offline_frame_qualities = dict(getattr(self._stereo_import_worker, 'frame_qualities', {}))
+        self._offline_source_paths = dict(getattr(self._stereo_import_worker, 'source_paths', {}))
         self._stereo_import_worker = None
         self._set_import_busy(False)
         self._log(f"导入 {len(img_pairs)} 对图片")
@@ -3511,6 +3515,7 @@ class CalibrationPanel(QWidget):
             pair_calib.calibration_info['model_assessment'] = self._model_report
 
         self._sync_pair_states()
+        self._log_pair_frame_review(pair_calib)
         self._publish_rig_for_export()
         try:
             q_l = self._evaluator.evaluate_intrinsic(intr_l)
@@ -3534,6 +3539,32 @@ class CalibrationPanel(QWidget):
             logger.exception("Rectification preview failed: pair=%s", pair_name)
             self._log(f"{pair_name}: 校正预览失败（标定结果已生成）：{exc}")
         self._start_next_calibration()
+
+    def _log_pair_frame_review(self, pair_calib):
+        name = pair_calib.pair_name
+        try:
+            sources = {}
+            if name == 'offline':
+                sources = {key: paths[::-1] if self._offline_lr_swapped else paths
+                           for key, paths in self._offline_source_paths.items()}
+            else:
+                for entries, _ in self._undo_stack:
+                    for entry in entries:
+                        if (entry.pair_name != name or entry.session is None
+                                or entry.session_frame_idx is None
+                                or entry.save_token not in self._saved_capture_tokens):
+                            continue
+                        idx = entry.session_frame_idx
+                        folder = entry.session.session_dir / entry.session.IMAGES_DIR / name
+                        sources[f'{idx:04d}'] = tuple(str(folder / f'{side}_{idx:04d}.png')
+                                                    for side in ('left', 'right'))
+            report = review_pair_frames(pair_calib)
+            pair_calib.calibration_info['frame_review'] = report
+            for line in frame_review_log_lines(name, report, sources):
+                self._log(line)
+        except Exception as exc:
+            logger.exception('Post-calibration frame review failed: pair=%s', name)
+            self._log(f'{name}: 逐对检查未完成（标定结果保留），请打开逐帧误差检查：{exc}')
 
     @Slot(str, str)
     def _on_pair_calibration_failed(self, pair_name: str, message: str):
@@ -4545,6 +4576,7 @@ class CalibrationPanel(QWidget):
         self._aux_observation_board = None
         self._offline_import_records = []
         self._offline_frame_qualities = {}
+        self._offline_source_paths = {}
         self._offline_lr_swapped = False
         self._offline_source_folder = None
         self._pending_import_folder = None

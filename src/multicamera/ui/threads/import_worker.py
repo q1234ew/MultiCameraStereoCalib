@@ -31,6 +31,7 @@ class StereoImageImportWorker(QThread):
         self.folder = folder
         self.board = board
         self.frame_qualities = {}
+        self.source_paths = {}
 
     def run(self):
         try:
@@ -51,6 +52,7 @@ class StereoImageImportWorker(QThread):
             detector = CharucoDetector(self.board)
             assessor = DataAssessor()
             self.frame_qualities = {}
+            self.source_paths = {}
             imported = []
             skipped = 0
             for idx, lp, rp in pairs:
@@ -73,6 +75,7 @@ class StereoImageImportWorker(QThread):
                     assessor.assess_frame(img_r, det_r.num_corners, len(imported)),
                 )
                 imported.append((idx, img_l, img_r, det_l, det_r))
+                self.source_paths[str(idx)] = (str(lp.resolve()), str(rp.resolve()))
 
             if not imported:
                 self.failed.emit("未能加载任何有效图片对，请检查图片格式或文件是否损坏")

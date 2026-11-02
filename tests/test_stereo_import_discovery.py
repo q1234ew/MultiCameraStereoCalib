@@ -57,4 +57,5 @@ def test_unpaired_image_is_reported_without_misleading_pair_count(app, tmp_path)
     worker.run()
     assert results.count() == 1 and failures.count() == 0
     assert len(results.at(0)[0]) == 1
+    assert worker.source_paths == {'0001': tuple(str(path.resolve()) for path in paths)}
     assert any('1 张图片未参与配对' in logs.at(i)[0] for i in range(logs.count()))
