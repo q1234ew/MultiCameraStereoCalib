@@ -57,6 +57,7 @@ class AuxGuidanceAnalysis:
     initial_total: int = 17
     summary: str = ''
     poses: list = field(default_factory=list)
+    sample_decisions: dict[str, str] = field(default_factory=dict)
 
 
 def board_adapter(board):
@@ -148,21 +149,27 @@ def _bootstrap(board, model, detections):
 
 def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
     clean = []
+    decisions = {}
     duplicates = 0
     expected = None
-    for _, rgb, aux in pairs:
+    for key, rgb, aux in pairs:
+        key = str(key)
         pair = tuple(_validated_detection(d, board) for d in (rgb, aux))
         if any(d is None for d in pair):
+            decisions[key] = 'invalid_detection'
             continue
         sizes = tuple(d.image_size for d in pair)
         if expected is None:
             expected = sizes
         if sizes != expected:
+            decisions[key] = 'size_mismatch'
             continue
         if duplicate_pair(pair, clean):
             duplicates += 1
+            decisions[key] = 'duplicate'
             continue
         clean.append(pair)
+        decisions[key] = 'included'
     fitted = []
     for i, supplied in enumerate(intrinsics):
         size = expected[i] if expected else getattr(supplied, 'image_size', ())
@@ -225,21 +232,21 @@ def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
         target = fit_target(board, target, expected[1])
         if target is None:
             phase = 'blocked'
-    summary = (f'非重复 {len(clean)} 组 · 重复 {duplicates} 组 · 双路姿态可解 {verified} 组\n'
-               + '可信 IR 距离：' + ' / '.join(f'{DISTANCE_NAMES[s]} {counts[s]}'
+    summary = (f'引导采用 {len(clean)} 组 · 重复构图 {duplicates} 组 · 双路姿态可解 {verified} 组\n'
+               + '可信辅助相机距离：' + ' / '.join(f'{DISTANCE_NAMES[s]} {counts[s]}'
                                                 for s in ('large', 'medium', 'small')))
     return AuxGuidanceAnalysis(phase, target, len(clean), duplicates, verified, dict(counts),
                                missing, tuple(fitted), min(repairs, MAX_REPAIRS), len(plan),
-                               summary, poses)
+                               summary, poses, decisions)
 
 
-def guidance_action(board, target, qualities):
+def guidance_action(board, target, qualities, *, auxiliary_label='红外'):
     """Return one current action; diagram tilt follows that action, not a future step."""
     if target is None:
-        return 'complete', '本轮采集完成，可以前往标定评估；仍可继续补拍'
+        return 'complete', '本轮引导结束，可继续补拍；满足标定条件后可计算'
     if len(qualities) != 2 or not all(q.accepted for q in qualities):
         reasons = [f'{name}：' + '、'.join(quality_reason_text(r) for r in q.reasons) for name, q in
-                   zip(('RGB', 'IR/辅助'), qualities) if not q.accepted]
+                   zip(('RGB左目', auxiliary_label), qualities) if not q.accepted]
         return 'quality', '；'.join(reasons) or '让同一块标定板同时完整进入两路画面'
     aux = qualities[1]
     area = aux.metrics.get('area', 0.)
@@ -247,7 +254,7 @@ def guidance_action(board, target, qualities):
     if reliable:
         area = aux.pose['distance_area']
     low, high = AREA_RANGES[target.scale]
-    suffix = '' if reliable else '（按 IR 占比近似）'
+    suffix = '' if reliable else f'（按{auxiliary_label}画面占比近似）'
     if area < low:
         return 'distance', '板面先正对相机，再靠近镜头；保持当前高度' + suffix
     if area >= high:
@@ -256,7 +263,7 @@ def guidance_action(board, target, qualities):
     desired = np.array([(target.col + .5) / 3, (target.row + .5) / 3])
     if np.linalg.norm(center - desired) > .16:
         zone = (('左上', '上方', '右上'), ('左侧', '中央', '右侧'), ('左下', '下方', '右下'))
-        return 'position', f'移至 IR 画面{zone[target.row][target.col]}；保持距离，兼顾 RGB 共视'
+        return 'position', f'移至{auxiliary_label}画面{zone[target.row][target.col]}；保持距离，兼顾RGB左目共视'
     pose = qualities[0].pose
     labels = {'front': '将板面正对镜头', 'left': '让标定板左边靠近镜头',
               'right': '让标定板右边靠近镜头', 'up': '让标定板上边靠近镜头',

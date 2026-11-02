@@ -20,7 +20,7 @@ from ...calibration.models import CameraModel
 from ...calibration.adaptive_guidance import (
     DISTANCE_LABELS, GuidanceObservation, evaluate_distance, measure_pose, measure_composition,
     _candidate_feasible, reliable_distance_pose, MAX_DISTANCE_REPAIR_REQUESTS, SCALE_AREA_RANGES,
-    pose_matches_tilt,
+    pose_matches_tilt, BOOTSTRAP_MIN_VIEWS, guidance_reason_text,
 )
 from ...calibration.observations import similar_composition
 from ..threads.guidance_worker import GuidanceWorker
@@ -57,52 +57,83 @@ class StereoCaptureWorkspace(QWidget):
         self._distance_scope = None
         self._distance_session = None
         self._instruction_stage = 'waiting'
+        self.receipt_key = None
         self._adaptive_sequence = CaptureSequence([CaptureTarget(1, 1, BoardTilt.FRONT)])
         self.banner = QWidget()
         banner_layout = QVBoxLayout(self.banner)
-        banner_layout.setContentsMargins(14, 2, 14, 2)
-        banner_layout.setSpacing(0)
-        banner = QHBoxLayout()
-        banner_layout.addLayout(banner)
+        banner_layout.setContentsMargins(0, 0, 0, 8)
+        banner_layout.setSpacing(4)
+        self.current_title = QLabel('当前动作')
+        self.current_title.setObjectName('workbenchSectionTitle')
+        current_heading = QHBoxLayout()
+        current_heading.setContentsMargins(0, 0, 0, 0)
+        current_heading.addWidget(self.current_title, 1)
+        banner_layout.addLayout(current_heading)
         self.banner.setObjectName('stereoCaptureBanner')
         self.banner.setStyleSheet(
-            f"QWidget#stereoCaptureBanner {{background:#202830; border-bottom:1px solid {BORDER};}}"
+            f"QWidget#stereoCaptureBanner {{border-bottom:1px solid {BORDER};}}"
             "QWidget#stereoCaptureBanner QLabel {background:transparent; border:none;}"
         )
         self.instruction = StableTextLabel("连接左右相机并放入标定板", lines=2)
         self.instruction.setWordWrap(True)
+        self.instruction.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.instruction.setStyleSheet(
-            f"color:{ACCENT}; font-size:18px; font-weight:bold; background:transparent;"
+            f"font-size:16px; font-weight:bold; background:transparent; border-left:3px solid {ACCENT};"
         )
-        banner.addWidget(self.instruction, 2)
+        banner_layout.addWidget(self.instruction)
         self.reason = StableTextLabel("固定采图计划 · 等待实时检测", lines=2)
         self.reason.setWordWrap(True)
-        self.reason.setStyleSheet('background:transparent;')
-        banner.addWidget(self.reason, 1)
+        self.reason.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.reason.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px; background:transparent;')
+        banner_layout.addWidget(self.reason)
+        self.policy_controls = QWidget()
+        banner = QHBoxLayout(self.policy_controls)
+        banner.setContentsMargins(0, 0, 0, 0)
+        banner.setSpacing(6)
         self.guide_mode = QComboBox()
         self.guide_mode.addItem('自适应引导', 'adaptive')
         self.guide_mode.addItem('固定采图计划', 'fixed')
         self.guide_mode.setAccessibleName('采图引导策略')
+        self.guide_mode.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.guide_mode.currentIndexChanged.connect(self.refresh)
         banner.addWidget(self.guide_mode)
+        self.btn_retry_guidance = QToolButton()
+        self.btn_retry_guidance.setIcon(app_icon('rotate-ccw'))
+        self.btn_retry_guidance.setToolTip('重新分析采图建议')
+        self.btn_retry_guidance.setAccessibleName('重新分析采图建议')
+        self.btn_retry_guidance.setStyleSheet('padding:1px;')
+        self.btn_retry_guidance.setFixedSize(24, 24)
+        policy = self.btn_retry_guidance.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.btn_retry_guidance.setSizePolicy(policy)
+        self.btn_retry_guidance.clicked.connect(self._retry_guidance)
+        banner.addWidget(self.btn_retry_guidance)
         self.pair = QComboBox()
         self.pair.setMaximumWidth(220)
+        self.pair.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.pair.setAccessibleName("双目采集目标")
         self.pair.currentTextChanged.connect(self._select_pair)
         banner.addWidget(self.pair)
-        self.next_step = StableTextLabel('后续安排：等待相机与采集任务就绪', lines=1)
+        self.next_title = QLabel('下一步安排')
+        self.next_title.setStyleSheet(f'color:{ACCENT}; font-weight:bold;')
+        banner.removeWidget(self.btn_retry_guidance)
+        current_heading.addWidget(self.btn_retry_guidance)
+        banner_layout.addWidget(self.next_title)
+        self.next_step = StableTextLabel('后续安排：等待相机与采集任务就绪', lines=3)
         self.next_step.setAccessibleName('后续采图安排')
         self.next_step.setWordWrap(True)
-        self.next_step.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        self.next_step.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.next_step.setStyleSheet(f'color:{TEXT_DIM}; font-size:13px;')
         banner_layout.addWidget(self.next_step)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 0, 6, 0)
+        outer.setContentsMargins(10, 0, 10, 8)
         outer.setSpacing(6)
         outer.setAlignment(Qt.AlignTop)
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         schematic_column = QVBoxLayout()
+        schematic_column.setAlignment(Qt.AlignTop)
         self.schematic_title = QLabel("相机与目标示意")
         self.schematic_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         schematic_column.addWidget(self.schematic_title)
@@ -112,13 +143,15 @@ class StereoCaptureWorkspace(QWidget):
         self.pose = QLabel("当前姿态（相对左相机）\n\n距离  待内参\n左右倾  待内参\n上下倾  待内参")
         self.pose.setWordWrap(True)
         self.pose.setMinimumWidth(165)
-        pose_column = QVBoxLayout()
+        self.pose_column = QWidget()
+        pose_column = QVBoxLayout(self.pose_column)
+        pose_column.setContentsMargins(0, 0, 0, 0)
         pose_column.addWidget(self.pose)
         self.pose_status = QLabel("姿态：待人工确认")
         self.pose_status.setWordWrap(True)
         self.pose_status.setStyleSheet(f"color:{WARNING};")
         pose_column.addWidget(self.pose_status)
-        body.addLayout(pose_column, 1)
+        body.addWidget(self.pose_column, 1)
         self.status = QLabel("采集状态\n\n双路可见：等待检测\n清晰度：待检测\n运动稳定：待检测\n目标位置：待检测")
         self.status.setWordWrap(True)
         self.status.setMinimumWidth(205)
@@ -126,14 +159,13 @@ class StereoCaptureWorkspace(QWidget):
         self.compact_summary = StableTextLabel(lines=7)
         self.compact_summary.setWordWrap(True)
         self.compact_summary.hide()
-        outer.addWidget(self.compact_summary)
+        self.compact_summary.setAccessibleName('实时板点清晰稳定摘要')
         self.advice = StableTextLabel("建议补拍不同位置和倾角", lines=3)
         self.advice.setWordWrap(True)
         self.advice.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         outer.addWidget(self.advice)
         self.receipt = StableTextLabel('本次原图：尚未采集', lines=2)
         self.receipt.setAccessibleName('最近原图采集结果')
-        outer.addWidget(self.receipt)
         # Keep acceptance feedback ahead of the optional illustration in short windows.
         self.schematic_toggle = QToolButton()
         self.schematic_toggle.setText('相机与目标示意')
@@ -141,6 +173,10 @@ class StereoCaptureWorkspace(QWidget):
         self.schematic_toggle.setCheckable(True)
         self.schematic_toggle.setChecked(True)
         self.schematic_toggle.setIcon(app_icon('chevron-down'))
+        self.schematic_toggle.setFixedHeight(28)
+        self.schematic_toggle.setStyleSheet(
+            f'color:{ACCENT}; border:none; background:transparent; padding:2px 0;'
+        )
         self.schematic_toggle.setToolTip('展开或收起姿态示意；不影响采图验收')
         self.schematic_toggle.toggled.connect(self._toggle_schematic)
         self.schematic_body = QWidget()
@@ -149,6 +185,8 @@ class StereoCaptureWorkspace(QWidget):
         schematic_actions.addWidget(self.schematic_toggle)
         schematic_actions.addStretch()
         for button in (self.schematic.pause, self.schematic.replay, self.schematic.expand):
+            button.setStyleSheet('padding:2px;')
+            button.setFixedSize(28, 28)
             self.schematic.layout().itemAt(0).layout().removeWidget(button)
             schematic_actions.addWidget(button)
         self.schematic_actions = QWidget()
@@ -156,6 +194,34 @@ class StereoCaptureWorkspace(QWidget):
         self.schematic_actions.setLayout(schematic_actions)
         outer.addWidget(self.schematic_actions)
         outer.addWidget(self.schematic_body)
+        self.live_title = QLabel('实时检查')
+        self.live_title.setObjectName('workbenchSectionTitle')
+        outer.addWidget(self.live_title)
+        outer.addWidget(self.compact_summary)
+        self.live_checks = QWidget()
+        checks = QGridLayout(self.live_checks)
+        checks.setContentsMargins(0, 0, 0, 0)
+        checks.setVerticalSpacing(6)
+        checks.setHorizontalSpacing(6)
+        checks.setColumnMinimumWidth(2, 16)
+        self.check_values = {}
+        for index, (key, title) in enumerate((('points', '双路板点'), ('sharp', '清晰度'),
+                                              ('stable', '稳定性'), ('pair', '视频配对'))):
+            row, column = index // 2, (index % 2) * 3
+            label = QLabel(title)
+            label.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+            checks.addWidget(label, row, column)
+            value = QLabel('待检查')
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value.setMinimumWidth(0)
+            self.check_values[key] = value
+            checks.addWidget(value, row, column + 1)
+        checks.setColumnStretch(1, 1)
+        checks.setColumnStretch(4, 1)
+        outer.addWidget(self.live_checks)
+        self.capture_verdict = StableTextLabel('等待实时检测', lines=2)
+        self.capture_verdict.setAccessibleName('当前预览采集条件')
+        outer.addWidget(self.capture_verdict)
 
         self.distance_tools = QWidget()
         distance_row = QGridLayout(self.distance_tools)
@@ -187,7 +253,7 @@ class StereoCaptureWorkspace(QWidget):
         distance_row.addWidget(self.btn_resume_guidance, 0, 2)
         distance_row.setColumnStretch(3, 1)
         self.distance_tools.installEventFilter(self)
-        outer.insertWidget(1, self.distance_tools)
+        outer.addWidget(self.distance_tools)
 
         self.coverage_button = QToolButton()
         self.coverage_button.setCheckable(True)
@@ -196,12 +262,17 @@ class StereoCaptureWorkspace(QWidget):
         self.coverage_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.coverage_button.setAccessibleName("展开覆盖分析与采集设置")
         outer.addWidget(self.coverage_button)
+        self.coverage_summary = StableTextLabel(lines=4)
+        self.coverage_summary.setAccessibleName('数据集累计覆盖统计')
+        self.coverage_summary.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        panel._sections[0].content_layout.insertWidget(0, self.coverage_summary)
         self.details = QScrollArea()
         self.details.setWidgetResizable(True)
         self.details.setMaximumHeight(220)
         self.details.hide()
         self.coverage_button.toggled.connect(self._toggle_details)
         outer.addWidget(self.details)
+        panel._sections[0].content_layout.insertWidget(0, self.policy_controls)
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.refresh)
@@ -367,6 +438,13 @@ class StereoCaptureWorkspace(QWidget):
                             rec.target_center, rec.target_area, result.tilt_counts)
         self.refresh()
 
+    def _retry_guidance(self):
+        if not self.btn_retry_guidance.isEnabled() or not self.adaptive:
+            return
+        self._requested_key = None
+        self._guidance_error = ''
+        self.refresh()
+
     def _target(self):
         key, _ = self._guidance_context()
         if self.adaptive and key is not None and self._distance_override:
@@ -425,7 +503,9 @@ class StereoCaptureWorkspace(QWidget):
                  for pair, offset in zip(pairs, range(0, len(samples), 2))
                  for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
         if not poses or any(p is None for p in poses):
-            return False, '倾角待内参；可手动采集基础样本'
+            if self._analysis and self._analysis.recommendation.pose_available:
+                return False, '当前倾角估计不可用；请检查可见角点与模型'
+            return False, '倾角待内参；初始建模需手动采图，无需等待绿色提示'
         def matches(p):
             tilt = dict(zip(BoardTilt, ('front', 'left', 'right', 'up', 'down')))[target.tilt]
             return pose_matches_tilt(p, tilt)
@@ -499,12 +579,21 @@ class StereoCaptureWorkspace(QWidget):
             self.refresh()
 
     def _detection_sample(self, detection, frame):
-        result = {'valid': False, 'detection': detection, 'sharp': False, 'stable': False}
-        if not detection.valid or frame.shape[1::-1] != tuple(detection.image_size):
+        result = {'valid': False, 'detected': detection.num_corners > 0,
+                  'detection': detection, 'sharp': False, 'stable': False}
+        if not detection.valid:
+            if result['detected']:
+                result['guidance_reason'] = 'insufficient_points'
             return result
+        if frame.shape[1::-1] != tuple(detection.image_size):
+            result['guidance_reason'] = 'inconsistent_image_size'
+            return result
+        reasons = []
         geometry = measure_composition(self.panel._board, GuidanceObservation(
-            detection.charuco_corners, detection.charuco_ids, detection.image_size, 'preview'))
+            detection.charuco_corners, detection.charuco_ids, detection.image_size, 'preview'),
+            rejections=reasons)
         if geometry is None:
+            result['guidance_reason'] = reasons[0]
             return result
         result.update(geometry, valid=True)
         pts = detection.charuco_corners.reshape(-1, 2)
@@ -702,7 +791,14 @@ class StereoCaptureWorkspace(QWidget):
                     self._analysis.recommendation.feasible)
         if not feasible:
             return 'blocked', '当前距离构图不可用，请检查分辨率和标定板', 'hold'
-        if not samples or not all(s['valid'] for s in samples):
+        if not samples:
+            return 'visibility', '等待左右最新检测，请保持标定板完整可见', 'hold'
+        if not all(s['valid'] for s in samples):
+            if any(s.get('guidance_reason') in ('narrow_board_extent', 'insufficient_points')
+                   for s in samples):
+                return 'visibility', '让更多板面被识别，避免只检出局部角点', 'hold'
+            if any(s.get('guidance_reason') for s in samples):
+                return 'visibility', '检查角点分布与标定板配置，暂不自动采图', 'hold'
             return 'visibility', '让标定板同时进入左右画面', 'hold'
         ready, message = self._distance_status(pairs, samples, target)
         if not ready:
@@ -733,7 +829,7 @@ class StereoCaptureWorkspace(QWidget):
         if not all(s.get('sharp') for s in samples):
             return 'quality', '检查对焦与光照，保持板面位置', 'hold'
         if not all(s.get('stable') for s in samples):
-            return 'stability', '保持静止至少 0.6 秒', 'hold'
+            return 'stability', '保持静止，等待连续3次稳定检测', 'hold'
         if duplicate:
             return 'duplicate', '稍微改变板面朝向，避免重复构图', 'hold'
         if any(self.panel._sm.get_sync_pair(name) is None for name in self.panel._selected_pairs()):
@@ -767,6 +863,8 @@ class StereoCaptureWorkspace(QWidget):
                     or self.panel._white_balance_guard.busy or self.panel._model_worker
                     or self.panel._calib_worker or self.panel._stereo_import_worker
                     or self.panel._aux_dataset_busy() or self._guidance_worker is not None)
+        self.btn_retry_guidance.setVisible(bool(live and self._guidance_error))
+        self.btn_retry_guidance.setEnabled(bool(live and self._guidance_error and not busy))
         for button, scale in ((self.btn_near, 'large'), (self.btn_far, 'small')):
             available = live and using_adaptive and not busy and self._distance_available(scale)
             button.setEnabled(available)
@@ -797,7 +895,8 @@ class StereoCaptureWorkspace(QWidget):
             action = TILT_ACTIONS.get(target.tilt)
             suffix = f"，{action[0]}" if action else "，板面正对镜头"
             self.instruction.setText(f"将标定板移至画面{positions[target.zone_row][target.zone_col]}{suffix}")
-            self.reason.setText(f"固定计划建议 · {TILT_LABELS[target.tilt]} · 保持双路可见")
+            self.reason.setText(f"当前目标：{DISTANCE_LABELS[target.scale]} · "
+                                f"画面{positions[target.zone_row][target.zone_col]} · {TILT_LABELS[target.tilt]}")
         else:
             self.instruction.setText("计划已浏览完，可继续补拍")
             self.reason.setText("浏览结束不代表标定质量达标")
@@ -812,7 +911,7 @@ class StereoCaptureWorkspace(QWidget):
             elif key is None:
                 self.reason.setText('多组同时采集沿用固定计划；选择单组可用自适应引导')
             elif self._guidance_error:
-                self.reason.setText('自适应分析不可用，已回退固定计划')
+                self.reason.setText('可重新分析\n或按固定参考手动采图')
                 self.reason.setToolTip(self._guidance_error)
             else:
                 self.reason.setText('正在分析已采配对，暂不自动采集')
@@ -821,6 +920,7 @@ class StereoCaptureWorkspace(QWidget):
             _, distance_message = self._distance_status(pairs, samples, target)
             self.reason.setToolTip(self.reason.text() + '\n' + distance_message)
         visible = bool(samples) and all(s["valid"] for s in samples)
+        detected = bool(samples) and all(s.get('detected', s['valid']) for s in samples)
         sharp = visible and all(s.get("sharp") for s in samples)
         stable = visible and all(s.get("stable") for s in samples)
         aligned = bool(visible and target) and all(
@@ -830,15 +930,17 @@ class StereoCaptureWorkspace(QWidget):
             self.instruction.setText(self.instruction.text().replace('移至', '保持在'))
         self.status.setText(
             "基础画面检查（不含姿态）\n\n"
-            f"双路可见：{'已检测' if visible else '等待检测'}\n"
+            f"双路板点：{'已检测' if visible else '已检出，引导几何待确认' if detected else '等待检测'}\n"
             f"清晰度：{'良好' if sharp else '待检查'}\n"
-            f"运动稳定：{'稳定' if stable else '请保持静止至少 0.6 秒'}\n"
+            f"运动稳定：{'稳定' if stable else '请保持静止，等待连续检测' if visible else '待角点检测，暂不能判断'}\n"
             f"目标位置：{'接近建议区域' if aligned else '待对齐'}"
         )
         self.status.setStyleSheet(f"color:{SUCCESS if visible and sharp and stable and aligned else TEXT_DIM};")
-        self.status.setToolTip("稳定要求至少3次检测并持续0.6秒，且相对窗口首帧无明显累计位移。预览阈值不是硬件同步或精度证明；基础位置检查不验证倾角。")
+        self.status.setToolTip("稳定要求至少3次检测、观测跨度至少0.6秒，且相对窗口首帧无明显累计位移。"
+                               "每路最多2次/秒检测，通常需静止约1秒或更久；未检出角点时无法判断运动。"
+                               "预览阈值不是硬件同步或精度证明；基础位置检查不验证倾角。")
         if not using_adaptive and not offline and not self.view.review_key and target and target.tilt != BoardTilt.FRONT:
-            self.reason.setText(f"固定计划建议 · {TILT_LABELS[target.tilt]} · 倾角步骤请手动采集")
+            self.reason.setText(self.reason.text() + '\n固定计划建议 · 倾角步骤请手动采集')
         self.pose_status.setText("姿态：待人工确认" if visible and not self.view.review_key else "姿态：待实时检测")
         self.pose_status.setToolTip("PnP 数值仅供观察；本轮不自动验收角度、方向或姿态多样性")
         if using_adaptive and not self.view.review_key:
@@ -851,6 +953,11 @@ class StereoCaptureWorkspace(QWidget):
             self.pose_status.setStyleSheet(f'color:{SUCCESS if reached else WARNING};')
             self.pose_status.setToolTip(message + '\n经验验收范围，不代表精度合格；'
                                         '双路位置、距离可信度及倾角共同检查')
+        geometry_reasons = list(dict.fromkeys(guidance_reason_text(s['guidance_reason'])
+                                for s in samples if s.get('guidance_reason')))
+        if geometry_reasons and not self.view.review_key:
+            self.pose_status.setText('；'.join(geometry_reasons))
+            self.pose_status.setToolTip(self.pose_status.text())
         matches = self._duplicate_matches(pairs, samples) if visible else []
         duplicate = bool(matches)
         self.advice.setText(
@@ -863,8 +970,8 @@ class StereoCaptureWorkspace(QWidget):
         if using_adaptive and not self.view.review_key and not offline:
             self._instruction_stage, action, motion = self._primary_action(pairs, samples, target, duplicate)
             self.instruction.setText('操作：' + action)
-            evidence = ('距离与倾角可检测' if self._analysis.recommendation.pose_available
-                        else '建立初始模型，请手动采图')
+            evidence = ('引导模型可用，当前姿态仍需检查' if self._analysis.recommendation.pose_available
+                        else '初始建模需手动采图')
             complete = (self._distance_override is not None and self._distance_override
                         not in self._analysis.recommendation.missing_distances)
             subtitle = '本档数量已补足，可返回推荐' if complete else evidence
@@ -872,6 +979,7 @@ class StereoCaptureWorkspace(QWidget):
                      BoardTilt.TILT_RIGHT: '右边近', BoardTilt.TILT_UP: '上边近',
                      BoardTilt.TILT_DOWN: '下边近'}
             rec = self._analysis.recommendation
+            building_model = rec.phase == 'initial' and not rec.pose_available
             phase = (f'首轮 {min(rec.sample_count + 1, rec.initial_total)}/{rec.initial_total}'
                      if rec.phase == 'initial' else '复核' if rec.phase == 'review' else
                      f'补采 {min(rec.repair_count + 1, MAX_DISTANCE_REPAIR_REQUESTS)}'
@@ -882,6 +990,11 @@ class StereoCaptureWorkspace(QWidget):
                             tilts[target.tilt])
             goal = f'目标：{DISTANCE_LABELS[target.scale]} · {current_tilt}'
             goal = f'{"指定补采" if self._distance_override else phase} · {goal}'
+            if building_model:
+                goal = f'初始建模 · 建模样本 {rec.sample_count} 组'
+                shown_tilt = (tilts[BoardTilt.FRONT] if self._instruction_stage in
+                              ('distance', 'position') else tilts[target.tilt])
+                subtitle = f'建议：{DISTANCE_LABELS[target.scale]} · {shown_tilt}'
             if not rec.feasible and not self._distance_override:
                 goal = '当前构图受限 · 请检查分辨率和标定板'
             if self._instruction_stage == 'review':
@@ -894,11 +1007,12 @@ class StereoCaptureWorkspace(QWidget):
                         ('front', 'left', 'right', 'up', 'down'), BoardTilt))[t]]
                         for t in rec.missing_tilts)
                 subtitle += '；不代表精度达标'
-            self.reason.setText(f'{goal}\n状态：{subtitle}')
+            self.reason.setText(f'{goal}\n{subtitle}' if building_model else
+                                f'{goal}\n状态：{subtitle}')
             poses = [self._pose_measurement(camera.camera_id, sample)
                      for pair, offset in zip(pairs, range(0, len(samples), 2))
                      for camera, sample in zip((pair.left, pair.right), samples[offset:offset + 2])]
-            if (not complete and self._instruction_stage != 'review'
+            if (not building_model and not complete and self._instruction_stage != 'review'
                     and poses and all(reliable_distance_pose(p) for p in poses)):
                 values = ' / '.join(f"{p['depth']:.2f}" for p in poses)
                 low, high = SCALE_AREA_RANGES[target.scale]
@@ -919,20 +1033,55 @@ class StereoCaptureWorkspace(QWidget):
                                     + ('本档数量已补足，可返回推荐' if complete else '继续补拍，或返回推荐')
                                     + '；仍需原图质量及标定后评估。\n' + self._analysis.summary)
         elif live and not using_adaptive:
-            self._instruction_stage = 'analysis'
+            self._instruction_stage = 'error' if self._guidance_error else 'analysis'
             self.instruction.setText('正在更新采图建议，请保持当前位置' if not self._guidance_error else
-                                     '自适应分析不可用，请检查固定计划')
+                                     '自适应分析失败，自动采集已暂停')
+        if not self.adaptive and not offline and not self.view.review_key:
+            waiting = (
+                '请先重试保存失败的原图，或撤销对应采集' if self.panel._failed_save_jobs else
+                '等待白平衡准备完成，保持场景不动' if self.panel._white_balance_guard.busy else
+                '等待原图保存完成，保持当前位置' if self.panel._pending_save_tokens
+                or self.panel._save_queue or self.panel._save_workers else
+                '等待当前任务完成，再继续采图' if busy else
+                '连接左右相机，等待实时图像' if not pairs or any(
+                    self.panel._sm.get_latest_frame(camera.camera_id) is None
+                    for pair in pairs for camera in (pair.left, pair.right)) else '')
+            if waiting:
+                self._instruction_stage = 'waiting'
+                self.instruction.setText(waiting)
+                self.reason.setText(self.reason.text().replace('当前目标：', '参考目标：'))
         adaptive_action = using_adaptive and not self.view.review_key and not offline
         hint = ('后续：退出原图回看后继续采集' if self.view.review_key else
                 '后续：检查导入数据后前往标定' if offline else
-                '后续：原图验收并保存后，继续当前固定计划')
+                '本组原图验收并保存后，继续当前固定计划；浏览或跳过不增加采集记录。')
         if live and not using_adaptive:
-            hint = '后续：等待当前配置分析完成，旧建议暂不生效'
+            hint = ('下一步：重新分析或切换固定计划；手动采图仍按原图验收' if self._guidance_error
+                    else '后续：等待当前配置分析完成，旧建议暂不生效')
         elif adaptive_action:
             hint = (self._analysis.recommendation.next_hint if not self._distance_override else
                     '后续：本张验收并保存后检查本档缺口；点击返回推荐继续自适应规划')
+        hint_details = hint
+        if adaptive_action:
+            rec = self._analysis.recommendation
+            if rec.phase == 'initial' and not rec.pose_available:
+                if rec.sample_count < BOOTSTRAP_MIN_VIEWS:
+                    hint = (f'初始建模需手动采图，无需等待绿色提示；至少{BOOTSTRAP_MIN_VIEWS}组'
+                            '且倾角有变化，原图验收并保存后计数')
+                else:
+                    hint = (f'已有{rec.sample_count}组，模型尚未就绪；继续手动补充左右、上下倾角，'
+                            f'{BOOTSTRAP_MIN_VIEWS}组只是最低数量')
+                if self._instruction_stage in ('saving', 'preparation', 'analysis'):
+                    hint = '请先完成上方等待事项；初始建模需手动采图，不会自动推进'
+                hint_details = (hint + '\n请先完成上方图像与采集状态检查；手动采图仍需原图验收。'
+                    '\n建模样本按已保存且被引导分析采用的非重复有效配对计数，不是点击或照片总数。'
+                    f'\n至少{BOOTSTRAP_MIN_VIEWS}组只是尝试建模的起点，双路模型可用后才进入姿态辅助采集。'
+                    '\n' + hint_details)
+            elif rec.pose_available and rec.phase == 'initial':
+                hint = '姿态辅助采集 · 引导模型可用（非最终标定）；' + hint
+                hint_details = hint
+        hint = self._next_action_hint(hint, offline)
         self.next_step.setText(hint)
-        self.next_step.setToolTip(hint)
+        self.next_step.setToolTip(hint + '\n' + hint_details)
         self.instruction.setToolTip(self.instruction.text())
         self.schematic.set_target(
             replace(target, tilt=BoardTilt.FRONT)
@@ -966,12 +1115,14 @@ class StereoCaptureWorkspace(QWidget):
                 for label, cal in cals
             ]
         self.compact_summary.setText(
-            f"可见 {'✓' if visible else '待检测'} · 清晰 {'✓' if sharp else '待检查'} · "
-            f"稳定 {'✓' if stable else '待检查'}\n{self.pose_status.text()}\n"
-            "数据集累计：板角点 ID / 视场网格\n" + '  '.join(self._coverage_summary)
+            f"板点{'可用' if visible else '已检出' if detected else '待检'} · "
+            f"清晰{'良好' if sharp else '待检'} · 稳定{'通过' if stable else '待检'}"
         )
         self.compact_summary.setToolTip(self.pose.text() + '\n' + self.status.text()
-                                       + '\n' + self.pose_status.toolTip())
+                                       + '\n' + self.pose_status.text() + '\n' + self.pose_status.toolTip())
+        self.coverage_summary.setText(
+            '数据集累计：板角点 ID / 视场网格\n' + '\n'.join(self._coverage_summary)
+            + '\n' + self.panel._lbl_capture_count.text())
         if offline:
             counts = self.view.displayed_corner_counts()
             origin = self.view.review_detection_origin if self.view.review_key else '原图分辨率检测'
@@ -983,11 +1134,12 @@ class StereoCaptureWorkspace(QWidget):
             )
             self.compact_summary.setText(
                 f'离线观测 {loaded} 对\n{self.panel._lbl_capture_count.text()}\n'
-                f'姿态覆盖未验证\n当前预览角点（{origin}）\n' + current +
-                '\n数据集累计：板角点 ID / 视场网格\n' + '  '.join(self._coverage_summary)
+                f'姿态覆盖未验证\n当前预览角点（{origin}）\n' + current
             )
             self.status.setText(self.compact_summary.text())
-        self.compact_summary.set_lines(8 if offline else 4)
+        self.compact_summary.set_lines(6 if offline else 1)
+        self.compact_summary.setVisible(self._compact and bool(offline))
+        self._refresh_live_checks(pairs, visible, detected, sharp, stable, busy, offline)
         self.schematic_toggle.setVisible(not offline)
         self.schematic_actions.setVisible(not offline)
         self.schematic_body.setVisible(not offline and self.schematic_toggle.isChecked())
@@ -997,6 +1149,7 @@ class StereoCaptureWorkspace(QWidget):
             "\n数据集累计：所有已采图出现过的板角点 ID 比例 / 4×4 视场网格占比。"
             "不是当前帧完整度或姿态覆盖率；预览按原图分辨率检测，与点击采图并非同一帧。",
         )
+        self.coverage_summary.setToolTip(self.coverage_button.toolTip())
         self.coverage_button.setText(
             "数据分析" if self._compact else
             "累计板角点 ID / 视场网格  ·  " + "  |  ".join(
@@ -1004,9 +1157,117 @@ class StereoCaptureWorkspace(QWidget):
             )
         )
 
-    def _refresh_receipt(self, pairs, offline):
-        self.receipt.setVisible(not offline)
+    def _next_action_hint(self, planned, offline):
+        """Pending persistence and review take priority over a future pose recommendation."""
+        panel = self.panel
         if self.view.review_key:
+            if offline:
+                return planned
+            if panel._failed_save_jobs:
+                return '正在回看原图；先重试失败保存或撤销对应采集，再继续采图。'
+            return '结束回看可恢复实时指引；采图使用实时新帧，原图仍需验收。'
+        if offline:
+            return planned
+        if panel._failed_save_jobs:
+            return '先重试保存失败的原图，不要重复采图；保存确认后再更新推荐。'
+        if panel._white_balance_guard.busy:
+            return '等待白平衡准备完成，本次采图将继续；保持场景与标定板不动。'
+        if panel._pending_save_tokens or panel._save_queue or panel._save_workers:
+            return '本组原图正在保存，请保持当前位置；保存确认后重新分析并更新建议。'
+        if self._guidance_worker is not None:
+            return '正在分析已采数据，请保持当前位置；分析完成后按新的当前动作继续。'
+        if not self.adaptive:
+            sequence = panel._capture_sequence
+            index = sequence.current_index + 1
+            if index < sequence.total:
+                target = sequence.targets[index]
+                return (f'本组验收并保存后，下一参考动作：\n{DISTANCE_LABELS[target.scale]} · '
+                        f'{target.label}。')
+            return '固定参考计划已到末项；本组保存后可前往标定评估，或自主补拍。'
+        return planned
+
+    def _refresh_live_checks(self, pairs, visible, detected, sharp, stable, busy, offline):
+        reviewing = bool(self.view.review_key)
+        self.live_title.setText('离线数据检查' if offline else '实时检查')
+        self.live_checks.setVisible(not offline)
+        self.capture_verdict.setVisible(not offline)
+        paired = bool(pairs) and all(self.panel._sm.get_sync_pair(p.name) is not None for p in pairs)
+        values = {
+            'points': ('板点可用' if visible else '局部检出' if detected else '等待检测', visible),
+            'sharp': ('通过' if sharp else '待检查', sharp),
+            'stable': ('通过' if stable else '保持静止' if visible else '待检测', stable),
+            'pair': ('已配对' if paired else '未配对', False),
+        }
+        for key, (text, passed) in values.items():
+            if reviewing or offline:
+                text, passed = ('回看不检查' if reviewing else '离线不检查'), False
+            self.check_values[key].setText(text)
+            self.check_values[key].setStyleSheet(f'color:{SUCCESS if passed else TEXT_DIM};')
+        self.live_checks.setToolTip(self.status.toolTip())
+        if reviewing:
+            message, ready = '正在回看原图，实时指引已暂停', False
+        elif offline:
+            message, ready = '离线原图已载入，可前往标定', False
+        elif busy:
+            message, ready = '请先完成当前准备、保存或分析任务', False
+        elif self.adaptive and self._guidance_error:
+            message, ready = '自适应分析失败，自动采集已暂停；可重试分析或手动采图', False
+        else:
+            ready = bool(self.auto_ready())
+            if ready:
+                message = '预览条件满足，可点击采集；原图仍需验收'
+            elif self._instruction_stage == 'review':
+                message = '本轮引导结束，可前往标定评估'
+            elif self.adaptive and self._analysis and not self._analysis.recommendation.pose_available:
+                message = '初始建模需手动采图，原图按实际质量验收'
+            elif not paired:
+                message = '等待左右视频帧配对'
+            else:
+                message = '按当前动作调整；手动采图仍按原图验收'
+        self.capture_verdict.setText(message)
+        self.capture_verdict.setStyleSheet(
+            f'color:{SUCCESS if ready else TEXT_DIM}; '
+            f'border:1px solid {SUCCESS if ready else BORDER}; border-radius:4px;')
+        self.capture_verdict.setToolTip(message + '\n' + self.status.text())
+
+    def _guidance_receipt(self, item, pair, state):
+        if not self.adaptive:
+            return '', ''
+        key, _ = self._guidance_context()
+        if key is None:
+            return '', ''
+        if state != '已保存':
+            return '暂不推进引导', '原图保存确认后才复核是否计入引导。'
+        if not self._analysis or key != self._analysis_key:
+            return ('引导分析失败' if self._guidance_error else '引导复核中',
+                    '标定数据已保留；请重新分析引导。' if self._guidance_error else
+                    '标定数据已保留；等待当前数据分析完成。')
+        source = item.key.rsplit(' ', 1)[-1]
+        decision = self._analysis.sample_decisions.get(source)
+        if decision is None:
+            return '引导待复核', '当前引导没有对应记录；标定数据仍保留，请检查验收详情。'
+        if decision['status'] == 'included':
+            return '已计入引导', '已作为当前引导的非重复有效配对；不代表标定精度达标。'
+        if decision['status'] == 'duplicate':
+            return '重复构图，未增加引导样本', (
+                f'与 {decision["source_frame"]} 近似重复；仍保留为标定数据，不增加引导样本。')
+        reasons = [guidance_reason_text(decision['reason'])] if 'reason' in decision else []
+        for label, camera in (('左目', pair.left), ('右目', pair.right)):
+            code = decision.get('camera_reasons', {}).get(camera.camera_id)
+            if code:
+                reasons.append(f'{label}：{guidance_reason_text(code)}')
+        return '未计入引导', '；'.join(reasons) + '。仍保留为标定数据；本张不推进引导。'
+
+    def _refresh_receipt(self, pairs, offline):
+        self.receipt_key = None
+        self.receipt.setVisible(True)
+        if offline:
+            self.receipt.setText(f'离线原图 · 已载入 {len(self.panel.preview_pairs())} 对\n'
+                                 '源文件不修改；检查数据后前往标定')
+            self.receipt.setToolTip(self.panel._lbl_raw_save.toolTip())
+            return
+        if self.view.review_key:
+            self.receipt_key = self.view.review_key
             self.receipt.setText(f'正在回看：{self.view.review_key}\n结束回看后继续实时采图')
             self.receipt.setToolTip(self.receipt.text())
             return
@@ -1016,6 +1277,7 @@ class StereoCaptureWorkspace(QWidget):
             self.receipt.setToolTip(self.receipt.text())
             return
         item = reviews[-1]
+        self.receipt_key = item.key
         token = item.save_token
         state = ('保存失败' if token in self.panel._failed_save_jobs else
                  '保存中' if token in self.panel._pending_save_tokens else
@@ -1025,23 +1287,27 @@ class StereoCaptureWorkspace(QWidget):
         accepted = item.quality_state == '可采纳'
         quality = ('完整角点可采纳' if min(left, right) == self.board.num_corners else
                    '部分角点可采纳') if accepted else item.quality_state or '验收待确认'
-        self.receipt.setText(f'本次原图 {item.key.rsplit(" ", 1)[-1]} · {state}\n'
+        guidance, details = self._guidance_receipt(item, pairs[0], state) if accepted else ('', '')
+        suffix = f' · {guidance}' if guidance else ''
+        self.receipt.setText(f'本次原图 {item.key} · {state}{suffix}\n'
                              f'左{left} / 右{right} · {quality}')
-        next_step = ('未计入有效样本，请查看验收详情后重拍。' if not accepted else
-                     '保存失败，请重试保存原图，不要重复采集。' if state == '保存失败' else
+        next_step = ('保存失败，请重试保存原图，不要重复采集。' if state == '保存失败' else
+                     '请等待原图保存确认，再按上方操作继续。' if state == '保存中' else
+                     '未计入有效样本，请查看验收详情后重拍。' if not accepted else
                      '下一步：按上方操作调整后继续采图；精度待标定评估。' if state == '已保存' else
                      '请等待原图保存确认，再按上方操作继续。')
-        self.receipt.setToolTip(item.result_text() + '\n' + next_step)
+        self.receipt.setToolTip(item.result_text() + '\n' + details + '\n' + next_step)
 
     def set_compact(self, compact):
         self._compact = compact
-        self.instruction.set_lines(1 if compact else 2)
+        self.instruction.set_lines(2)
         self.schematic.set_compact(compact)
         self.pose.setMinimumWidth(145 if compact else 165)
         self.status.setMinimumWidth(185 if compact else 205)
         self.pose.setVisible(not compact)
+        self.pose_column.setVisible(not compact)
         self.pose_status.setVisible(not compact)
         self.status.setVisible(not compact)
-        self.compact_summary.setVisible(compact)
-        self.setMaximumWidth(440 if compact else 16777215)
+        self.compact_summary.setVisible(compact and bool(self.panel.offline_selection))
+        self.setMaximumWidth(480 if compact else 16777215)
         self.refresh()

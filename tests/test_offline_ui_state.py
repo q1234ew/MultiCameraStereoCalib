@@ -45,6 +45,10 @@ def test_offline_import_preserves_guide_and_selects_correct_source(offline_windo
     assert not panel._combo_wb_mode.isVisible()
     assert not panel._btn_auto.isVisible() and not panel._btn_skip_stereo.isVisible()
     assert not guide.schematic.isVisible() and not guide.schematic.timer.isActive()
+    assert guide.live_title.text() == '离线数据检查'
+    assert guide.live_checks.isHidden() and guide.capture_verdict.isHidden()
+    assert guide.compact_summary.isVisible()
+    assert win._btn_receipt_details.isHidden()
     assert '离线' in guide.instruction.text() and '实时' not in guide.compact_summary.text()
     assert '源目录' in panel._lbl_raw_save.text()
     assert panel._btn_to_calibration.property('class') == 'primary'
@@ -79,7 +83,8 @@ def test_current_preview_counts_are_distinct_from_cumulative_coverage(offline_wi
     app.processEvents()
     win._stereo_capture.refresh()
     text = win._stereo_capture.compact_summary.text()
-    assert '当前预览角点' in text and '数据集累计' in text
+    assert '当前预览角点' in text and '数据集累计' not in text
+    assert '数据集累计' in win._stereo_capture.coverage_summary.text()
     assert '原图分辨率检测' in text and '缩放检测' not in text
     assert '累计' in win._stereo_capture.coverage_button.toolTip()
     assert '预览角点' in win._stream_view._views[pair.left_id]._info.text()

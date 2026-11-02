@@ -305,9 +305,13 @@ def test_distance_buttons_and_instruction_fit_small_windows(stereo_bench, app, t
         guide.refresh()
         for _ in range(3):
             app.processEvents()
+        win._guide_scroll.ensureWidgetVisible(guide.distance_tools)
+        app.processEvents()
+        viewport = win._guide_scroll.viewport()
         for widget in (guide.btn_near, guide.btn_far, guide.btn_resume_guidance):
             assert widget.isVisible()
-            assert win.rect().contains(widget.mapTo(win, widget.rect().bottomRight()))
+            assert viewport.rect().contains(widget.mapTo(viewport, widget.rect().topLeft()))
+            assert viewport.rect().contains(widget.mapTo(viewport, widget.rect().bottomRight()))
         assert win._preview_scroll.horizontalScrollBar().maximum() == 0
         win.grab().save(str(directory / f'capture-actions-{width}.png'))
 
@@ -326,7 +330,7 @@ def test_distance_actions_wrap_with_large_font_in_narrow_sidebar(stereo_bench, a
     index = guide._distance_layout.indexOf(guide.btn_resume_guidance)
     assert guide._distance_layout.getItemPosition(index) == (1, 0, 1, 2)
     viewport = win._guide_scroll.viewport()
-    win._guide_scroll.verticalScrollBar().setValue(0)
+    win._guide_scroll.ensureWidgetVisible(guide.distance_tools)
     app.processEvents()
     assert win._guide_scroll.horizontalScrollBar().maximum() == 0
     for button in buttons:

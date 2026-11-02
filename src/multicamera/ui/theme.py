@@ -6,18 +6,18 @@ from functools import lru_cache
 from pathlib import Path
 
 # ── Color palette ──────────────────────────────────────────────
-BG_DARK = "#18181a"
-BG_MID = "#202023"
-BG_CARD = "#27272b"
-BG_INPUT = "#303035"
-BG_HOVER = "#38383e"
-BORDER = "#46464e"
+BG_DARK = "#202124"
+BG_MID = "#242528"
+BG_CARD = "#28292c"
+BG_INPUT = "#303134"
+BG_HOVER = "#383a3e"
+BORDER = "#43464c"
 BORDER_FOCUS = "#6db7ff"
 TEXT = "#f0f0f2"
 TEXT_DIM = "#b8b8c1"
 TEXT_HINT = "#92929f"
 ACCENT = "#6db7ff"
-PRIMARY = "#086ed3"
+PRIMARY = "#0b73d0"
 ACCENT_HOVER = "#075fb7"
 SUCCESS = "#58d695"
 WARNING = "#e7b65b"
@@ -391,6 +391,18 @@ def app_stylesheet() -> str:
     /* ── Labels ────────────────────────────────────── */
     QLabel {{
         color: {TEXT};
+    }}
+    QLabel#workbenchSectionTitle {{
+        font-size: 15px;
+        font-weight: bold;
+    }}
+    QWidget#captureReceiptStrip {{
+        border-top: 1px solid {BORDER};
+        border-bottom: 1px solid {BORDER};
+    }}
+    QWidget#captureReceiptStrip QLabel {{
+        background: transparent;
+        border: none;
     }}
 
     /* ── Splitter ──────────────────────────────────── */

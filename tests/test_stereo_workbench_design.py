@@ -47,7 +47,7 @@ def rig():
 
 
 @pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
-def test_acceptance_feedback_precedes_optional_schematic(stereo_bench, app, tmp_path, size):
+def test_current_and_next_actions_precede_schematic_with_persistent_receipt(stereo_bench, app, tmp_path, size):
     win = stereo_bench
     guide = win._stereo_capture
     det, frame, _ = sample(win)
@@ -58,11 +58,12 @@ def test_acceptance_feedback_precedes_optional_schematic(stereo_bench, app, tmp_
     for _ in range(5):
         app.processEvents()
     viewport = win._guide_scroll.viewport()
-    for label in (guide.compact_summary,):
+    for label in (guide.instruction, guide.next_step):
         top = label.mapTo(viewport, QPoint(0, 0))
         assert top.y() >= 0
         assert top.y() + label.height() <= viewport.height()
-    assert win._calib_panel._action_footer.isAncestorOf(guide.receipt)
+    assert win._receipt_strip.isAncestorOf(guide.receipt)
+    assert not win._calib_panel._action_footer.isAncestorOf(guide.receipt)
     assert win.rect().contains(guide.receipt.mapTo(win, guide.receipt.rect().bottomRight()))
     baseline = win._stream_view.geometry()
     guide.schematic_toggle.click()

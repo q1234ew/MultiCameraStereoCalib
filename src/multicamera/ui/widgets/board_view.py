@@ -91,7 +91,7 @@ def _text(p, rect, text, color=TEXT_DIM, size=11, alignment=Qt.AlignCenter):
 
 def view_rects(rect, compact):
     gap = 8 if compact else 12
-    main_width = rect.width() * (.62 if compact else .67)
+    main_width = rect.width() * (.5 if compact else .67)
     return (QRectF(rect.x(), rect.y(), main_width - gap / 2, rect.height()),
             QRectF(rect.x() + main_width + gap / 2, rect.y(),
                    rect.width() - main_width - gap / 2, rect.height()))
@@ -130,9 +130,9 @@ def paint_board_view(p, rect, target, progress, point, compact=False, layer='dyn
             p.setBrush(QColor(BG_MID))
             p.drawRoundedRect(panel.adjusted(1, 1, -1, -1), 6, 6)
         _text(p, QRectF(main.x() + 4, main.y(), main.width() - 8, heading),
-              '相机视角 · 不镜像', TEXT, 11 if compact else 12)
+              '板面 · 不镜像', TEXT, 11 if compact else 12)
         _text(p, QRectF(depth.x() + 4, depth.y(), depth.width() - 8, heading),
-              ('位置示意 · 相机固定' if oblique else '侧视 · 镜头在左' if side else '俯视 · 镜头在下'),
+              ('立体视角 · 相机固定' if oblique else '侧视 · 镜头在左' if side else '俯视 · 镜头在下'),
               TEXT, 10 if compact else 12)
         if target is None:
             _text(p, main_image, '等待采图计划')

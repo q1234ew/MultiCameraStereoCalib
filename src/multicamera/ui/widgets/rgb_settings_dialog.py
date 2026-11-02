@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -20,13 +21,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from ..theme import ACCENT, DANGER, SUCCESS, TEXT_DIM
+from ..theme import ACCENT, DANGER, SUCCESS, TEXT_DIM, app_icon
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +135,8 @@ class RgbSettingsDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("RGB 参数 / RGB Settings")
+        self.setWindowTitle("RGB 相机参数")
+        self.setMinimumSize(520, 360)
         self.resize(620, 760)
         self._sync_urls = _unique_urls([base_url, *(sync_urls or [])])
         self._last_applied_urls: list[str] = []
@@ -142,8 +145,20 @@ class RgbSettingsDialog(QDialog):
         self._worker: _RgbConfigWorker | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(16, 16, 16, 16)
+        content_layout.setSpacing(16)
+        connection = QGroupBox("目标与同步")
+        connection_layout = QVBoxLayout(connection)
+        connection_layout.setContentsMargins(12, 12, 12, 12)
+        connection_layout.setSpacing(8)
 
         url_row = QHBoxLayout()
         self._edit_url = QLineEdit(_normalise_base_url(base_url))
@@ -151,46 +166,72 @@ class RgbSettingsDialog(QDialog):
         url_row.addWidget(QLabel("目标相机:"), 0)
         url_row.addWidget(self._edit_url, 1)
         self._btn_refresh = QPushButton("刷新")
+        self._btn_refresh.setIcon(app_icon("rotate-ccw"))
+        self._btn_refresh.setAutoDefault(False)
         self._btn_refresh.clicked.connect(self.refresh_config)
         url_row.addWidget(self._btn_refresh)
-        layout.addLayout(url_row)
+        connection_layout.addLayout(url_row)
 
         self._chk_sync = QCheckBox("同步应用到已配置 RGB 左/右")
         self._chk_sync.setChecked(len(self._sync_urls) > 1)
         self._chk_sync.setVisible(len(self._sync_urls) > 1)
-        layout.addWidget(self._chk_sync)
+        connection_layout.addWidget(self._chk_sync)
 
         self._lbl_targets = QLabel(self._format_targets())
         self._lbl_targets.setWordWrap(True)
+        self._lbl_targets.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_targets.setTextFormat(Qt.PlainText)
         self._lbl_targets.setStyleSheet(f"color: {TEXT_DIM};")
         self._lbl_targets.setVisible(len(self._sync_urls) > 1)
-        layout.addWidget(self._lbl_targets)
+        connection_layout.addWidget(self._lbl_targets)
 
         self._lbl_device = QLabel("设备: --")
+        self._lbl_device.setWordWrap(True)
+        self._lbl_device.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_device.setTextFormat(Qt.PlainText)
         self._lbl_device.setStyleSheet(f"color: {TEXT_DIM};")
-        layout.addWidget(self._lbl_device)
+        connection_layout.addWidget(self._lbl_device)
+        content_layout.addWidget(connection)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
         self._body = QWidget()
         self._body_layout = QVBoxLayout(self._body)
         self._body_layout.setContentsMargins(0, 0, 0, 0)
-        self._body_layout.setSpacing(8)
-        scroll.setWidget(self._body)
-        layout.addWidget(scroll, 1)
+        self._body_layout.setSpacing(16)
+        content_layout.addWidget(self._body, 1)
+        self._scroll.setWidget(content)
+        layout.addWidget(self._scroll, 1)
 
-        bottom = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("actionFooter")
+        actions = QVBoxLayout(footer)
+        actions.setContentsMargins(16, 12, 16, 12)
+        actions.setSpacing(8)
         self._lbl_status = QLabel("点击刷新读取相机参数")
-        self._lbl_status.setStyleSheet(f"color: {TEXT_DIM};")
-        bottom.addWidget(self._lbl_status, 1)
-        self._btn_apply = QPushButton("应用 / Apply")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setTextFormat(Qt.PlainText)
+        self._lbl_status.setStyleSheet(f"color: {TEXT_DIM}; background:transparent;")
+        actions.addWidget(self._lbl_status)
+        self._lbl_next_step = QLabel("下一步：应用到相机后返回采集；关闭不撤销已应用的参数。")
+        self._lbl_next_step.setWordWrap(True)
+        self._lbl_next_step.setStyleSheet(f"color: {TEXT_DIM}; background:transparent;")
+        actions.addWidget(self._lbl_next_step)
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        self._btn_apply = QPushButton("应用到相机")
+        self._btn_apply.setIcon(app_icon("check"))
+        self._btn_apply.setProperty("class", "primary")
+        self._btn_apply.setDefault(True)
         self._btn_apply.clicked.connect(self.apply_config)
         self._btn_apply.setEnabled(False)
-        bottom.addWidget(self._btn_apply)
         self._btn_close = QPushButton("关闭")
+        self._btn_close.setIcon(app_icon("x"))
+        self._btn_close.setAutoDefault(False)
+        self._btn_close.setToolTip("关闭窗口，放弃尚未应用的修改；已应用的相机参数保持不变")
         self._btn_close.clicked.connect(self.accept)
         bottom.addWidget(self._btn_close)
-        layout.addLayout(bottom)
+        bottom.addWidget(self._btn_apply)
+        actions.addLayout(bottom)
+        layout.addWidget(footer)
 
         self.refresh_config()
 
@@ -286,10 +327,12 @@ class RgbSettingsDialog(QDialog):
 
         quick = QGroupBox("常用参数")
         quick_layout = QVBoxLayout(quick)
-        quick_layout.setSpacing(8)
+        quick_layout.setContentsMargins(12, 12, 12, 12)
+        quick_layout.setSpacing(12)
         more = QGroupBox("更多参数")
         more_layout = QVBoxLayout(more)
-        more_layout.setSpacing(8)
+        more_layout.setContentsMargins(12, 12, 12, 12)
+        more_layout.setSpacing(12)
 
         handled: set[str] = set()
         for key in _QUICK_KEYS:
@@ -304,6 +347,8 @@ class RgbSettingsDialog(QDialog):
 
         self._body_layout.addWidget(quick)
         self._body_layout.addWidget(more)
+        quick.setVisible(bool(handled))
+        more.setVisible(bool(set(self._controls_meta) - handled))
         self._body_layout.addStretch(1)
         self._update_dependencies()
 
@@ -315,6 +360,9 @@ class RgbSettingsDialog(QDialog):
 
         head = QHBoxLayout()
         label = QLabel(_control_label(key, ctl))
+        label.setWordWrap(True)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        label.setTextFormat(Qt.PlainText)
         label.setStyleSheet(f"color: {TEXT_DIM};")
         head.addWidget(label, 1)
         meta = QLabel(_control_meta(ctl))
@@ -408,7 +456,7 @@ class RgbSettingsDialog(QDialog):
 
     def _set_status(self, text: str, ok: bool | None = None):
         color = SUCCESS if ok is True else DANGER if ok is False else ACCENT
-        self._lbl_status.setStyleSheet(f"color: {color};")
+        self._lbl_status.setStyleSheet(f"color: {color}; background:transparent;")
         self._lbl_status.setText(text)
 
     def _wait_for_worker(self):

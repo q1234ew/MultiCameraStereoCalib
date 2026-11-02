@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import BG_DARK, TEXT_DIM, standard_icon, app_icon
+from ...calibration.planar import PlanarDetectionResult
 
 
 @dataclass
@@ -30,12 +31,19 @@ class PreviewPair:
     quality_state: str = ''
     quality_reasons: tuple[str, ...] = ()
 
+    @property
+    def display_quality_state(self):
+        if isinstance(self.left_detection, PlanarDetectionResult):
+            return {'可采纳': '验收通过', '待复核': '验收待复核'}.get(
+                self.quality_state, self.quality_state)
+        return self.quality_state
+
     def result_text(self):
         def count(detection):
             return (getattr(detection, 'num_corners', getattr(detection, 'num_points', 0))
                     if detection is not None else '—')
         return (f'{self.key} · {self.detection_origin} L={count(self.left_detection)} '
-                f'R={count(self.right_detection)} · {self.save_state} · {self.quality_state} '
+                f'R={count(self.right_detection)} · {self.save_state} · {self.display_quality_state} '
                 + '；'.join(self.quality_reasons))
 
 
@@ -99,8 +107,8 @@ class PairGallery(QWidget):
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._list.setIconSize(QSize(188, 74))
-        self._list.setGridSize(QSize(204, 108))
+        self._list.setIconSize(QSize(132, 66))
+        self._list.setGridSize(QSize(144, 104))
         self._list.setFixedHeight(114)
         self._list.itemClicked.connect(self._select_pair)
         self._list.itemActivated.connect(self._select_pair)
@@ -113,8 +121,15 @@ class PairGallery(QWidget):
         self._next.clicked.connect(lambda: self._page(1))
         row.addWidget(self._next)
         outer.addWidget(self._body)
+        self._empty = QLabel('尚无配对图像')
+        self._empty.setAlignment(Qt.AlignCenter)
+        self._empty.setFixedHeight(72)
+        self._empty.setStyleSheet(f'color:{TEXT_DIM};')
+        self._empty.setAccessibleName('图库为空')
+        outer.addWidget(self._empty)
         self._refresh_page()
         self._body.hide()
+        self._update_empty_state()
 
     def set_pairs(self, pairs: list[PreviewPair]):
         if len(pairs) == len(self._pairs) and all(
@@ -142,11 +157,13 @@ class PairGallery(QWidget):
         self._latest_capture.setVisible(latest is not None)
         self._latest_capture.setToolTip(latest.result_text() if latest else '')
         if latest is not None:
-            left = getattr(latest.left_detection, 'num_corners', getattr(latest.left_detection, 'num_points', 0))
-            right = getattr(latest.right_detection, 'num_corners', getattr(latest.right_detection, 'num_points', 0))
-            self._latest_capture.setText(f'最近采图 {latest.key.rsplit(" ", 1)[-1]} · L{left}/R{right} · {latest.quality_state} · {latest.save_state}')
+            self._latest_capture.setText(f'最近原图 · {latest.display_quality_state or "待验收"}')
         self._body.setVisible(bool(self._pairs) and self._toggle.isChecked())
+        self._update_empty_state()
         self._refresh_page()
+
+    def _update_empty_state(self):
+        self._empty.setVisible(not self._pairs and self.height() >= 100)
 
     def clear_selection(self):
         self._selected_key = None
@@ -170,7 +187,8 @@ class PairGallery(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        count = max(1, min(4, (self.width() - 80) // 208))
+        self._update_empty_state()
+        count = max(1, min(6, (self.width() - 80) // 148))
         if count != self._page_size:
             self._page_size = count
             self._start = min(self._start, max(0, len(self._pairs) - count))

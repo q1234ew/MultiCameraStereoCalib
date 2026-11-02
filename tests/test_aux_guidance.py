@@ -73,6 +73,8 @@ def test_duplicates_invalid_sizes_and_grid_do_not_advance(monkeypatch):
     before = a.image_points.copy()
     result = analyze_aux_guidance(board, CameraModel.PINHOLE, incoming, intr)
     assert result.unique_count == 1 and result.duplicate_count == 1
+    assert result.sample_decisions == {'0': 'included', 'repeat': 'duplicate',
+                                      'bad-size': 'size_mismatch', 'bad-grid': 'invalid_detection'}
     assert result.target == initial_plan()[1]
     np.testing.assert_array_equal(a.image_points, before)
 

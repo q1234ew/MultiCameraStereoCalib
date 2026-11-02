@@ -107,7 +107,7 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
         app.processEvents()
         button = panel._btn_capture
         assert button.isVisible()
-        for control in (button, panel._btn_import, panel._btn_to_calibration, panel._btn_undo):
+        for control in (button, win._btn_import_capture, panel._btn_to_calibration, panel._btn_undo):
             assert win.rect().contains(control.mapTo(win, control.rect().topLeft()))
             assert win.rect().contains(control.mapTo(win, control.rect().bottomRight()))
             assert control.height() >= control.minimumSizeHint().height()
@@ -130,11 +130,13 @@ def test_layout_switch_restores_footer_and_capture_controls(stereo_bench, app, t
         assert win._capture_bottom.height() <= (
             win._gallery.height() + panel._action_footer.height() + 12)
         if width == 1280:
-            viewport = win._preview_scroll.viewport()
+            win._guide_scroll.ensureWidgetVisible(guide.schematic.canvas)
+            app.processEvents()
+            viewport = win._guide_scroll.viewport()
             canvas = guide.schematic.canvas
             assert viewport.rect().contains(canvas.mapTo(viewport, canvas.rect().topLeft()))
             assert viewport.rect().contains(canvas.mapTo(viewport, canvas.rect().bottomRight()))
-            assert guide.compact_summary.isVisible() and not guide.pose.isVisible()
+            assert guide.live_checks.isVisible() and not guide.pose.isVisible()
         win.grab().save(str(directory / f'stereo-capture-{width}.png'))
     panel._capture_sequence.jump_to(10)
     guide.refresh()
@@ -161,6 +163,9 @@ def test_gallery_and_logs_keep_preview_visible_and_restore_inline(stereo_bench, 
         win.resize(*size)
         app.processEvents()
         app.processEvents()
+        if size[1] < 900:
+            win._gallery._toggle.setChecked(True)
+            app.processEvents()
         assert win._preview_scroll.verticalScrollBar().maximum() == 0
         viewport = win._preview_scroll.viewport()
         for cid in (LEFT, RIGHT):
@@ -170,10 +175,14 @@ def test_gallery_and_logs_keep_preview_visible_and_restore_inline(stereo_bench, 
             win._calib_panel._footer_info.geometry())
         for key, widget in (('gallery', win._gallery._body), ('logs', win._logs_widget)):
             dialog = win._aux_panel_dialogs[key]
-            assert dialog.isVisible()
             assert widget.isVisible()
-            assert widget.parentWidget() is dialog
-            dialog.grab().save(str(directory / f'{key}-tool-{size[0]}.png'))
+            if key == 'gallery' and size[1] >= 900:
+                assert not dialog.isVisible()
+                assert widget.parentWidget() is win._gallery
+            else:
+                assert dialog.isVisible()
+                assert widget.parentWidget() is dialog
+                dialog.grab().save(str(directory / f'{key}-tool-{size[0]}.png'))
         win.grab().save(str(directory / f'capture-panels-{size[0]}.png'))
     QTest.keyClick(win._aux_panel_dialogs['gallery'], Qt.Key_Escape)
     assert not win._gallery._toggle.isChecked()
@@ -211,6 +220,47 @@ def test_expanded_schematic_fits_sidebar_without_horizontal_scroll(stereo_bench,
         win.grab().save(str(directory / f'expanded-schematic-{size[0]}.png'))
         guide.schematic.expand.setChecked(False)
         assert '展开' in button.toolTip()
+
+
+@pytest.mark.parametrize('size', [(1000, 680), (1280, 800), (1440, 1024)])
+def test_animation_uses_sidebar_width_with_single_line_live_status(stereo_bench, app, size):
+    win = stereo_bench
+    guide = win._stereo_capture
+    detection, frame, _ = sample(win)
+    publish_stable(win, detection, frame)
+    win.resize(*size)
+    for cid in (LEFT, RIGHT):
+        win._stream_view._on_frame(cid, frame, time.time())
+    for _ in range(5):
+        app.processEvents()
+    assert guide.pose_column.isHidden() and guide.status.isHidden()
+    assert abs(guide.schematic.canvas.width() - guide.schematic_body.width()) <= 1
+    assert '\n' not in guide.compact_summary.text()
+    assert guide.compact_summary._lines == 1
+    assert '累计' not in guide.compact_summary.text()
+    assert guide.schematic.view_mode == 'board'
+    assert guide.schematic.legend.isVisible()
+    canvas_bottom = guide.schematic.canvas.mapTo(
+        guide.schematic, guide.schematic.canvas.rect().bottomLeft()).y()
+    legend_top = guide.schematic.legend.mapTo(
+        guide.schematic, guide.schematic.legend.rect().topLeft()).y()
+    assert 0 <= legend_top - canvas_bottom <= 12
+    assert not guide.coverage_summary.isVisible()
+    before = win._stream_view.geometry()
+    win._guide_scroll.ensureWidgetVisible(guide.schematic.legend)
+    for _ in range(3):
+        app.processEvents()
+    viewport = win._guide_scroll.viewport()
+    for label in guide.schematic.legend_labels:
+        assert viewport.rect().contains(label.mapTo(viewport, label.rect().topLeft()))
+        assert viewport.rect().contains(label.mapTo(viewport, label.rect().bottomRight()))
+    guide.coverage_button.setChecked(True)
+    for _ in range(3):
+        app.processEvents()
+    assert guide.coverage_summary.isVisible()
+    assert '数据集累计' in guide.coverage_summary.text()
+    assert win._stream_view.geometry() == before
+    assert win._guide_scroll.horizontalScrollBar().maximum() == 0
 
 
 def test_pose_uses_calibrated_pnp_not_example_values(stereo_bench):

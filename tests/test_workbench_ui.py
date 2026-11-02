@@ -214,9 +214,12 @@ def test_focus_close_restore_and_escape_are_coherent(bench, app):
     assert view.presentation_mode == "aux_focus"
 
 
-def test_gallery_review_is_explicit_and_does_not_replace_capture_source(bench, app, finish_aux_tasks):
+def test_gallery_review_is_explicit_and_does_not_replace_capture_source(
+        bench, app, monkeypatch, finish_aux_tasks):
     win, rgb, ir = bench
     gallery, view, panel = win._gallery, win._stream_view, win._calib_panel
+    guide = panel._aux_guide
+    monkeypatch.setattr(guide, '_request_preview', lambda: None)
     pair = gallery._pairs[-1]
     index = len(gallery._pairs) - 1
     item = next(gallery._list.item(i) for i in range(gallery._list.count())
@@ -224,20 +227,84 @@ def test_gallery_review_is_explicit_and_does_not_replace_capture_source(bench, a
     gallery._select_pair(item)
     assert view.review_key == pair.key
     assert win._review_bar.isVisible()
+    assert '正在回看原图' in guide.phase.text()
+    assert pair.key in guide.phase.text()
+    assert '实时指引已暂停' in guide.action.text()
+    assert not panel._btn_capture_aux.isEnabled()
+    assert '先结束回看' in panel._btn_capture_aux.toolTip()
+    assert '验收通过' in view._views[LEFT]._info.toolTip()
+    assert '可采纳' not in view._views[LEFT]._info.toolTip()
+    assert pair.quality_state == '可采纳'  # Display names do not migrate stored states.
     before = view._views[IR]._last_frame.copy()
     win._stream_manager.frame_received.emit(IR, np.zeros_like(ir), time.time())
     np.testing.assert_array_equal(view._views[IR]._last_frame, before)
-    publish(win, rgb, ir)
+    rgb_new, ir_new = rgb.copy(), ir.copy()
+    rgb_new[:20, :20] = 70
+    ir_new[:10, :10] = 80
+    publish(win, rgb_new, ir_new)
     assert view.review_key == pair.key
     assert view.review_matches({LEFT: pair.left, IR: pair.right})
+    count = len(panel._aux_images)
+    folder = win._current_session.session_dir / 'multimodal'
+    originals = {path.name: path.read_bytes() for path in folder.iterdir()}
+    panel._btn_capture_aux.click()
+    panel._on_capture_aux()  # The slot also rejects non-button calls during review.
+    assert len(panel._aux_images) == count
+    assert panel._aux_capture_worker is None
+    assert view.review_key == pair.key
+    assert originals == {path.name: path.read_bytes() for path in folder.iterdir()}
+    assert panel._aux_saved_count == 0
+    win._btn_end_review.click()
+    assert not view.review_key
+    assert not win._review_bar.isVisible()
+    assert not guide.last_qualities and not guide._samples
+    assert '正在回看' not in guide.phase.text()
+    panel._refresh_aux_readiness()
+    assert panel._btn_capture_aux.isEnabled()
     panel._btn_capture_aux.click()
     app.processEvents()
     finish_aux_tasks(panel)
     assert not view.review_key
     assert not win._review_bar.isVisible()
     session = win._current_session.session_dir
-    np.testing.assert_array_equal(cv2.imread(str(session / "multimodal/rgb_left_0000.png")), rgb)
-    np.testing.assert_array_equal(cv2.imread(str(session / "multimodal/aux_0000.png")), ir)
+    np.testing.assert_array_equal(cv2.imread(str(session / "multimodal/rgb_left_0000.png")), rgb_new)
+    np.testing.assert_array_equal(cv2.imread(str(session / "multimodal/aux_0000.png")), ir_new)
+
+
+def test_review_pauses_pending_guidance_and_rejects_pre_review_preview(
+        bench, monkeypatch, finish_aux_tasks):
+    win, rgb, ir = bench
+    panel = win._calib_panel
+    guide = panel._aux_guide
+    monkeypatch.setattr(guide, '_request_preview', lambda: None)
+    pair = panel.preview_pairs()[0]
+    guide.data_changed()
+    panel._aux_seq_widget._btn_next.click()
+    chosen = panel._aux_capture_sequence.current_index
+    publish(win, rgb, ir)
+    win._on_gallery_pair_selected(pair.key, {LEFT: pair.left, IR: pair.right})
+    finish_aux_tasks(panel)
+    assert '正在回看原图' in guide.phase.text()
+    assert '实时指引已暂停' in guide.action.text()
+    assert '引导采用 1 组' in guide.counts.text()
+    assert not panel._btn_capture_aux.isEnabled()
+    assert guide._manual and panel._aux_capture_sequence.current_index == chosen
+    old_stamp = guide._clock() - .2
+    win._btn_end_review.click()
+    guide._preview_ready((guide.context_key(), old_stamp), None, '')
+    assert not guide.last_qualities and not guide._preview_detections
+    assert not guide._samples
+    assert '可以采集' not in guide.action.text()
+    assert f'浏览参考动作 {chosen + 1}/17' in guide.phase.text()
+
+
+def test_review_status_uses_display_label_for_rejected_planar_images(bench):
+    win, _, _ = bench
+    pair = win._calib_panel.preview_pairs()[0]
+    pair.quality_state = '待复核'
+    win._show_review_pair(pair)
+    assert '验收待复核' in win._stream_view._views[LEFT]._info.toolTip()
+    assert pair.quality_state == '待复核'
 
 
 def test_replacing_data_ends_stale_review_and_gallery_is_bounded(bench):
@@ -248,14 +315,14 @@ def test_replacing_data_ends_stale_review_and_gallery_is_bounded(bench):
     replacements = [PreviewPair(str(i), LEFT, IR, rgb, ir) for i in range(1000)]
     win._on_preview_pairs_changed(replacements)
     assert not view.review_key
-    assert gallery._list.count() <= 4
-    assert len(gallery._icon_cache) <= 4
+    assert gallery._list.count() <= 6
+    assert len(gallery._icon_cache) <= 6
     assert gallery._pairs[0].left is rgb
     gallery._toggle.setChecked(False)
     assert not gallery._body.isVisible()
     assert not gallery._icon_cache
     gallery._toggle.setChecked(True)
-    assert gallery._list.count() <= 4
+    assert gallery._list.count() <= 6
     gallery._page(-1)
     assert gallery._start < len(replacements) - gallery._page_size
 
@@ -374,13 +441,13 @@ def test_sidebar_summary_uses_actual_board_and_live_readiness(bench):
     assert panel._lbl_task_phase.text() == "融合采集"
     assert panel._aux_task_values['sensor'].text() == 'RGB + 红外'
     assert panel._aux_task_values['intrinsics'].text() == '已就绪'
-    assert panel._aux_task_values['capture'].text() == '已就绪'
+    assert panel._aux_task_values['capture'].text() == '视频已配对'
     assert panel._aux_board_values['geometry'].text() == '7 列 × 5 行格子'
     assert panel._aux_board_values['spacing'].text() == '80 mm'
     assert '24 点' in panel._aux_board_values['points'].text()
-    assert panel._lbl_aux_pair_count.text() == '8 组质量可用 · 基础 17 组'
-    assert panel._aux_seq_widget._title_lbl.text() == '建议构图 · 位置以 IR/辅助画面为准'
-    assert '不等于已验证姿态' in panel._aux_seq_widget._title_lbl.toolTip()
+    assert panel._lbl_aux_pair_count.text() == '验收通过 8 组'
+    assert panel._aux_seq_widget._title_lbl.text() == '参考动作 · 位置以红外画面为准'
+    assert '不是已采数量' in panel._aux_seq_widget._title_lbl.toolTip()
     assert not panel._lbl_aux_readiness.isVisible()
     assert not panel._lbl_aux_board.isVisible()
     assert not panel._aux_seq_widget._dots.isVisible()
@@ -515,6 +582,40 @@ def test_white_balance_preparation_captures_only_new_live_frames(bench, app, mon
     np.testing.assert_array_equal(panel._aux_images[-1][0], rgb_new)
     saved = win._current_session.session_dir / 'multimodal/rgb_left_0000.png'
     np.testing.assert_array_equal(cv2.imread(str(saved)), rgb_new)
+
+
+@pytest.mark.parametrize("size", [(1440, 1024), (1280, 800), (1000, 680)])
+def test_aux_copy_transitions_keep_preview_and_fixed_receipt_geometry(bench, app, size):
+    win, rgb, ir = bench
+    win.resize(*size)
+    publish(win, rgb, ir)
+    for _ in range(4):
+        app.processEvents()
+    panel, guide = win._calib_panel, win._calib_panel._aux_guide
+    content = panel._sections[2].content_layout
+    assert content.indexOf(guide) < content.indexOf(panel._aux_seq_widget)
+    assert content.indexOf(panel._aux_seq_widget) < content.indexOf(guide.details)
+
+    def geometry():
+        return tuple((tile.geometry(), tile._image_label.geometry())
+                     for tile in win._stream_view._views.values() if tile.isVisible())
+
+    before = geometry()
+    receipt_height = guide.receipt.height()
+    panel._aux_seq_widget._btn_next.click()
+    for text in ('正在检查本次原图 · 尚未确认保存\n检查后显示验收结果',
+                 'live_0001 · 原图保存失败\n未计入验收和引导，请重新采图',
+                 'live_0001 · 原图已保存 · 验收待复核\n引导未采用 · 验收记录写入失败'):
+        guide.show_receipt_message(text)
+        guide.refresh()
+        for _ in range(4):
+            app.processEvents()
+        assert geometry() == before
+        assert guide.receipt.height() == receipt_height
+        assert '\n' in guide.receipt.visible_text()
+        assert panel._inspector_scroll.horizontalScrollBar().maximum() == 0
+        assert '已记录' not in panel._aux_seq_widget._title_lbl.text()
+        assert panel._btn_capture_aux.isVisible()
 
 
 @pytest.mark.parametrize("size", [(1440, 1024), (1280, 800), (1000, 680)])

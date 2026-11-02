@@ -99,6 +99,25 @@ class GuidanceAnalysis:
     approximate_distance_counts: dict[str, int] = field(default_factory=dict)
     tilt_counts: dict[str, int] = field(default_factory=dict)
     image_coverage: dict[str, list[list[int]]] = field(default_factory=dict)
+    sample_decisions: dict[str, dict] = field(default_factory=dict)
+
+
+GUIDANCE_REASON_LABELS = {
+    'invalid_observation': '角点数据或标定板配置无效',
+    'insufficient_points': '可用角点不足6个',
+    'points_outside_image': '角点超出图像范围',
+    'narrow_board_extent': '已检出角点，但分布过于集中，请展示更多板面',
+    'invalid_image_geometry': '角点几何暂不可用，请检查图像与标定板配置',
+    'unreliable_board_geometry': '板面位置估计不可靠，请改善可见角点分布',
+    'conflicting_frame_id': '同一帧编号存在不同观测，需重新检查数据',
+    'missing_pair': '未找到该目同编号的有效观测',
+    'inconsistent_image_size': '图像尺寸与本组引导观测不一致',
+    'duplicate_composition': '与已有引导样本近似重复',
+}
+
+
+def guidance_reason_text(code):
+    return GUIDANCE_REASON_LABELS.get(code, '引导观测暂不可用，请检查原图')
 
 
 def reliable_distance_pose(pose):
@@ -111,11 +130,16 @@ def _hull_area(points):
     return float(cv2.contourArea(cv2.convexHull(np.array(points, np.float32, copy=True))))
 
 
-def _geometry(board, observation):
+def _geometry(board, observation, *, rejections=None):
     """Copy/validate observations and reject spatially narrow partial boards."""
+    def reject(code):
+        if rejections is not None:
+            rejections.append(code)
+        return None
+
     try:
         if not isinstance(observation.frame_id, str) or not observation.frame_id:
-            return None
+            return reject('invalid_observation')
         detection = DetectionResult(observation.corners, observation.ids, [], None,
                                     observation.image_size)
         corners, ids, size = prepare_observation(detection, board)
@@ -124,25 +148,29 @@ def _geometry(board, observation):
         points = corners.reshape(-1, 2).astype(np.float64)
         all_obj = np.array(board.object_points, np.float64, copy=True)
         obj = all_obj[ids.ravel()]
-        if len(points) < 6 or not np.isfinite(all_obj).all():
-            return None
+        if len(points) < 6:
+            return reject('insufficient_points')
+        if not np.isfinite(all_obj).all():
+            return reject('invalid_observation')
         if np.any(points < 0) or np.any(points >= np.asarray(size)):
-            return None
+            return reject('points_outside_image')
         full_area = _hull_area(all_obj[:, :2])
-        if full_area <= 0 or _hull_area(obj[:, :2]) / full_area < MIN_BOARD_HULL_FRACTION:
-            return None
+        if full_area <= 0:
+            return reject('invalid_image_geometry')
+        if _hull_area(obj[:, :2]) / full_area < MIN_BOARD_HULL_FRACTION:
+            return reject('narrow_board_extent')
         area = _hull_area(points) / float(size[0] * size[1])
         if not 1e-5 < area < 1.:
-            return None
+            return reject('invalid_image_geometry')
         # Normalize object coordinates so perspective terms are comparable across boards.
         midpoint = (all_obj[:, :2].min(axis=0) + all_obj[:, :2].max(axis=0)) / 2
         extent = np.ptp(all_obj[:, :2], axis=0)
         if np.any(extent <= 0):
-            return None
+            return reject('invalid_image_geometry')
         local = (obj[:, :2] - midpoint) / extent
         H, _ = cv2.findHomography(local, points / size, 0)
         if H is None or not np.isfinite(H).all() or abs(H[2, 2]) < 1e-10:
-            return None
+            return reject('unreliable_board_geometry')
         H = H / H[2, 2]
         projected = cv2.perspectiveTransform(local.reshape(-1, 1, 2), H).reshape(-1, 2)
         residual = np.sqrt(np.mean(np.sum(((projected - points / size) * size) ** 2, axis=1)))
@@ -152,17 +180,17 @@ def _geometry(board, observation):
                       and np.linalg.norm(center - points.mean(axis=0) / size) < .25)
         if not reasonable:
             if len(ids) != len(all_obj):
-                return None
+                return reject('unreliable_board_geometry')
             center = points.mean(axis=0) / size
         clean = GuidanceObservation(corners, ids, size, observation.frame_id)
         return clean, obj, center.copy(), area, H
     except (ValueError, TypeError, AttributeError, IndexError, cv2.error):
-        return None
+        return reject('invalid_observation')
 
 
-def measure_composition(board, observation):
+def measure_composition(board, observation, *, rejections=None):
     """Shared live/history composition; center is the full board's mapped center."""
-    geometry = _geometry(board, observation)
+    geometry = _geometry(board, observation, rejections=rejections)
     if geometry is None:
         return None
     full_area = _hull_area(np.asarray(board.object_points)[:, :2])
@@ -549,12 +577,17 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
         raise ValueError('自适应双目引导需要恰好两台相机')
     model = CameraModel(model)
     cameras = sorted(observations)
-    maps = {}
+    maps, exclusions = {}, {}
+    input_ids = list(dict.fromkeys(key for camera in cameras for obs in observations[camera]
+                                  if isinstance(key := getattr(obs, 'frame_id', None), str) and key))
     for camera in cameras:
-        frames, conflicts = {}, set()
+        frames, conflicts, rejected = {}, set(), {}
         for observation in observations[camera]:
-            g = _geometry(board, observation)
+            reasons = []
+            g = _geometry(board, observation, rejections=reasons)
             if g is None:
+                if isinstance(getattr(observation, 'frame_id', None), str):
+                    rejected[observation.frame_id] = reasons[0]
                 continue
             key = g[0].frame_id
             if key in frames:
@@ -566,16 +599,31 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
             else:
                 frames[key] = g
         maps[camera] = {k: v for k, v in frames.items() if k not in conflicts}
+        exclusions[camera] = {**rejected, **dict.fromkeys(conflicts, 'conflicting_frame_id')}
+    decisions = {key: {'status': 'excluded', 'camera_reasons': {
+        camera: exclusions[camera].get(key, 'missing_pair') for camera in cameras
+        if key not in maps[camera]}} for key in input_ids}
     left, right = cameras
     paired = [(g, maps[right][key]) for key, g in maps[left].items() if key in maps[right]]
     if paired:
         sizes = Counter((a[0].image_size, b[0].image_size) for a, b in paired)
         expected = sizes.most_common(1)[0][0]
+        for pair in paired:
+            if tuple(g[0].image_size for g in pair) != expected:
+                decisions[pair[0][0].frame_id] = {
+                    'status': 'excluded', 'reason': 'inconsistent_image_size'}
         paired = [p for p in paired if tuple(g[0].image_size for g in p) == expected]
     unique = []
     for pair in paired:
-        if not any(all(_similar(g[0], old[i][0]) for i, g in enumerate(pair)) for old in unique):
+        previous = next((old for old in unique
+                         if all(_similar(g[0], old[i][0]) for i, g in enumerate(pair))), None)
+        key = pair[0][0].frame_id
+        if previous is None:
             unique.append(pair)
+            decisions[key] = {'status': 'included'}
+        else:
+            decisions[key] = {'status': 'duplicate', 'reason': 'duplicate_composition',
+                              'source_frame': previous[0][0].frame_id}
     intrinsics = {}
     for i, camera in enumerate(cameras):
         supplied = provided_intrinsics.get(camera)
@@ -759,4 +807,5 @@ def analyze_guidance(board, model, observations: dict[str, list[GuidanceObservat
                                  missing_tilts, next_hint, distribution_gaps)
     return GuidanceAnalysis(rec, intrinsics, summary, dict(paired_distances),
                             dict(approximate_distances), dict(paired_tilts),
-                            {camera: values.tolist() for camera, values in zip(cameras, coverage)})
+                            {camera: values.tolist() for camera, values in zip(cameras, coverage)},
+                            sample_decisions=decisions)

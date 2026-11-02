@@ -99,11 +99,11 @@ def test_held_original_saved_but_never_advances_calibration(
     assert pair.quality_state == ('拒收' if strict else '待复核')
     assert pair.save_state == '已保存'
     assert '未计入有效样本' in panel._lbl_capture_decision.text()
-    details = []
-    monkeypatch.setattr('multicamera.ui.widgets.calib_panel.QMessageBox.information',
-                        lambda parent, title, text: details.append(text))
     panel._btn_capture_decision_details.click()
-    assert details and all(reason in details[-1] for reason in pair.quality_reasons)
+    dialog = panel._capture_details_dialog
+    assert dialog.isVisible() and not dialog.isModal()
+    assert all(reason in dialog.content.toPlainText() for reason in pair.quality_reasons)
+    dialog.close()
     directory = Path(os.environ.get('MULTICAMERA_QUALITY_QA_DIR', tmp_path))
     directory.mkdir(parents=True, exist_ok=True)
     for width, height in ((1000, 680), (1280, 800), (1440, 1024)):

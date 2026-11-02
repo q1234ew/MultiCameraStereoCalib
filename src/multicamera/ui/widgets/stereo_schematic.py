@@ -8,7 +8,8 @@ import time
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QComboBox, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from ..theme import ACCENT, BG_MID, BORDER, TEXT_DIM, TEXT_HINT, WARNING, app_icon
@@ -259,6 +260,27 @@ class StereoSchematic(QWidget):
         layout.addLayout(toolbar)
         self.canvas = MotionCanvas(self)
         layout.addWidget(self.canvas, 1)
+        self.legend = QWidget()
+        self.legend.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.legend.setAccessibleName('动作图例：白色固定边，黄色移动边，蓝色虚线目标；非实测')
+        self.legend.setToolTip('颜色仅解释动作示意，不表示实时检测或标定精度。')
+        legend_row = QHBoxLayout(self.legend)
+        legend_row.setContentsMargins(0, 0, 0, 0)
+        legend_row.setSpacing(12)
+        self.legend_labels = []
+        for name, color, style in (('固定边', '#ffffff', 'solid'),
+                                   ('移动边', '#ffd23f', 'solid'),
+                                   ('目标', ACCENT, 'dashed')):
+            swatch = QFrame()
+            swatch.setFixedSize(14, 8)
+            swatch.setStyleSheet(f'border:0; border-bottom:2px {style} {color};')
+            legend_row.addWidget(swatch)
+            label = QLabel(name)
+            label.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+            legend_row.addWidget(label)
+            self.legend_labels.append(label)
+        legend_row.addStretch()
+        layout.addWidget(self.legend)
         self.caption = QLabel()
         self.caption.setWordWrap(True)
         self.caption.setStyleSheet(f"color:{TEXT_HINT}; font-size:12px;")
@@ -325,6 +347,8 @@ class StereoSchematic(QWidget):
 
     def _apply_compact(self):
         compact = self._preferred_compact and not self.expand.isChecked()
+        self.setSizePolicy(QSizePolicy.Expanding,
+                           QSizePolicy.Fixed if self._preferred_compact else QSizePolicy.Expanding)
         self.canvas.compact = compact
         self.canvas.setMinimumWidth(280 if self._preferred_compact else 360)
         self.canvas.setMinimumHeight(150 if compact else 210)

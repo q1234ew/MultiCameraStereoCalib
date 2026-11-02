@@ -7,14 +7,15 @@ from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
-from PySide6.QtCore import QThreadPool, Slot
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtCore import QThreadPool, Slot, Qt
+from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from ...calibration.aux_guidance import (
     AREA_RANGES, DISTANCE_NAMES, MAX_REPAIRS, guidance_action, initial_plan,
 )
+from ...calibration.aux_capture_quality import quality_reason_text
 from ..threads.aux_capture_worker import AuxCaptureWorker, AuxGuidanceWorker
-from ..theme import ACCENT, SUCCESS, TEXT_DIM, WARNING
+from ..theme import ACCENT, BORDER, SUCCESS, TEXT, TEXT_DIM, WARNING
 from .capture_guide import BoardTilt, CaptureTarget, build_multimodal_sequence
 from .stable_text import StableTextLabel
 
@@ -44,30 +45,99 @@ class AuxCaptureGuide(QWidget):
         self._clock = time.monotonic
         self._manual = False
         self._scope = None
+        self._analysis_error = ''
+        self._receipt_record = None
+        self._receipt_override = None
+        self._recommended_action = ''
         self.last_qualities = []
         self._preview_detections = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
+        self.heading = QLabel('当前采集任务')
+        self.heading.setStyleSheet(f'color:{TEXT}; font-weight:bold;')
         self.phase = StableTextLabel('基础采集 · 等待图像', lines=2)
         self.phase.setStyleSheet(f'color:{ACCENT}; font-weight:bold;')
-        self.action = StableTextLabel('让同一块标定板完整进入 RGB 左目和 IR 画面', lines=2)
-        self.counts = StableTextLabel('已保存 0 · 检测有效 0\n质量可用 0 · 非重复 0 · 双路姿态可解 0', lines=2)
+        self.action = StableTextLabel('让同一块标定板完整进入RGB左目和辅助相机画面', lines=3)
+        self.action.setStyleSheet(
+            f'color:{TEXT}; font-size:17px; font-weight:bold; border-left:3px solid {ACCENT};')
+        self.action.setAccessibleName('当前采集动作')
+        self.next_step = StableTextLabel('下一步：连接两路实时图像，或导入配对原图', lines=3)
+        self.next_step.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        self.next_step.setAccessibleName('下一步采集安排')
+        self.target_info = StableTextLabel('目标：等待采图建议', lines=3)
+        self.target_info.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        self.target_info.setAccessibleName('当前构图目标与标定板')
+        self.counts = StableTextLabel('原图已保存 0 组 · 源目录 0 组\n验收通过 0 组 · 引导采用 待更新', lines=2)
         self.counts.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
         self.receipt = StableTextLabel('最近原图：尚未采集', lines=2)
-        for label in (self.phase, self.action):
+        self.next_title = QLabel('下一步安排')
+        self.next_title.setStyleSheet(f'color:{ACCENT}; font-weight:bold;')
+        for label in (self.heading, self.phase, self.action, self.target_info,
+                      self.next_title, self.next_step):
+            label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             layout.addWidget(label)
         self.details = QWidget(panel)
         details = QVBoxLayout(self.details)
         details.setContentsMargins(0, 0, 0, 0)
-        details.setSpacing(4)
+        details.setSpacing(6)
+        self.checks = QWidget(self.details)
+        checks = QGridLayout(self.checks)
+        checks.setContentsMargins(0, 0, 0, 0)
+        checks.setHorizontalSpacing(12)
+        checks.setVerticalSpacing(2)
+        checks.setColumnStretch(1, 1)
+        self.checks_heading = QLabel('实时检查')
+        self.checks_heading.setStyleSheet(f'color:{TEXT}; font-weight:bold;')
+        checks.addWidget(self.checks_heading, 0, 0, 1, 2)
+        self.check_values = {}
+        for row, (key, title) in enumerate((('board', '双路板点'), ('quality', '原图预检'),
+                                            ('stability', '稳定性'), ('pairing', '视频配对')), 1):
+            label = QLabel(title)
+            label.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+            value = StableTextLabel('等待检测', lines=1)
+            value.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+            checks.addWidget(label, row, 0)
+            checks.addWidget(value, row, 1)
+            self.check_values[key] = value
+        details.addWidget(self.checks)
+        self.data_heading = QLabel('数据概况')
+        self.data_heading.setStyleSheet(
+            f'color:{TEXT}; font-weight:bold; border-top:1px solid {BORDER}; padding-top:6px;')
+        details.addWidget(self.data_heading)
         details.addWidget(self.counts)
         details.addWidget(self.receipt)
+
+    @property
+    def auxiliary_label(self):
+        return '声像仪RGB' if self.panel._aux_modality() == 'acoustic_rgb' else '红外'
+
+    @property
+    def camera_labels(self):
+        return ('RGB左目', self.auxiliary_label)
 
     def bind_preview(self, view):
         self._view = view
         view.preview_detected.connect(self.observe)
         view.preview_detection_expired.connect(self.expire)
+        view.review_changed.connect(self._on_review_changed)
+
+    @property
+    def reviewing(self):
+        return bool(self._view is not None and self._view.review_key)
+
+    @Slot(str, bool)
+    def _on_review_changed(self, key, active):
+        if self.panel._active_step != 2:
+            return
+        self._samples.clear()
+        self._sample_timestamps.clear()
+        self.last_qualities = []
+        self._preview_detections = []
+        self._preview_invalidated_at = self._clock()
+        self.panel._refresh_aux_readiness()
+        if not active and self.analysis is not None and self._key == self.context_key():
+            self.render()
 
     def context_key(self):
         panel = self.panel
@@ -87,18 +157,37 @@ class AuxCaptureGuide(QWidget):
         self.last_qualities = []
         self._preview_detections = []
         self._manual = False
+        self._analysis_error = ''
+        self._receipt_record = None
+        self._receipt_override = None
         self.receipt.setText('最近原图：尚未采集')
         self.refresh()
 
     def data_changed(self):
         self._revision += 1
         self._key = None
+        self._manual = False
         self.refresh()
 
     def manual_navigation(self):
         self._manual = True
-        self.phase.setText('手动查看计划 · 不计入引导进度')
-        self.action.setText('手动浏览计划，不计为采集或姿态验证；采图后恢复推荐')
+        self._show_browsing_feedback()
+        self._tooltips()
+
+    def _show_browsing_feedback(self):
+        if self.reviewing:
+            self._show_review_feedback()
+            return
+        seq = self.panel._aux_capture_sequence
+        self.phase.setText(f'浏览参考动作 {min(seq.current_index + 1, seq.total)}/{seq.total}\n非采集进度')
+        self.action.setText('浏览不增加采集记录；手动采图仍按原图验收，采图后恢复推荐')
+        self.phase.setStyleSheet(f'color:{ACCENT}; font-weight:bold;')
+        self._reference_copy()
+
+    def _show_review_feedback(self):
+        self.phase.setText(f'正在回看原图\n{self._view.review_key}')
+        self.phase.setStyleSheet(f'color:{WARNING}; font-weight:bold;')
+        self.action.setText('实时指引已暂停；请先结束回看，再采集实时图像')
 
     @Slot(str)
     def expire(self, camera_id):
@@ -207,7 +296,7 @@ class AuxCaptureGuide(QWidget):
         now, histories = snapshot if snapshot is not None else (self._clock(), self._samples)
         if len(detections) != 2:
             detections = (None, None)
-        for name, camera_id, det in zip(('RGB', 'IR/辅助'),
+        for name, camera_id, det in zip(self.camera_labels,
                 (self.panel._rgb_left_camera_id(), self.panel._aux_camera_id()), detections):
             history = histories.get(camera_id, [])
             stable = (det is not None and det.valid and len(history) >= 3
@@ -216,7 +305,7 @@ class AuxCaptureGuide(QWidget):
                       and det.image_size == history[-1][2]
                       and self._close(det.image_points.reshape(-1, 2), history[0][1], det.image_size))
             if not stable:
-                reasons.append(f'{name}稳定性未通过，请双路完整可见并静止至少0.6秒')
+                reasons.append(f'{name}稳定性未通过，请保持整板可见并等待连续3次稳定检测')
         return reasons
 
     def intrinsics(self):
@@ -241,12 +330,21 @@ class AuxCaptureGuide(QWidget):
                 deepcopy((self.panel._intrinsics.get(self.panel._rgb_left_camera_id()),
                           self.panel._aux_intrinsics)))
             self._worker, self._requested = worker, key
+            self._analysis_error = ''
             worker.signals.completed.connect(self._analyzed)
             QThreadPool.globalInstance().start(worker)
         self._update_counts()
         self._request_preview()
-        if self.analysis is None or self._key != key:
+        if self.reviewing:
+            self._show_review_feedback()
+        elif self._manual:
+            self._show_browsing_feedback()
+        elif self._analysis_error and self._key == key:
+            self.phase.setText('引导分析失败 · 原图仍保留')
+            self.action.setText('请查看日志；重新采集或导入后会重新分析，原图仍需验收')
+        elif self.analysis is None or self._key != key:
             self.phase.setText('正在分析采图数据；当前原图记录保留')
+            self.action.setText('正在更新采图建议；本次原图仍需验收')
         self._tooltips()
 
     @Slot(object, object, str)
@@ -258,17 +356,22 @@ class AuxCaptureGuide(QWidget):
         self._key = key
         if error:
             self.analysis = None
-            self.phase.setText('采图分析失败；可检查原图或重新导入')
-            self.action.setText(error)
+            self._analysis_error = error
+            self.refresh()
             self.panel._log('融合采图分析失败：' + error)
             return
         self.analysis = analysis
-        self._manual = False
+        self._analysis_error = ''
         if analysis.phase == 'complete':
-            self.panel._log('融合本轮采集完成，可以前往标定评估；仍可补拍，未宣称精度合格')
+            self.panel._log('融合本轮引导结束；满足标定条件后可计算，仍可补拍，不代表精度合格')
         self.render()
 
     def render(self):
+        if self.reviewing or self._manual:
+            self._show_browsing_feedback()
+            self._update_counts()
+            self._tooltips()
+            return
         analysis = self.analysis
         if analysis is None:
             return
@@ -277,16 +380,16 @@ class AuxCaptureGuide(QWidget):
         if analysis.target is None:
             seq._index = seq.total
             self.phase.setText('当前构图不可用 · 请调整板型或分辨率' if analysis.phase == 'blocked'
-                               else '本轮采集完成 · 可以前往标定评估')
+                               else '本轮引导结束 · 可继续补拍')
             missing = '、'.join(DISTANCE_NAMES[s] for s in analysis.missing)
             self.action.setText('当前板型与分辨率无法安全放入建议区域，请调整配置或手动选择构图'
                 if analysis.phase == 'blocked' else
                 ('仍待验证距离：' + missing + '；可继续补拍\n' if missing else '')
-                + '采图结束不代表标定精度合格')
+                + (self.panel._aux_calibration_problem() or '已满足计算条件，可前往标定评估；不代表精度合格'))
             self.phase.setStyleSheet(f'color:{WARNING if analysis.phase == "blocked" else SUCCESS}; font-weight:bold;')
             self.panel._aux_seq_widget.set_completion_message(
-                '当前构图不可用' if analysis.phase == 'blocked' else '本轮采集完成',
-                '请检查板型和分辨率' if analysis.phase == 'blocked' else '可前往标定评估，或继续补拍')
+                '当前构图不可用' if analysis.phase == 'blocked' else '本轮引导结束',
+                '请检查板型和分辨率' if analysis.phase == 'blocked' else '满足标定条件后可计算，仍可补拍')
         else:
             self.panel._aux_seq_widget.set_completion_message('', '')
             target = analysis.target
@@ -295,63 +398,251 @@ class AuxCaptureGuide(QWidget):
             if analysis.phase == 'repair':
                 seq.targets.append(capture)
                 seq._index = len(initial_plan())
-                stage = f'有限补采 {analysis.repair_count + 1}/{MAX_REPAIRS}'
+                stage = f'补采建议 {analysis.repair_count + 1}/{MAX_REPAIRS}'
             else:
                 seq._index = analysis.unique_count
                 seq.targets[seq._index] = capture
-                stage = f'基础采集 {analysis.unique_count + 1}/{analysis.initial_total}'
+                stage = f'基础采集 · 引导采用 {analysis.unique_count}/{analysis.initial_total}组'
             self.phase.setStyleSheet(f'color:{ACCENT}; font-weight:bold;')
             self.phase.setText(stage + ' · ' + DISTANCE_NAMES[target.scale])
             ir_pose = self.last_qualities[1].pose if len(self.last_qualities) == 2 else None
             if ir_pose is not None and ir_pose.get('distance_reliable', False):
                 low, high = AREA_RANGES[target.scale]
                 factor = ir_pose['distance_area'] * ir_pose['depth'] ** 2
-                self.phase.setText(self.phase.text() + f"\nIR 深度 {ir_pose['depth']:.2f} m"
+                self.phase.setText(self.phase.text() + f"\n{self.auxiliary_label}深度 {ir_pose['depth']:.2f} m"
                     f' · 目标 {np.sqrt(factor / high):.2f}–{np.sqrt(factor / low):.2f} m')
             else:
-                self.phase.setText(self.phase.text() + '\nIR 距离按占比近似，非实测距离')
+                self.phase.setText(self.phase.text() + f'\n{self.auxiliary_label}距离按画面占比估计，非实测')
             instruction_stage, action = guidance_action(
-                self.panel._aux_board_config(), target, self.last_qualities)
+                self.panel._aux_board_config(), target, self.last_qualities,
+                auxiliary_label=self.auxiliary_label)
             if instruction_stage == 'ready' and (
                     not 0 <= self._clock() - self._preview_result_at <= self.MAX_AGE
                     or self.stability_reasons(self._preview_detections)):
-                instruction_stage, action = 'stability', '双路保持静止至少0.6秒，再采集原图'
+                instruction_stage, action = 'stability', '保持整板可见，等待双路连续3次稳定检测'
+            if instruction_stage == 'tilt_unverified':
+                action += '；可手动采图，仍需原图验收'
             if instruction_stage in ('distance', 'position', 'quality'):
                 seq.targets[seq._index] = replace(capture, tilt=BoardTilt.FRONT)
             self.action.setText(action)
+        self._recommended_action = self.action.text()
         self.panel._aux_seq_widget.refresh()
         self.panel._aux_seq_widget._large_guide.show_distance = True
-        self.panel._aux_seq_widget._title_lbl.setText('建议构图 · 位置以 IR/辅助画面为准')
-        self.panel._aux_seq_widget._title_lbl.setToolTip(
-            '计划步骤不等于已验证姿态；当前帧以原图验收为准。上下/左右倾以RGB左目为参考。')
-        self.panel._aux_cap_progress.setMaximum(analysis.initial_total)
-        self.panel._aux_cap_progress.setValue(min(analysis.unique_count, analysis.initial_total))
-        self.panel._aux_cap_progress.setFormat(
-            f'非重复 {analysis.unique_count} 组 · 基础 {analysis.initial_total} 组')
+        self._reference_copy()
         if self.panel._active_step == 2:
             self.panel.sequence_updated.emit(seq)
         self._update_counts()
         self._tooltips()
 
-    def record_receipt(self, key, state, reasons, detections):
-        self.receipt.setText(f'{state} · {key} · RGB {detections[0].num_points}'
-                             f' / IR {detections[1].num_points}\n'
-                             + ('；'.join(reasons) if reasons else '原图已保存，已纳入质量可用数据'))
+    def _reference_copy(self):
+        widget = self.panel._aux_seq_widget
+        widget._title_lbl.setText(f'参考动作 · 位置以{self.auxiliary_label}画面为准')
+        widget._title_lbl.setToolTip(
+            '图中序号是参考动作，不是已采数量；浏览不增加采集记录。'
+            '上下/左右倾以RGB左目为参考，手动采图仍按本次原图验收。')
+
+    def record_receipt(self, key, state, reasons, detections, *, saved=True):
+        self._receipt_override = None
+        self._receipt_record = dict(key=key, state=state, reasons=list(reasons), saved=saved,
+                                    points=tuple(det.num_points for det in detections))
+        self._render_receipt()
         self.receipt.setStyleSheet(f'color:{SUCCESS if state == "可采纳" else WARNING};')
         self._tooltips()
+
+    def show_receipt_message(self, text):
+        self._receipt_override = text
+        self.receipt.setStyleSheet(f'color:{WARNING};')
+        self._render_receipt()
+        self._tooltips()
+
+    def _render_receipt(self):
+        if self._receipt_override:
+            self.receipt.setText(self._receipt_override)
+            self.receipt.setToolTip(self._receipt_override)
+            return
+        record = self._receipt_record
+        if record is None:
+            if self.panel._aux_imported_count:
+                self.receipt.setText(f'离线导入 {self.panel._aux_imported_count} 组 · 原图保留在源目录\n'
+                                     '验收通过与引导采用见统计，导入不等于姿态已验证')
+            self.receipt.setToolTip(self.receipt.text())
+            return
+        accepted = record['state'] == '可采纳'
+        decision = (self.analysis.sample_decisions.get(record['key'])
+                    if self.analysis and self._key == self.context_key() else None)
+        guidance = ('引导未采用' if not accepted else '引导已采用' if decision == 'included' else
+                    '引导未采用（重复构图）' if decision == 'duplicate' else
+                    '引导未采用' if decision else '引导分析失败' if self._analysis_error else '引导待更新')
+        points = ' / '.join(f'{name} {n}' for name, n in zip(self.camera_labels, record['points']))
+        storage = '原图已保存' if record['saved'] else '原图仅在内存'
+        state = '验收通过' if accepted else '验收待复核'
+        reasons = record['reasons'][:]
+        if decision in ('invalid_detection', 'size_mismatch'):
+            reasons.append('引导要求检测有效且图像尺寸一致；请检查本组原图')
+        detail = f'{points} · {guidance}'
+        if not accepted and reasons:
+            reason = reasons[0].split('，', 1)[0]
+            if any('验收记录写入失败' in value for value in reasons):
+                reason = '验收记录写入失败'
+            elif '稳定性未通过' in reason:
+                reason = '等待连续3次稳定检测'
+            detail = f'{guidance} · {reason}'
+        self.receipt.setText(f'{record["key"]} · {storage} · {state}\n{detail}')
+        self.receipt.setToolTip(self.receipt.text() + '\n' + points + '\n' + '；'.join(reasons)
+                               + '\n验收通过不代表物理角点对应已确认或标定精度合格。')
 
     def _update_counts(self):
         records = getattr(self.panel, '_aux_quality_records', [])
         detected = sum(r.get('detected', False) for r in records)
         unique = self.analysis.unique_count if self.analysis and self._key == self.context_key() else '待更新'
         pose_count = self.analysis.pose_count if self.analysis and self._key == self.context_key() else '待更新'
-        self.counts.setText(f'已保存 {self.panel._aux_saved_count} · 源目录 {self.panel._aux_imported_count}'
-                            f' · 检测有效 {detected}\n质量可用 {len(self.panel._aux_pairs)}'
-                            f' · 非重复 {unique} · 双路姿态可解 {pose_count}')
-        if self.analysis:
-            self.counts.setToolTip(self.analysis.summary + '\n姿态可解不等于推荐姿态已到位；临时内参不写入结果。')
+        if self._analysis_error and self._key == self.context_key():
+            unique = pose_count = '分析失败'
+        unique_text = f'{unique} 组' if isinstance(unique, int) else unique
+        self.counts.setText(f'原图已保存 {self.panel._aux_saved_count} 组 · 源目录 {self.panel._aux_imported_count} 组\n'
+                            f'验收通过 {len(self.panel._aux_pairs)} 组 · 引导采用 {unique_text}')
+        self.counts.setToolTip(
+            self.counts.text() + f'\n双路检测有效 {detected} 组 · 双路姿态可解 {pose_count} 组\n'
+            '引导采用按检测有效、尺寸一致且非重复的配对计数，不是参考动作完成数。'
+            '验收通过不代表物理角点对应已确认；姿态可解不等于推荐姿态已到位或精度合格。'
+            '\n稳定要求至少3次检测且跨度至少0.6秒；通常需静止约1秒或更久。'
+            + (self.analysis.summary if self.analysis and self._key == self.context_key() else ''))
         self.counts.setAccessibleName(self.counts.text())
+        total = self.analysis.initial_total if self.analysis and self._key == self.context_key() else len(initial_plan())
+        self.panel._aux_cap_progress.setMaximum(total)
+        self.panel._aux_cap_progress.setValue(min(unique, total) if isinstance(unique, int) else 0)
+        self.panel._aux_cap_progress.setFormat(f'引导采用 {unique_text} · 基础目标 {total} 组')
+        self.panel._aux_cap_progress.setToolTip(self.counts.toolTip())
+        self._render_receipt()
 
     def _tooltips(self):
-        for label in (self.phase, self.action, self.receipt):
+        self.refresh_workbench()
+        for label in (self.phase, self.action, self.next_step):
             label.setToolTip(label.text())
+
+    def refresh_workbench(self):
+        """Refresh presentation only; never start work or change capture eligibility."""
+        panel = self.panel
+        frames, pairing = panel._aux_live_frames()
+        fresh = (frames is not None and len(self.last_qualities) == 2
+                 and 0 <= self._clock() - self._preview_result_at <= self.MAX_AGE)
+        next_text, override = self._workbench_next_step(frames, fresh)
+        self.next_step.setText('下一步：' + next_text)
+        if override:
+            self.action.setText(override)
+        elif (not self.reviewing and not self._manual and self._recommended_action
+              and self.analysis is not None and self._key == self.context_key()):
+            self.action.setText(self._recommended_action)
+        self._update_target_info()
+        paused = self.reviewing or panel._aux_operation_busy()
+        statuses = {
+            'board': ('回看中，实时检查暂停' if self.reviewing else '等待检测', TEXT_DIM),
+            'quality': ('回看中，实时检查暂停' if self.reviewing else '等待检测', TEXT_DIM),
+            'stability': ('回看中，实时检查暂停' if self.reviewing else '等待连续3次检测', TEXT_DIM),
+            'pairing': ('回看中，非实时原图' if self.reviewing else
+                        '处理中' if paused else '软件已配对' if frames is not None else '未配对',
+                        TEXT_DIM if paused or frames is not None else WARNING),
+        }
+        reasons = []
+        if fresh and not paused:
+            detections = self._preview_detections
+            board = panel._aux_board_config()
+            complete = (len(detections) == 2 and all(
+                det.valid and det.num_points == board.cols * board.rows for det in detections))
+            statuses['board'] = ('双路完整可见' if complete else '未检测到双路完整板点',
+                                 SUCCESS if complete else WARNING)
+            reasons = [f'{name}：{quality_reason_text(reason)}'
+                       for name, quality in zip(self.camera_labels, self.last_qualities)
+                       for reason in quality.reasons]
+            passed = all(quality.accepted for quality in self.last_qualities)
+            statuses['quality'] = ('预检通过' if passed else '待调整，查看详情',
+                                   SUCCESS if passed else WARNING)
+            stable = not self.stability_reasons(detections)
+            statuses['stability'] = ('连续检测稳定' if stable else '保持静止，等待稳定',
+                                     SUCCESS if stable else WARNING)
+        for key, (text, color) in statuses.items():
+            value = self.check_values[key]
+            value.setText(text)
+            value.setStyleSheet(f'color:{color}; font-size:12px;')
+            detail = (pairing if key == 'pairing' else '；'.join(reasons) if key == 'quality'
+                      else '稳定需连续3次检测、跨度至少0.6秒' if key == 'stability' else '')
+            value.setToolTip(text + ('\n' + detail if detail else '')
+                             + '\n实时预检不是本次采图验收；保存、验收与引导采用分别统计。')
+        for label in (self.action, self.next_step):
+            label.setToolTip(label.text())
+
+    def _update_target_info(self):
+        board = self.panel._aux_board_config()
+        target = self.panel._aux_capture_sequence.current
+        if not self._manual and self.analysis is not None and self.analysis.target is not None:
+            planned = self.analysis.target
+            target = CaptureTarget(planned.row, planned.col, TILTS[planned.tilt],
+                                   scale=planned.scale)
+        if self.reviewing:
+            goal = '目标：回看原图，实时目标暂停'
+        elif self._analysis_error and self._key == self.context_key() and not self._manual:
+            goal = '目标：引导分析失败，原图仍保留'
+        elif not self._manual and (self.analysis is None or self._key != self.context_key()):
+            goal = '目标：等待采图建议更新'
+        elif target is not None:
+            prefix = '浏览参考' if self._manual else '目标'
+            goal = f'{prefix}：{DISTANCE_NAMES[target.scale]} · {target.label}'
+        elif self.analysis is not None and self.analysis.phase == 'blocked':
+            goal = '目标：当前构图不可用'
+        elif self._manual:
+            goal = '浏览参考：已浏览完，非采集进度'
+        else:
+            goal = '目标：本轮引导结束，可继续补拍'
+        pattern = '棋盘格' if board.pattern_type.value == 'chessboard' else '圆点阵'
+        self.target_info.setText(
+            f'{goal}\n{pattern} · 检测点 {board.cols}×{board.rows} · '
+            f'{board.square_size * 1000:g} mm')
+        self.target_info.setToolTip(self.target_info.text()
+            + f'\n位置以{self.auxiliary_label}画面为准，倾角以RGB左目为参考；距离占比不是实测距离。')
+
+    def _workbench_next_step(self, frames, fresh):
+        panel = self.panel
+        if self.reviewing:
+            return '结束回看，返回实时图像后再采集', None
+        if panel._aux_capture_worker is not None:
+            return ('等待本次原图检查与保存结果，暂勿重复采集',
+                    '正在检查本次原图，尚未确认保存')
+        if panel._white_balance_guard.busy:
+            return '等待白平衡准备完成，再采集配对图像', '正在准备白平衡'
+        if panel._aux_operation_busy():
+            return '等待当前后台任务完成，再继续采集或标定', '后台任务进行中，请稍候'
+        if self._receipt_override:
+            if '失败' in self._receipt_override or '未保存' in self._receipt_override:
+                return ('查看最近原图详情，处理失败原因后重新采图',
+                        self._receipt_override.split('\n', 1)[0])
+            if '尚未确认保存' in self._receipt_override:
+                return '等待本次原图检查与保存结果，暂勿重复采集', '本次原图尚未确认保存'
+        if self._manual:
+            text = ('当前仅浏览参考；可手动采图，采图后恢复推荐' if frames is not None else
+                    '当前仅浏览参考；连接两路实时图像后可手动采图，或导入原图')
+            return text, None
+        current = self._key == self.context_key()
+        if self._analysis_error and current:
+            return '查看日志；重新采集或导入后将重新分析引导', None
+        if self.analysis is None or not current:
+            return '等待采图建议更新；已有原图和独立计数保留', None
+        if self.analysis.phase == 'blocked':
+            return '调整标定板或分辨率配置，或手动选择可用构图', None
+        if self.analysis.target is None:
+            problem = panel._aux_calibration_problem()
+            return ('前往标定评估；' + problem if problem else
+                    '前往标定评估，计算后检查质量；仍可继续补拍'), None
+        if frames is None:
+            problem = panel._aux_calibration_problem()
+            return ('连接两路实时图像或导入配对原图' if problem else
+                    '可前往标定评估；继续实时补拍需连接两路图像'), None
+        stage, _ = guidance_action(panel._aux_board_config(), self.analysis.target,
+                                   self.last_qualities, auxiliary_label=self.auxiliary_label)
+        if stage == 'ready' and (not fresh or self.stability_reasons(self._preview_detections)):
+            return ('等待双路连续稳定检测，再采集配对图像',
+                    '保持整板可见，等待双路连续3次稳定检测')
+        if stage == 'ready':
+            return '采集配对图像；保存与验收后自动更新推荐', None
+        if stage == 'tilt_unverified':
+            return '人工确认倾角后可手动采图；本次原图仍需验收', None
+        return '完成当前动作后保持静止，再采集配对图像；本次原图仍需验收', None

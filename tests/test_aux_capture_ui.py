@@ -81,7 +81,12 @@ def test_stable_original_saved_with_quality_evidence_and_no_126_gate(panel, monk
     finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 1
     assert panel._aux_guide.analysis.unique_count == 1
-    assert 'RGB 24 / IR 24' in panel._aux_guide.receipt.text()
+    assert 'RGB左目 24 / 红外 24' in panel._aux_guide.receipt.text()
+    assert '验收通过' in panel._aux_guide.receipt.text()
+    assert '引导已采用' in panel._aux_guide.receipt.text()
+    assert panel._aux_reviews[-1].quality_state == '可采纳'
+    assert panel._aux_reviews[-1].display_quality_state == '验收通过'
+    assert '验收通过' in panel._aux_reviews[-1].result_text()
     path = panel._session.session_dir / 'multimodal/quality_0000.json'
     evidence = json.loads(path.read_text())
     assert evidence['state'] == '可采纳'
@@ -96,7 +101,10 @@ def test_unstable_photo_retained_but_not_counted_and_reimport_does_not_promote(p
     panel._on_capture_aux()
     finish_aux_tasks(panel)
     assert panel._aux_saved_count == 1 and not panel._aux_pairs
-    assert '稳定性未通过' in panel._aux_guide.receipt.text()
+    assert '稳定性未通过' in panel._aux_guide.receipt.toolTip()
+    assert '等待连续3次稳定检测' in panel._aux_guide.receipt.text()
+    assert panel._aux_reviews[-1].quality_state == '待复核'
+    assert panel._aux_reviews[-1].display_quality_state == '验收待复核'
     folder = panel._session.session_dir / 'multimodal'
     original = {p: p.read_bytes() for p in folder.iterdir()}
     worker = AuxImageImportWorker(str(folder), panel._aux_board_config())
@@ -131,8 +139,141 @@ def test_duplicate_raw_photos_do_not_advance_unique_progress(panel, monkeypatch,
     assert len(panel._aux_pairs) == 2 and panel._aux_saved_count == 2
     assert panel._aux_guide.analysis.unique_count == 1
     assert panel._aux_guide.analysis.duplicate_count == 1
-    assert '非重复 1' in panel._aux_guide.counts.text()
+    assert '引导采用 1 组' in panel._aux_guide.counts.text()
+    assert '验收通过 2 组' in panel._aux_guide.counts.text()
+    assert '引导未采用（重复构图）' in panel._aux_guide.receipt.text()
     assert panel._aux_capture_sequence.done_count == 0
+
+
+def test_browsing_second_reference_preserves_saved_and_rejected_counts(
+        panel, monkeypatch, finish_aux_tasks):
+    image = board_image()
+    live(panel, monkeypatch, image)
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    guide, widget = panel._aux_guide, panel._aux_seq_widget
+    counts = guide.counts.text()
+    widget._btn_next.click()
+    guide.refresh()
+    assert '浏览参考动作 2/17' in guide.phase.text()
+    assert '非采集进度' in guide.phase.text()
+    assert '浏览不增加采集记录' in guide.action.text()
+    assert '手动采图仍按原图验收' in guide.action.text()
+    assert '参考动作' in widget._title_lbl.text()
+    assert '已记录' not in widget._title_lbl.text()
+    assert '参考动作 2/17' in widget._large_guide.accessibleName()
+    assert widget._pending_action.text() == '下个参考动作'
+    assert guide.counts.text() == counts
+    assert '原图已保存 1 组' in counts
+    assert '验收通过 0 组 · 引导采用 0 组' in counts
+    assert panel._aux_cap_progress.value() == 0
+    panel._btn_aux_quality_details.click()
+    dialog = panel._capture_details_dialog
+    assert dialog.isVisible() and not dialog.isModal()
+    details = dialog.content.toPlainText()
+    assert 'RGB左目稳定性未通过' in details
+    assert '红外稳定性未通过' in details
+    assert 'RGB左目 24 / 红外 24' in details
+    dialog.close()
+
+
+@pytest.mark.parametrize('updates', [1, 2])
+def test_analysis_completion_preserves_manual_selection_until_next_capture(
+        panel, monkeypatch, finish_aux_tasks, updates):
+    guide, widget = panel._aux_guide, panel._aux_seq_widget
+    for _ in range(updates):
+        guide.data_changed()
+        assert guide._worker is not None
+        widget._btn_next.click()
+    chosen = panel._aux_capture_sequence.current_index
+    target = panel._aux_capture_sequence.current
+    assert guide._manual
+    assert '浏览参考动作' in guide.phase.text()
+    finish_aux_tasks(panel)
+    assert guide._key == guide.context_key()
+    assert guide._manual
+    assert panel._aux_capture_sequence.current_index == chosen
+    assert panel._aux_capture_sequence.current == target
+    assert f'浏览参考动作 {chosen + 1}/17' in guide.phase.text()
+    assert '引导采用 0 组' in guide.counts.text()
+    image = board_image()
+    live(panel, monkeypatch, image)
+    seed_stability(panel, image)
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    assert panel._aux_saved_count == 1
+    assert not guide._manual
+    assert '基础采集' in guide.phase.text()
+    assert '浏览参考动作' not in guide.phase.text()
+
+
+def test_save_failure_receipt_is_not_replaced_by_previous_success(
+        panel, monkeypatch, finish_aux_tasks):
+    image = board_image()
+    live(panel, monkeypatch, image)
+    seed_stability(panel, image)
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    assert '引导已采用' in panel._aux_guide.receipt.text()
+    monkeypatch.setattr(panel._session, 'save_multimodal_pair',
+                        lambda *args: (_ for _ in ()).throw(OSError('disk full')))
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    for _ in range(3):
+        panel._refresh_aux_readiness()
+    assert '原图保存失败' in panel._aux_guide.receipt.text()
+    assert '引导已采用' not in panel._aux_guide.receipt.text()
+    assert panel._aux_saved_count == len(panel._aux_pairs) == 1
+
+
+def test_analysis_failure_does_not_claim_analysis_is_still_running(panel, finish_aux_tasks):
+    finish_aux_tasks(panel)
+    guide = panel._aux_guide
+    guide._analyzed(guide.context_key(), None, 'controlled analysis failure')
+    for _ in range(3):
+        guide.refresh()
+    assert '引导分析失败' in guide.phase.text()
+    assert '正在分析' not in guide.phase.text()
+    assert '引导采用 分析失败' in guide.counts.text()
+    assert '分析失败 组' not in guide.counts.text()
+    guide.data_changed()
+    finish_aux_tasks(panel)
+    assert guide.analysis is not None
+    assert '引导采用 0 组' in guide.counts.text()
+
+
+def test_saved_receipt_does_not_reuse_old_guidance_decision_while_updating(
+        panel, monkeypatch, finish_aux_tasks):
+    image = board_image()
+    live(panel, monkeypatch, image)
+    seed_stability(panel, image)
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    assert '引导已采用' in panel._aux_guide.receipt.text()
+    panel._aux_guide.data_changed()
+    assert '引导待更新' in panel._aux_guide.receipt.text()
+    assert '引导已采用' not in panel._aux_guide.receipt.text()
+    finish_aux_tasks(panel)
+    assert '引导已采用' in panel._aux_guide.receipt.text()
+
+
+def test_acoustic_rgb_copy_does_not_describe_auxiliary_camera_as_infrared(
+        panel, monkeypatch, finish_aux_tasks):
+    from multicamera.calibration.planar import PatternBoardConfig
+
+    panel._sm.auxiliary_camera.modality = 'acoustic_rgb'
+    panel._sm.auxiliary_camera.board_config = PatternBoardConfig.ir_chessboard()
+    panel._aux_guide.reset()
+    finish_aux_tasks(panel)
+    assert '声像仪RGB距离' in panel._aux_guide.phase.text()
+    assert '红外' not in panel._aux_guide.phase.text()
+    image = board_image()
+    live(panel, monkeypatch, image)
+    seed_stability(panel, image)
+    panel._on_capture_aux()
+    finish_aux_tasks(panel)
+    assert '声像仪RGB 24' in panel._aux_guide.receipt.toolTip()
+    assert '红外' not in panel._aux_guide.receipt.toolTip()
 
 
 def test_stale_background_capture_does_not_save_to_new_context(panel, monkeypatch, finish_aux_tasks):
@@ -190,11 +331,11 @@ def test_initial_repair_completion_and_receipt_keep_fixed_geometry(panel, app, w
         app.processEvents()
         assert before == [(label.geometry().width(), label.height()) for label in
                           (guide.phase, guide.action, guide.counts, guide.receipt)]
-    assert '本轮采集完成' in guide.phase.text()
+    assert '本轮引导结束' in guide.phase.text()
     assert '待验证距离' in guide.action.text()
-    assert panel._aux_seq_widget._large_guide.completion_title == '本轮采集完成'
+    assert panel._aux_seq_widget._large_guide.completion_title == '本轮引导结束'
     guide.refresh()
-    assert '本轮采集完成' in guide.phase.text()  # Not a disappearing toast.
+    assert '本轮引导结束' in guide.phase.text()  # Not a disappearing toast.
     assert panel._btn_capture_aux.text()  # Manual supplement remains available.
 
 
@@ -358,10 +499,10 @@ def test_actual_import_button_to_completion_and_manual_supplement(panel, monkeyp
     assert len(panel._aux_pairs) == 21
     assert panel._aux_guide.analysis.unique_count == 21
     assert panel._aux_guide.analysis.phase == 'complete'
-    assert '本轮采集完成' in panel._aux_guide.phase.text()
+    assert '本轮引导结束' in panel._aux_guide.phase.text()
     assert '源目录 21' in panel._aux_guide.counts.text()
     assert panel._aux_capture_sequence.done_count == 0  # No invented pose verification.
-    assert all('建议' in action.text() for action in panel._aux_seq_widget._step_actions)
+    assert all('参考' in action.text() for action in panel._aux_seq_widget._step_actions)
     live(panel, monkeypatch, image)
     seed_stability(panel, image)
     panel._refresh_aux_readiness()

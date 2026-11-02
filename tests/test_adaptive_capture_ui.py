@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from PySide6.QtCore import QThreadPool
 from multicamera.calibration.intrinsic import IntrinsicCalibrator
@@ -60,7 +61,10 @@ def test_default_adaptive_worker_updates_overlay_without_final_intrinsics(stereo
     assert guide._analysis.recommendation.sample_count == 0
     assert win._stream_view._capture_sequence is guide._adaptive_sequence
     assert not panel._seq_widget.isVisible()
-    assert '建立初始模型' in guide.reason.text()
+    assert '初始建模' in guide.reason.text()
+    assert '建模样本 0 组' in guide.reason.text()
+    assert '需手动采图' in guide.next_step.text()
+    assert '无需等待绿色提示' in guide.next_step.text()
     initial = guide._target()
     add_pair(win)
     guide.refresh()
@@ -73,6 +77,60 @@ def test_default_adaptive_worker_updates_overlay_without_final_intrinsics(stereo
     key = guide._analysis_key
     guide.refresh()
     assert guide._analysis_key == key and guide._guidance_worker is None
+
+
+@pytest.mark.parametrize('count', [0, 1, 5, 6, 8])
+def test_initial_model_copy_distinguishes_minimum_count_from_model_readiness(stereo_bench, app, count):
+    from multicamera.calibration.adaptive_guidance import BOOTSTRAP_MIN_VIEWS
+
+    guide = activate(stereo_bench, app)
+    guide._analysis.recommendation = replace(guide._analysis.recommendation,
+        sample_count=count, pose_available=False, phase='initial')
+    guide.refresh()
+    assert '初始建模' in guide.reason.text()
+    assert f'建模样本 {count} 组' in guide.reason.text()
+    assert '首轮' not in guide.reason.text()
+    assert '手动' in guide.next_step.visible_text()
+    assert str(BOOTSTRAP_MIN_VIEWS) in guide.next_step.text()
+    assert '非重复有效配对' in guide.next_step.toolTip()
+    assert '原图验收' in guide.next_step.toolTip()
+    assert '暂不能判断' in guide.status.text()
+    assert '约1秒或更久' in guide.status.toolTip()
+    assert '请手动采集基础样本' in guide.panel._btn_auto.toolTip()
+    assert not guide.auto_ready()
+    if count < BOOTSTRAP_MIN_VIEWS:
+        assert '无需等待绿色提示' in guide.next_step.text()
+    else:
+        assert '模型尚未就绪' in guide.next_step.text()
+        assert '最低数量' in guide.next_step.text()
+        assert '左右、上下倾角' in guide.next_step.text()
+
+
+def test_model_available_copy_does_not_claim_current_frame_is_ready(stereo_bench, app):
+    win = stereo_bench
+    guide = activate(win, app)
+    _, _, intr = sample(win)
+    win._calib_panel._intrinsics.update({LEFT: deepcopy(intr), RIGHT: deepcopy(intr)})
+    guide.refresh()
+    settle(guide, app)
+    assert guide._analysis.recommendation.pose_available
+    assert '引导模型可用' in guide.reason.text()
+    assert '姿态辅助采集' in guide.next_step.text()
+    assert '非最终标定' in guide.next_step.text()
+    assert '需手动采图' not in guide.next_step.text()
+    assert '可以采集' not in guide.instruction.text()
+    assert not guide.auto_ready()
+
+
+def test_initial_model_copy_preserves_save_wait_priority(stereo_bench, app):
+    guide = activate(stereo_bench, app)
+    guide.panel._pending_save_tokens.add('pending')
+    guide.refresh()
+    assert guide._instruction_stage == 'saving'
+    assert '等待原图保存完成' in guide.instruction.text()
+    assert '原图正在保存' in guide.next_step.text()
+    assert '保存确认后' in guide.next_step.text()
+    assert not guide.auto_ready()
 
 
 def test_pending_failed_saves_and_stale_results_do_not_advance(stereo_bench, app):
@@ -147,9 +205,119 @@ def test_adaptive_layout_and_background_failure_fallback(stereo_bench, app, tmp_
         win.grab().save(str(directory / f'adaptive-capture-{width}.png'))
     key, _ = guide._guidance_context()
     guide._guidance_completed(key, None, 'synthetic analysis failure')
-    assert '回退固定计划' in guide.reason.text()
+    assert '固定参考' in guide.reason.text()
+    assert '已回退' not in guide.reason.text()
+    assert '自动采集已暂停' in guide.instruction.text()
+    assert '等待当前配置分析完成' not in guide.next_step.text()
+    assert '重新分析' in guide.next_step.text()
+    assert guide.guide_mode.currentData() == 'adaptive'
+    assert guide.btn_retry_guidance.isVisible() and guide.btn_retry_guidance.isEnabled()
     assert win._stream_view._capture_sequence is win._calib_panel._capture_sequence
     assert not guide.auto_ready()
+    panel = win._calib_panel
+    panel._pending_save_tokens.add('pending')
+    guide.refresh()
+    assert not guide.btn_retry_guidance.isEnabled()
+    panel._pending_save_tokens.clear()
+    guide.refresh()
+    guide.btn_retry_guidance.click()
+    assert guide._guidance_worker is not None
+    assert not guide._guidance_error
+    settle(guide, app)
+    assert guide._analysis is not None
+    assert guide._analysis.recommendation.sample_count == 1
+    assert not guide.btn_retry_guidance.isVisible()
+    assert '分析失败' not in guide.instruction.text()
+
+
+@pytest.mark.parametrize('count', [56, 126])
+def test_saved_calibration_data_explains_actual_guidance_inclusion(
+        stereo_bench, app, monkeypatch, tmp_path, count):
+    from multicamera.calibration.stereo import StereoCalibrator
+    from multicamera.io.session import CalibrationSession
+    from test_calibration_workflow import wait_until
+
+    win = stereo_bench
+    panel, guide = win._calib_panel, activate(win, app)
+    det, frame, _ = sample(win)
+    det.charuco_corners = det.charuco_corners[:count]
+    det.charuco_ids = det.charuco_ids[:count]
+    session = CalibrationSession.create(tmp_path / 'capture', win._board, [])
+    panel.set_session(session)
+    win._current_session = session
+    panel._check_wb.setChecked(False)
+    panel._intr_cals = {cid: IntrinsicCalibrator(win._board, min_frames=6) for cid in (LEFT, RIGHT)}
+    panel._stereo_cals = {'rgb': StereoCalibrator(win._board, min_frames=6)}
+    panel._fqs = {LEFT: [], RIGHT: []}
+    for cid in (LEFT, RIGHT):
+        monkeypatch.setattr(panel._intr_cals[cid].detector, 'detect', lambda image: deepcopy(det))
+    publish_stable(win, det, frame)
+    settle(guide, app)
+    panel._refresh_capture_readiness()
+    assert '仅连接检查' in panel._lbl_capture_readiness.text()
+    assert '不代表角点' in panel._lbl_capture_readiness.toolTip()
+    assert '配对就绪' not in panel._lbl_capture_readiness.text()
+    if count == 56:
+        assert '已检出' in guide.compact_summary.text()
+        assert '局部角点' in guide.instruction.text()
+        assert '分布过于集中' in guide.pose_status.text()
+        assert not guide.auto_ready()
+    panel._on_capture()
+    wait_until(app, lambda: not panel._pending_save_tokens and not panel._save_workers)
+    guide.refresh()
+    settle(guide, app)
+    assert panel._stereo_cals['rgb'].num_frames == 1
+    assert '计入标定数据' in panel._lbl_capture_decision.text()
+    assert '已保存' in guide.receipt.text()
+    if count == 56:
+        assert guide._analysis.recommendation.sample_count == 0
+        assert '未计入引导' in guide.receipt.text()
+        assert '左目：已检出角点' in guide.receipt.toolTip()
+        assert '右目：已检出角点' in guide.receipt.toolTip()
+        assert '仍保留为标定数据' in guide.receipt.toolTip()
+    else:
+        assert guide._analysis.recommendation.sample_count == 1
+        assert '已计入引导' in guide.receipt.text()
+        publish_stable(win, det, frame)
+        panel._on_capture()
+        wait_until(app, lambda: not panel._pending_save_tokens and not panel._save_workers)
+        guide.refresh()
+        settle(guide, app)
+        assert panel._stereo_cals['rgb'].num_frames == 2
+        assert guide._analysis.recommendation.sample_count == 1
+        assert '重复构图，未增加引导样本' in guide.receipt.text()
+        assert '0000' in guide.receipt.toolTip()
+    old_key = guide._analysis_key
+    panel._guidance_failed_saves.add((id(session), 'rgb', 'different-frame'))
+    guide.refresh()
+    assert guide._analysis_key == old_key
+    assert '引导复核中' in guide.receipt.text()
+    assert '已计入引导' not in guide.receipt.text()
+    settle(guide, app)
+
+
+@pytest.mark.parametrize('count', [1, 3, 5])
+def test_few_detected_points_are_not_described_as_missing_board(stereo_bench, app, count):
+    win = stereo_bench
+    guide = activate(win, app)
+    det, frame, _ = sample(win)
+    det.charuco_corners = det.charuco_corners[:count]
+    det.charuco_ids = det.charuco_ids[:count]
+    publish_stable(win, det, frame)
+    settle(guide, app)
+    assert all(s['detected'] and not s['valid'] for s in guide.samples.values())
+    assert '已检出' in guide.compact_summary.text()
+    assert '可用角点不足6个' in guide.pose_status.text()
+    assert '局部角点' in guide.instruction.text()
+    assert not guide.auto_ready()
+
+
+def test_no_single_pair_context_does_not_show_permanent_guidance_wait(
+        stereo_bench, app, monkeypatch):
+    guide = activate(stereo_bench, app)
+    monkeypatch.setattr(guide, '_guidance_context', lambda: (None, None))
+    assert guide._guidance_receipt(None, None, '已保存') == ('', '')
+    assert guide._guidance_receipt(None, None, '保存中') == ('', '')
 
 
 def test_calibrated_adaptive_auto_requires_both_camera_poses(stereo_bench, app):

@@ -176,8 +176,11 @@ def test_view_switch_and_fixed_moving_edge_caption_preserve_animation_state(app)
     assert guide.progress == .6 and guide.pause.isChecked()
     guide.set_compact(True)
     assert guide.view_options.isHidden()
+    assert guide.legend.isVisible()
+    assert [label.text() for label in guide.legend_labels] == ['固定边', '移动边', '目标']
     guide.expand.setChecked(True)
     assert not guide.view_options.isHidden()
+    assert guide.legend.isVisible()
     guide.close()
 
 

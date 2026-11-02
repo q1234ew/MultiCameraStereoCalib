@@ -109,6 +109,77 @@ def test_matching_ids_not_list_position(board):
     assert analyze(board, {'L': data['L'], 'R': []}).recommendation.sample_count == 0
 
 
+@pytest.mark.parametrize('narrow_camera', ['L', 'R', 'both'])
+def test_guidance_decisions_report_actual_partial_geometry_exclusions(board, narrow_camera):
+    data = paired(board)
+    for camera in data:
+        if narrow_camera in (camera, 'both'):
+            obs = data[camera][0]
+            obs.corners, obs.ids = obs.corners[:24], obs.ids[:24]
+    result = analyze(board, data)
+    assert result.recommendation.sample_count == 0
+    expected = ('L', 'R') if narrow_camera == 'both' else (narrow_camera,)
+    assert result.sample_decisions['0'] == {
+        'status': 'excluded', 'camera_reasons': dict.fromkeys(expected, 'narrow_board_extent')}
+    for camera in expected:
+        reasons = []
+        assert ag.measure_composition(board, data[camera][0], rejections=reasons) is None
+        assert reasons == ['narrow_board_extent']
+        assert '已检出角点' in ag.guidance_reason_text(reasons[0])
+
+
+def test_guidance_decisions_distinguish_inclusion_duplicates_missing_and_conflicts(board):
+    data = paired(board, count=2)
+    data['L'].append(observation(board, 'left-only'))
+    data['R'].append(observation(board, 'conflict'))
+    data['L'].extend([observation(board, 'conflict'),
+                      observation(board, 'conflict', center=(.2, .1))])
+    result = analyze(board, data)
+    assert result.recommendation.sample_count == 1
+    assert result.sample_decisions == {
+        '0': {'status': 'included'},
+        '1': {'status': 'duplicate', 'reason': 'duplicate_composition', 'source_frame': '0'},
+        'left-only': {'status': 'excluded', 'camera_reasons': {'R': 'missing_pair'}},
+        'conflict': {'status': 'excluded', 'camera_reasons': {'L': 'conflicting_frame_id'}}}
+
+
+def test_guidance_decisions_report_inconsistent_sizes_without_mutating_observations(board):
+    data = diverse(board, count=3)
+    for camera in data:
+        data[camera][2].image_size = (1600, 1200)
+    before = deepcopy(data)
+    result = analyze(board, data)
+    assert result.recommendation.sample_count == 2
+    assert result.sample_decisions['2'] == {
+        'status': 'excluded', 'reason': 'inconsistent_image_size'}
+    for camera in data:
+        for a, b in zip(data[camera], before[camera]):
+            np.testing.assert_array_equal(a.corners, b.corners)
+            np.testing.assert_array_equal(a.ids, b.ids)
+            assert a.image_size == b.image_size
+
+
+def test_well_distributed_partial_board_is_still_included_for_guidance(board):
+    data = paired(board)
+    for frames in data.values():
+        obs = frames[0]
+        keep = obs.ids % 8 < 6
+        obs.corners, obs.ids = obs.corners[keep], obs.ids[keep]
+        assert len(obs.ids) < board.num_corners
+    result = analyze(board, data)
+    assert result.recommendation.sample_count == 1
+    assert result.sample_decisions['0'] == {'status': 'included'}
+
+
+def test_malformed_observation_without_source_id_does_not_crash_reason_reporting(board):
+    data = paired(board)
+    data['L'] = [None]
+    result = analyze(board, data)
+    assert result.recommendation.sample_count == 0
+    assert result.sample_decisions['0'] == {
+        'status': 'excluded', 'camera_reasons': {'L': 'missing_pair'}}
+
+
 @pytest.mark.parametrize('kind', ['nan', 'ids', 'repeated-id', 'few', 'shape', 'outside',
                                   'size', 'fractional-id', 'collinear', 'partial'])
 def test_invalid_observations_do_not_count(board, kind):

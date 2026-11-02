@@ -632,8 +632,11 @@ class _LargeGuideDiagram(QWidget):
         if zone is not None:
             targets = [t for t in self._targets if (t.zone_row, t.zone_col) == zone]
             done = sum(t.status == CaptureStatus.DONE for t in targets)
-            self.setToolTip(f'{STEREO_ZONE_LABELS[zone]} · 已采 {done}/{len(targets)}\n'
-                            '选择该区域待采姿态；距离为计划提示，并非实时测距')
+            self.setToolTip(
+                f'{STEREO_ZONE_LABELS[zone]} · 参考动作 {len(targets)} 项\n浏览不增加采集记录'
+                if self.recommendations_only else
+                f'{STEREO_ZONE_LABELS[zone]} · 已采 {done}/{len(targets)}\n'
+                '选择该区域待采姿态；距离为计划提示，并非实时测距')
         else:
             self.setToolTip(self.accessibleName() + '\n记录状态不代表实际姿态已自动验证')
         super().mouseMoveEvent(event)
@@ -680,7 +683,7 @@ class _LargeGuideDiagram(QWidget):
             CaptureStatus.SKIPPED: ('已跳过', WARNING),
         }[t.status]
         if self.recommendations_only and t.status == CaptureStatus.PENDING:
-            status = '建议'
+            status = '参考'
 
         # ── header: badge | label | hint ──
         hdr_h = 28
@@ -1051,14 +1054,29 @@ class CaptureSequenceWidget(QFrame):
         self._large_guide._targets = self._sequence.targets
         self._large_guide.recommendations_only = self.recommendations_only
         if self.recommendations_only:
-            self._btn_steps.setToolTip('建议姿态清单仅供浏览；图像数量和姿态验证另计')
+            idx = self._sequence.current_index
+            self._title_lbl.setText('参考动作 · 非采集进度')
+            self._title_lbl.setToolTip('图中编号是参考动作序号；原图已保存、验收通过和引导采用分别统计。')
+            self._progress_lbl.setText(f'参考动作 {min(idx + 1, total)}/{total}')
+            self._btn_steps.setToolTip('参考动作清单；浏览或跳过参考动作不会增加采集记录')
+            self._btn_steps.setAccessibleName('浏览参考动作清单')
+            self._btn_expand.setToolTip('展开参考动作示意')
+            self._btn_expand.setAccessibleName('展开参考动作示意')
+            self._pending_action.setText('下个参考动作')
+            self._btn_prev.setToolTip('浏览上个参考动作，不增加采集记录')
+            self._btn_prev.setAccessibleName('上个参考动作')
+            self._btn_next.setToolTip('浏览下个参考动作，不增加采集记录')
+            self._btn_next.setAccessibleName('下个参考动作')
+            self._btn_skip.setToolTip('跳过当前参考动作，不增加采集记录')
         names = {CaptureStatus.DONE: ('已采', 'check', SUCCESS),
                  CaptureStatus.SKIPPED: ('跳过', 'circle-minus', WARNING),
                  CaptureStatus.PENDING: ('待采', 'scan-line', TEXT_DIM)}
         for index, (target, action) in enumerate(zip(self._sequence.targets, self._step_actions)):
             label, icon, color = names[target.status]
             if self.recommendations_only and target.status == CaptureStatus.PENDING:
-                label = '建议'
+                label = '参考'
+            elif self.recommendations_only and target.status == CaptureStatus.SKIPPED:
+                label = '已跳过参考'
             current = ' · 当前' if index == self._sequence.current_index else ''
             action.setText(f'{index + 1:02d}  {target.label}  · {label}{current}')
             action.setIcon(app_icon(icon, color))
@@ -1072,6 +1090,8 @@ class CaptureSequenceWidget(QFrame):
         accessible = (f'{idx + 1}/{total}，{cur.label}；{summary}' if cur is not None else
                       '；'.join(self._large_guide.completion_message)
                       if self._large_guide.completion_message else f'引导已浏览完；{summary}')
+        if self.recommendations_only and cur is not None:
+            accessible = f'参考动作 {idx + 1}/{total}，{cur.label}；浏览不增加采集记录'
         self._large_guide.setAccessibleName(accessible)
         self._large_guide.setToolTip(accessible + '\n记录状态不代表姿态覆盖已自动验证')
         if cur is not None:

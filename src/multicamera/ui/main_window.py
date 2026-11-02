@@ -6,7 +6,7 @@ import logging
 from copy import deepcopy
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize
+from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
@@ -110,12 +110,24 @@ class MainWindow(QMainWindow):
 
         self._workspace = QWidget()
         workspace = QVBoxLayout(self._workspace)
-        workspace.setContentsMargins(6, 8, 6, 8)
+        workspace.setContentsMargins(12, 12, 12, 8)
         workspace.setSpacing(8)
         self._stereo_capture = StereoCaptureWorkspace(
             self._calib_panel, self._stream_view, self._board,
         )
-        workspace.addWidget(self._stereo_capture.banner)
+        self._stereo_capture.layout().insertWidget(0, self._stereo_capture.banner)
+        self._preview_heading = QWidget()
+        self._preview_heading.setFixedHeight(32)
+        heading = QHBoxLayout(self._preview_heading)
+        heading.setContentsMargins(2, 0, 2, 0)
+        heading.setSpacing(12)
+        self._preview_title = QLabel('双路预览')
+        self._preview_title.setObjectName('workbenchSectionTitle')
+        heading.addWidget(self._preview_title)
+        self._preview_note = QLabel('原图检测 · 软件配对')
+        self._preview_note.setStyleSheet(f'color:{TEXT_DIM}; font-size:12px;')
+        heading.addWidget(self._preview_note)
+        heading.addStretch()
         self._review_bar = QWidget()
         review = QHBoxLayout(self._review_bar)
         review.setContentsMargins(6, 0, 6, 0)
@@ -130,7 +142,7 @@ class MainWindow(QMainWindow):
         self._btn_end_review.setIcon(app_icon('undo-2'))
         self._btn_end_review.clicked.connect(self._stream_view.end_review)
         review.addWidget(self._btn_end_review)
-        workspace.addWidget(self._review_bar)
+        heading.addWidget(self._review_bar, 1)
         self._review_bar.hide()
         self._preview_body = QWidget()
         preview_body = QVBoxLayout(self._preview_body)
@@ -139,14 +151,19 @@ class MainWindow(QMainWindow):
         self._capture_preview_splitter = QSplitter(Qt.Horizontal)
         self._capture_preview_splitter.setChildrenCollapsible(False)
         self._capture_preview_splitter.setHandleWidth(5)
-        self._capture_preview_splitter.addWidget(self._stream_view)
+        self._preview_left = QWidget()
+        self._preview_left_layout = QVBoxLayout(self._preview_left)
+        self._preview_left_layout.setContentsMargins(0, 0, 6, 0)
+        self._preview_left_layout.setSpacing(10)
+        self._preview_left_layout.addWidget(self._preview_heading)
+        self._preview_left_layout.addWidget(self._stream_view, 1)
+        self._capture_preview_splitter.addWidget(self._preview_left)
         self._guide_scroll = QScrollArea()
         self._guide_scroll.setFrameShape(QFrame.NoFrame)
         self._guide_scroll.setWidgetResizable(True)
-        self._guide_scroll.setMinimumWidth(300)
-        self._guide_scroll.setMaximumWidth(440)
+        self._guide_scroll.setMinimumWidth(320)
+        self._guide_scroll.setMaximumWidth(480)
         self._guide_scroll.setWidget(self._stereo_capture)
-        self._calib_panel.set_stereo_receipt(self._stereo_capture.receipt)
         self._capture_preview_splitter.addWidget(self._guide_scroll)
         self._capture_preview_splitter.setStretchFactor(0, 1)
         self._capture_preview_splitter.setStretchFactor(1, 0)
@@ -161,14 +178,28 @@ class MainWindow(QMainWindow):
         self._capture_bottom_layout = QHBoxLayout(self._capture_bottom)
         self._capture_bottom_layout.setContentsMargins(0, 0, 0, 0)
         self._capture_actions = QWidget()
-        self._capture_actions.setMinimumWidth(310)
+        self._capture_actions.setMinimumWidth(0)
         self._capture_actions.setMaximumWidth(400)
         self._capture_actions_layout = QVBoxLayout(self._capture_actions)
         self._capture_actions_layout.setContentsMargins(0, 0, 0, 0)
         self._capture_actions_layout.setSizeConstraint(QLayout.SetMinimumSize)
         self._gallery = PairGallery()
         self._gallery._toggle.toggled.connect(self._on_gallery_expansion_changed)
-        self._capture_bottom_layout.addWidget(self._gallery, 1, Qt.AlignTop)
+        self._preview_left_layout.addWidget(self._gallery)
+        self._receipt_strip = QWidget()
+        self._receipt_strip.setObjectName('captureReceiptStrip')
+        receipt = QHBoxLayout(self._receipt_strip)
+        receipt.setContentsMargins(8, 4, 4, 4)
+        receipt.addWidget(self._stereo_capture.receipt, 1)
+        self._btn_receipt_details = QToolButton()
+        self._btn_receipt_details.setText('回看原图')
+        self._btn_receipt_details.setAccessibleName('回看当前回执原图')
+        self._btn_receipt_details.setIcon(app_icon('chevron-right'))
+        self._btn_receipt_details.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_receipt_details.setToolTip('回看当前回执对应原图及其保存、验收结果')
+        self._btn_receipt_details.clicked.connect(self._show_latest_capture)
+        receipt.addWidget(self._btn_receipt_details)
+        self._preview_left_layout.addWidget(self._receipt_strip)
         self._capture_bottom_layout.addWidget(self._capture_actions)
         workspace.addWidget(self._capture_bottom)
         self._calib_panel._capture_readiness = self._stereo_capture.auto_ready
@@ -197,6 +228,10 @@ class MainWindow(QMainWindow):
         self._aux_panel_dialogs = {}
         self._logs_widget.hide()
         self._toggle_logs.toggled.connect(self._toggle_log_panel)
+        self._capture_ui_timer = QTimer(self)
+        self._capture_ui_timer.setInterval(250)
+        self._capture_ui_timer.timeout.connect(self._refresh_capture_navigation)
+        self._capture_ui_timer.start()
 
         self._inspector = QFrame()
         self._inspector.setObjectName("inspectorColumn")
@@ -258,6 +293,7 @@ class MainWindow(QMainWindow):
         self._guide_scroll.setVisible(active)
         self._stereo_capture.banner.setVisible(active)
         self._capture_actions.setVisible(active)
+        self._receipt_strip.setVisible(active)
         self._inspector.setVisible(not active)
         self._view_aux.setVisible(not active)
         self._view_split.setVisible(not active)
@@ -275,8 +311,11 @@ class MainWindow(QMainWindow):
 
     def _sync_capture_density(self):
         compact = self._capture_layout_active
-        if compact == getattr(self, '_compact_capture', None):
+        density = (compact, self.height() < 900)
+        previous = getattr(self, '_capture_density', None)
+        if density == previous:
             return
+        self._capture_density = density
         self._compact_capture = compact
         self._stereo_capture.set_compact(compact)
         self._calib_panel.set_capture_footer_compact(compact)
@@ -285,27 +324,28 @@ class MainWindow(QMainWindow):
         self._capture_bottom_layout.setDirection(
             QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight,
         )
-        if compact:
-            self._gallery_before_compact = self._gallery._toggle.isChecked()
+        self._gallery.setFixedHeight(38 if self.height() < 900 else 150)
+        if density[1] != (previous[1] if previous else False):
             self._changing_gallery_density = True
-            self._gallery._toggle.setChecked(False)
-            self._changing_gallery_density = False
-        elif hasattr(self, '_gallery_before_compact'):
-            self._changing_gallery_density = True
-            self._gallery._toggle.setChecked(self._gallery_before_compact)
+            if density[1]:
+                self._gallery_before_small = self._gallery._toggle.isChecked()
+                self._gallery._toggle.setChecked(False)
+            else:
+                self._gallery._toggle.setChecked(getattr(self, '_gallery_before_small', True))
             self._changing_gallery_density = False
         self._capture_preview_splitter.setOrientation(Qt.Horizontal)
-        self._capture_preview_splitter.setSizes([750, 350])
+        self._capture_preview_splitter.setSizes([max(600, self.width() - 420), 400])
 
     def _on_gallery_expansion_changed(self, expanded):
         if getattr(self, '_compact_capture', False) and not getattr(self, '_changing_gallery_density', False):
             self._gallery_before_compact = expanded
+        if self.height() < 900 and not getattr(self, '_changing_gallery_density', False):
+            self._gallery_before_small = expanded
         if hasattr(self, '_aux_panel_dialogs'):
             self._sync_auxiliary_panels()
 
     def _sync_auxiliary_panels(self):
         """Keep low-height windows usable without compressing the video area."""
-        floating = self._capture_layout_active or self.height() < 900
         panels = (
             ('gallery', '配对图像', self._gallery._body, self._gallery.layout(), 1,
              self._gallery._toggle, bool(self._gallery._pairs)),
@@ -313,6 +353,7 @@ class MainWindow(QMainWindow):
              self._logs_workspace_index, self._toggle_logs, True),
         )
         for key, title, widget, home, index, toggle, available in panels:
+            floating = self.height() < 900 or (key == 'logs' and self._capture_layout_active)
             toggle.setToolTip(f'在独立窗口查看{title}' if floating else f'展开或收起{title}')
             dialog = self._aux_panel_dialogs.get(key)
             expanded = toggle.isChecked() and available
@@ -371,7 +412,48 @@ class MainWindow(QMainWindow):
             row.addWidget(button)
         self._view_split.setChecked(True)
         self._view_aux.setEnabled(False)
+        self._btn_import_capture = QToolButton()
+        self._btn_import_capture.setText('导入图片')
+        self._btn_import_capture.setIcon(app_icon('folder-input'))
+        self._btn_import_capture.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_import_capture.setAccessibleName('导入当前任务的配对图片')
+        self._btn_import_capture.clicked.connect(self._import_capture_images)
+        row.addWidget(self._btn_import_capture)
         return header
+
+    def _import_capture_images(self):
+        panel = self._calib_panel
+        button = panel._btn_import_aux if panel._active_step == 2 else panel._btn_import
+        if panel.workflow_phase == 'capture' and button.isEnabled():
+            button.click()
+
+    def _show_latest_capture(self):
+        """Resolve the displayed receipt, never fall back to an unrelated group's image."""
+        panel = self._calib_panel
+        pairs = panel.preview_pairs()
+        key = self._stereo_capture.receipt_key
+        latest = next((p for p in pairs if p.key == key), None)
+        if latest is not None:
+            self._on_gallery_pair_selected(latest.key, {latest.left_id: latest.left,
+                                                       latest.right_id: latest.right})
+
+    def _refresh_capture_navigation(self):
+        panel = self._calib_panel
+        if not hasattr(self, '_btn_import_capture'):
+            return
+        capture = panel.workflow_phase == 'capture'
+        self._btn_import_capture.setVisible(capture)
+        source = panel._btn_import_aux if panel._active_step == 2 else panel._btn_import
+        self._btn_import_capture.setEnabled(capture and source.isEnabled())
+        self._btn_import_capture.setToolTip(source.toolTip() or '导入配对原图，保留原始文件')
+        self._btn_import_capture.setText(source.text())
+        self._stereo_capture._refresh_receipt(list(panel._selected_pairs().values()), panel.offline_selection)
+        key = self._stereo_capture.receipt_key
+        has_capture = key is not None and any(p.key == key for p in self._gallery._pairs)
+        self._btn_receipt_details.setEnabled(has_capture)
+        self._btn_receipt_details.setVisible(not bool(panel.offline_selection))
+        self._preview_note.setText('离线原图 · 不修改源文件' if panel.offline_selection else
+                                   '原图检测 · 软件配对')
 
     def _create_cloud_placeholder(self) -> QWidget:
         placeholder = QWidget()
@@ -445,39 +527,6 @@ class MainWindow(QMainWindow):
         brand = QLabel("MultiCamera")
         brand.setStyleSheet(f"font-size:17px; font-weight:bold; color:{TEXT}; padding:0 10px;")
         toolbar.addWidget(brand)
-        self._lbl_connections = QLabel("未连接")
-        self._lbl_connections.setMinimumWidth(100)
-
-        self._act_start_streams = self._create_action("连接相机")
-        self._act_start_streams.setIcon(standard_icon(self, QStyle.SP_MediaPlay))
-        self._act_start_streams.setToolTip('连接已配置的相机')
-        toolbar.addAction(self._act_start_streams)
-
-        self._act_stop_streams = self._create_action("断开")
-        self._act_stop_streams.setIcon(standard_icon(self, QStyle.SP_MediaStop))
-        self._act_stop_streams.setEnabled(False)
-        self._act_stop_streams.setToolTip('断开全部相机')
-        toolbar.addAction(self._act_stop_streams)
-        toolbar.widgetForAction(self._act_stop_streams).setToolButtonStyle(Qt.ToolButtonIconOnly)
-        toolbar.addWidget(self._lbl_connections)
-
-        toolbar.addSeparator()
-
-        self._act_config_tb = self._create_action("相机配置")
-        self._act_config_tb.setIcon(standard_icon(self, QStyle.SP_FileDialogDetailedView))
-        self._act_config_tb.setToolTip('配置相机连接、融合相机和标定板')
-        toolbar.addAction(self._act_config_tb)
-
-        self._act_gen_board_tb = self._create_action("生成标定板")
-
-        self._act_rgb_settings_tb = self._create_action("RGB 参数")
-        self._act_rgb_settings_tb.setIcon(app_icon('sliders-horizontal'))
-        self._act_rgb_settings_tb.setToolTip('同步调整左右 RGB 相机参数')
-        toolbar.addAction(self._act_rgb_settings_tb)
-        toolbar.addSeparator()
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(spacer)
         self._session_button = QToolButton()
         self._session_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._session_button.setIcon(app_icon('folder-open'))
@@ -490,6 +539,37 @@ class MainWindow(QMainWindow):
         self._session_menu.addAction(self._act_load_session)
         self._session_button.setMenu(self._session_menu)
         toolbar.addWidget(self._session_button)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+        self._lbl_connections = QLabel("未连接")
+        self._lbl_connections.setMinimumWidth(100)
+        toolbar.addWidget(self._lbl_connections)
+
+        self._act_start_streams = self._create_action("连接相机")
+        self._act_start_streams.setIcon(standard_icon(self, QStyle.SP_MediaPlay))
+        self._act_start_streams.setToolTip('连接已配置的相机')
+        toolbar.addAction(self._act_start_streams)
+
+        self._act_stop_streams = self._create_action("断开")
+        self._act_stop_streams.setIcon(standard_icon(self, QStyle.SP_MediaStop))
+        self._act_stop_streams.setEnabled(False)
+        self._act_stop_streams.setToolTip('断开全部相机')
+        toolbar.addAction(self._act_stop_streams)
+        toolbar.widgetForAction(self._act_stop_streams).setToolButtonStyle(Qt.ToolButtonIconOnly)
+        toolbar.addSeparator()
+
+        self._act_config_tb = self._create_action("相机设置")
+        self._act_config_tb.setIcon(standard_icon(self, QStyle.SP_FileDialogDetailedView))
+        self._act_config_tb.setToolTip('配置相机连接、融合相机和标定板')
+        toolbar.addAction(self._act_config_tb)
+
+        self._act_gen_board_tb = self._create_action("生成标定板")
+
+        self._act_rgb_settings_tb = self._create_action("RGB 参数")
+        self._act_rgb_settings_tb.setIcon(app_icon('sliders-horizontal'))
+        self._act_rgb_settings_tb.setToolTip('同步调整左右 RGB 相机参数')
+        toolbar.addAction(self._act_rgb_settings_tb)
         self._sync_toolbar_density()
 
     def _sync_toolbar_density(self):
@@ -561,6 +641,8 @@ class MainWindow(QMainWindow):
         self._calib_panel.configure_stereo_requested.connect(lambda: self._on_config(False))
         self._calib_panel.model_choice_requested.connect(self._on_model_choice)
         self._calib_panel.data_source_changed.connect(self._update_connection_summary)
+        self._calib_panel.data_source_changed.connect(self._refresh_capture_navigation)
+        self._calib_panel._combo_pair.currentTextChanged.connect(self._refresh_capture_navigation)
         self._calib_panel.offline_imported.connect(self._gallery.show_first_page)
         self._calib_panel.diagnostic_preview_requested.connect(self._on_gallery_pair_selected)
         self._calib_panel.workflow_changed.connect(self._sync_workbench_header)
@@ -609,6 +691,7 @@ class MainWindow(QMainWindow):
             self._workflow_tabs.setCurrentIndex({"capture": 0, "calibration": 1, "results": 2, "pointcloud": 2}[phase])
         self._view_aux.setText("辅助优先" if aux is not None and aux.modality == "acoustic_rgb" else "红外优先")
         self._on_presentation_changed(self._stream_view.presentation_mode)
+        self._refresh_capture_navigation()
 
     @Slot(str)
     def _on_presentation_changed(self, mode):
@@ -628,6 +711,9 @@ class MainWindow(QMainWindow):
             else:
                 self._show_review_pair(current)
         self._gallery.set_pairs(pairs)
+        if self._capture_layout_active:
+            self._stereo_capture.refresh()
+        self._refresh_capture_navigation()
         self._sync_auxiliary_panels()
 
     @Slot(str, bool)
@@ -638,6 +724,7 @@ class MainWindow(QMainWindow):
         self._lbl_review.setToolTip(key)
         self._review_bar.setVisible(active)
         self._stereo_capture.refresh()
+        self._refresh_capture_navigation()
 
     @Slot(str, object)
     def _on_gallery_pair_selected(self, key, images):
@@ -656,7 +743,7 @@ class MainWindow(QMainWindow):
             detections={pair.left_id: pair.left_detection, pair.right_id: pair.right_detection} if recorded else None,
             detection_origin=pair.detection_origin if recorded else '预览重检',
             corner_total=pair.corner_total,
-            save_state=' · '.join(filter(None, (pair.save_state, pair.quality_state))))
+            save_state=' · '.join(filter(None, (pair.save_state, pair.display_quality_state))))
 
     @Slot(bool)
     def _toggle_log_panel(self, expanded):

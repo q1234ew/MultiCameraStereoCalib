@@ -5,8 +5,10 @@ from tempfile import TemporaryDirectory
 import os
 import re
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QPlainTextEdit, QVBoxLayout,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QLabel, QPlainTextEdit,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from ...calibration.models import MultiCameraRig
@@ -32,11 +34,25 @@ class ExportDialog(QDialog):
     def __init__(self, rig: MultiCameraRig, parent=None):
         super().__init__(parent)
         self.setWindowTitle("导出标定结果")
-        self.resize(600, 430)
+        self.setMinimumSize(560, 360)
+        self.resize(680, 540)
         self._rig = MultiCameraRig.from_dict(rig.to_dict())
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        content = QVBoxLayout(body)
+        content.setContentsMargins(16, 16, 16, 16)
+        content.setSpacing(12)
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setSpacing(8)
         self._scope = QComboBox()
+        self._scope.setMinimumContentsLength(20)
+        self._scope.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self._scope.addItem("全部标定结果", ("all", ""))
         for name, pair in self._rig.pairs.items():
             self._scope.addItem(f"双目组：{name}（{pair.left_id} / {pair.right_id}）", ("pair", name))
@@ -47,23 +63,41 @@ class ExportDialog(QDialog):
                 self._scope.addItem(f"融合结果：参考 RGB 双目 + {cid}", ("fusion", cid))
         form.addRow("导出对象", self._scope)
         self._format = QComboBox()
+        self._format.setMinimumContentsLength(20)
+        self._format.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         for key, (label, _, _, _) in self.FORMATS.items():
             self._format.addItem(label, key)
         form.addRow("文件格式", self._format)
-        layout.addLayout(form)
+        content.addLayout(form)
+        heading = QLabel("导出内容清单")
+        heading.setStyleSheet("font-weight:bold;")
+        content.addWidget(heading)
         self._summary = QPlainTextEdit()
         self._summary.setReadOnly(True)
         self._summary.setMinimumHeight(145)
         self._summary.setAccessibleName("导出内容清单")
-        layout.addWidget(self._summary, 1)
+        content.addWidget(self._summary, 1)
         self._note = QLabel()
         self._note.setWordWrap(True)
+        self._note.setTextFormat(Qt.PlainText)
         self._note.setStyleSheet(f"color:{TEXT_DIM};")
-        layout.addWidget(self._note)
+        content.addWidget(self._note)
+        self._scroll.setWidget(body)
+        layout.addWidget(self._scroll, 1)
+        footer = QFrame()
+        footer.setObjectName("actionFooter")
+        actions = QVBoxLayout(footer)
+        actions.setContentsMargins(16, 12, 16, 12)
+        actions.setSpacing(8)
         self._error = QLabel()
         self._error.setWordWrap(True)
-        self._error.setStyleSheet(f"color:{WARNING};")
-        layout.addWidget(self._error)
+        self._error.setTextFormat(Qt.PlainText)
+        self._error.setStyleSheet(f"color:{WARNING}; background:transparent;")
+        actions.addWidget(self._error)
+        self._lbl_next_step = QLabel("下一步：选择保存位置后导出文件。")
+        self._lbl_next_step.setWordWrap(True)
+        self._lbl_next_step.setStyleSheet(f"color:{TEXT_DIM}; background:transparent;")
+        actions.addWidget(self._lbl_next_step)
         self._buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self._buttons.button(QDialogButtonBox.Save).setText("选择保存位置...")
         self._buttons.button(QDialogButtonBox.Save).setIcon(app_icon('download'))
@@ -71,9 +105,11 @@ class ExportDialog(QDialog):
         self._buttons.button(QDialogButtonBox.Save).setDefault(True)
         self._buttons.button(QDialogButtonBox.Cancel).setText("取消")
         self._buttons.button(QDialogButtonBox.Cancel).setIcon(app_icon('x'))
+        self._buttons.button(QDialogButtonBox.Cancel).setAutoDefault(False)
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
-        layout.addWidget(self._buttons)
+        actions.addWidget(self._buttons)
+        layout.addWidget(footer)
         self._scope.currentIndexChanged.connect(self._scope_changed)
         self._format.currentIndexChanged.connect(self._refresh)
         self._scope_changed()
@@ -161,6 +197,7 @@ class ExportDialog(QDialog):
             except ValueError as exc:
                 problem = f"Kalibr 参数不兼容或外参链不完整，请核对导出对象：{exc}"
         self._error.setText(problem)
+        self._error.setVisible(bool(problem))
         self._buttons.button(QDialogButtonBox.Save).setEnabled(not problem)
 
     def export_to(self, path: str | Path) -> Path:

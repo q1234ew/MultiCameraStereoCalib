@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QPushButton, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout,
 )
 
 from ...calibration.models import CameraIntrinsics, StereoPairCalibration
@@ -78,20 +79,58 @@ class CalibrationDiagnosticsDialog(QDialog):
         self.setMinimumSize(360, 300)
         available = self.screen().availableGeometry()
         self.resize(min(1000, available.width() - 32), min(640, available.height() - 32))
-        layout = QVBoxLayout(self)
+        content = QVBoxLayout(self)
+        content.setContentsMargins(12, 8, 12, 8)
+        content.setSpacing(6)
         header = QHBoxLayout()
+        title = QLabel("逐帧误差检查")
+        title.setObjectName("workbenchSectionTitle")
+        header.addWidget(title)
         header.addWidget(QLabel("双目组"))
         self._combo_pair = QComboBox()
         self._combo_pair.setAccessibleName("诊断双目组")
+        self._combo_pair.setMinimumContentsLength(4)
+        self._combo_pair.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._combo_pair.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._combo_pair.setMinimumWidth(0)
         for name in self._pairs:
             self._combo_pair.addItem(name, name)
+            self._combo_pair.setItemData(self._combo_pair.count() - 1, name, Qt.ToolTipRole)
         header.addWidget(self._combo_pair, 1)
-        layout.addLayout(header)
+        content.addLayout(header)
+        summary = QHBoxLayout()
+        self._metric_summary = QLabel(
+            "训练集重投影误差，不是独立验证。\n— 为缺失或无效值，不表示零误差。")
+        self._metric_summary.setWordWrap(True)
+        self._metric_summary.setStyleSheet(f"color:{TEXT_DIM};")
+        summary.addWidget(self._metric_summary, 1)
+        self._btn_details = QToolButton()
+        self._btn_details.setCheckable(True)
+        self._btn_details.setAccessibleName("指标说明")
+        self._btn_details.setToolTip("展开指标说明")
+        self._btn_details.setIcon(app_icon("chevron-right"))
+        self._btn_details.toggled.connect(self._toggle_details)
+        summary.addWidget(self._btn_details)
+        content.addLayout(summary)
+        self._details_scroll = QScrollArea()
+        self._details_scroll.setAccessibleName("详细指标说明")
+        self._details_scroll.setWidgetResizable(True)
+        self._details_scroll.setFrameShape(QFrame.NoFrame)
+        self._details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._notes = QLabel()
         self._notes.setWordWrap(True)
+        self._notes.setTextFormat(Qt.PlainText)
+        self._notes.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._notes.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._notes.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._notes.setMinimumWidth(0)
         self._notes.setStyleSheet(f"color:{TEXT_DIM};")
-        layout.addWidget(self._notes)
+        self._details_scroll.setWidget(self._notes)
+        self._details_scroll.hide()
+        content.addWidget(self._details_scroll)
         self._table = QTableWidget(0, 8)
+        self._table.setMinimumSize(0, 64)
+        self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._table.setStyleSheet(f'QTableWidget::item:selected {{background:{PRIMARY}; color:white;}}')
         self._table.setAccessibleName("逐帧误差与参与记录")
         self._table.setHorizontalHeaderLabels([
@@ -101,26 +140,62 @@ class CalibrationDiagnosticsDialog(QDialog):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().hide()
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self._table, 1)
+        content.addWidget(self._table, 1)
+        self._empty_state = QLabel(self._table.viewport())
+        self._empty_state.setAlignment(Qt.AlignCenter)
+        self._empty_state.setWordWrap(True)
+        self._empty_state.setTextFormat(Qt.PlainText)
+        self._empty_state.setStyleSheet(f"color:{TEXT_DIM}; background:transparent;")
+        self._empty_state.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._table.viewport().installEventFilter(self)
+        self._footer = QFrame()
+        self._footer.setObjectName("actionFooter")
+        self._footer.setFixedHeight(1)
+        content.addWidget(self._footer)
         footer = QHBoxLayout()
+        footer.setContentsMargins(0, 2, 0, 0)
+        footer.setSpacing(8)
         self._btn_preview = QPushButton("查看原图")
         self._btn_preview.setIcon(app_icon("folder-open"))
+        self._btn_preview.setAutoDefault(False)
         self._btn_preview.setToolTip("查看当前帧的原始左右图像")
         self._btn_preview.clicked.connect(self._request_preview)
         footer.addWidget(self._btn_preview)
-        footer.addStretch()
+        self._preview_status = QLabel()
+        self._preview_status.setStyleSheet(f"color:{TEXT_DIM}; background:transparent;")
+        footer.addWidget(self._preview_status, 1)
         self._btn_close = QPushButton("关闭")
         self._btn_close.setIcon(app_icon("x"))
+        self._btn_close.setAutoDefault(False)
         self._btn_close.clicked.connect(self.reject)
         footer.addWidget(self._btn_close)
-        layout.addLayout(footer)
+        content.addLayout(footer)
         self._combo_pair.currentIndexChanged.connect(self._refresh)
         self._table.itemSelectionChanged.connect(self._refresh_preview_button)
         self._table.cellDoubleClicked.connect(self._on_double_clicked)
         self._refresh()
+
+    def _toggle_details(self, expanded):
+        self._details_scroll.setVisible(expanded)
+        self._btn_details.setIcon(app_icon("chevron-down" if expanded else "chevron-right"))
+        self._btn_details.setToolTip("收起指标说明" if expanded else "展开指标说明")
+
+    def resizeEvent(self, event):
+        # Bound explanations independently of their length so the table keeps priority.
+        self._details_scroll.setFixedHeight(min(80, max(48, self.height() // 6)))
+        if not self._btn_details.isChecked():
+            # Hidden scroll areas defer child layout until their first show.
+            self._notes.resize(max(1, self.width() - 24), self._details_scroll.height())
+        super().resizeEvent(event)
+
+    def eventFilter(self, watched, event):
+        if watched is self._table.viewport() and event.type() == QEvent.Resize:
+            self._empty_state.setGeometry(watched.rect().adjusted(8, 4, -8, -4))
+        return super().eventFilter(watched, event)
 
     def _matching_preview(self, name, pair, frame_id, source_ids):
         candidates = [preview for preview in self._previews
@@ -184,7 +259,11 @@ class CalibrationDiagnosticsDialog(QDialog):
         self._table.setRowCount(0)
         name = self._combo_pair.currentData()
         pair = self._pairs.get(name)
+        self._combo_pair.setToolTip(name or "暂无双目标定结果")
+        self._combo_pair.setEnabled(bool(self._pairs))
         notes = ["训练集重投影误差，不是独立验证；— 表示无值或无效值，不是零误差。"]
+        notes.append("左右内参列为各自记录的逐帧误差，单位 px；"
+                     "仅 euclidean_rms_px 明确表示欧氏 RMS。")
         rows = []
         if pair is None:
             notes.append("暂无双目标定结果。")
@@ -206,6 +285,8 @@ class CalibrationDiagnosticsDialog(QDialog):
                 notes.append(f"校正残差列比较选用配对的 {alignment.get('coordinate', '?')} 坐标；受校正像素尺度影响。")
             rows = self._rows(name, pair)
         self._notes.setText("\n".join(notes))
+        self._empty_state.setText("暂无双目标定结果" if pair is None else "当前组暂无逐帧记录")
+        self._empty_state.setVisible(not rows)
         self._table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             label = _FrameIdItem(row.label)
@@ -226,13 +307,20 @@ class CalibrationDiagnosticsDialog(QDialog):
         self._refresh_preview_button()
 
     def _current_preview(self):
+        if not self._table.selectionModel().hasSelection():
+            return None
         item = self._table.item(self._table.currentRow(), 0)
         return item.data(Qt.UserRole).preview if item is not None else None
 
     def _refresh_preview_button(self):
         preview = self._current_preview()
         self._btn_preview.setEnabled(preview is not None)
-        self._btn_preview.setToolTip(preview.key if preview else "当前帧无可可靠匹配的原图")
+        selected = self._table.selectionModel().hasSelection()
+        status = "原图可用" if preview else "无匹配原图" if selected else "未选择帧"
+        self._preview_status.setText(status)
+        self._btn_preview.setToolTip(
+            preview.key if preview else "当前帧无可可靠匹配的原图" if selected else "未选择帧"
+        )
 
     def _request_preview(self, *_):
         preview = self._current_preview()

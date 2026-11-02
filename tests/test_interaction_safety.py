@@ -243,7 +243,7 @@ def test_live_readiness_blocks_invalid_frames_and_capture(window, calibrated, pr
         monkeypatch.setattr(panel._session, "save_multimodal_pair", lambda *args: pytest.fail("must not save"))
     panel._on_capture_aux()
     assert len(panel._aux_pairs) == count
-    assert "采图未就绪" in panel._lbl_aux_readiness.text()
+    assert "视频未配对" in panel._lbl_aux_readiness.text()
 
 
 def test_readiness_rejects_board_or_image_size_mismatch_and_busy(window, calibrated):

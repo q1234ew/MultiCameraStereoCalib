@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -29,7 +30,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QStyle,
     QStyledItemDelegate,
     QSplitter,
     QTabWidget,
@@ -44,7 +44,7 @@ from ...calibration.models import CameraModel
 from ...calibration.planar import PatternBoardConfig, PatternType
 from ...io.board_config import load_pattern_board_config
 from ..configuration import pair_signature
-from ..theme import TEXT_DIM, DANGER, standard_icon
+from ..theme import TEXT_DIM, DANGER, app_icon
 from ...streaming.discovery import DiscoveredService, DiscoveryWorker
 from ...streaming.stream_manager import (
     AuxiliaryCameraConfig,
@@ -101,7 +101,7 @@ class ConfigDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("相机与标定板配置")
-        self.setMinimumSize(900, 640)
+        self.setMinimumSize(900, 480)
         self.resize(1080, 760)
         self._stream_manager = stream_manager
         self._board = board
@@ -157,22 +157,49 @@ class ConfigDialog(QDialog):
         self._board_viewport.installEventFilter(self)
         self._tabs.currentChanged.connect(self._update_board_columns)
 
-        footer = QWidget()
+        footer = QFrame()
         footer.setObjectName("actionFooter")
         row = QVBoxLayout(footer)
-        row.setContentsMargins(14, 10, 14, 12)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(8)
         self._lbl_config_status = QLabel()
         self._lbl_config_status.setWordWrap(True)
         self._lbl_config_status.setTextFormat(Qt.PlainText)
         row.addWidget(self._lbl_config_status)
+        self._lbl_next_step = QLabel()
+        self._lbl_next_step.setWordWrap(True)
+        self._lbl_next_step.setStyleSheet(f"color:{TEXT_DIM}; background:transparent;")
+        row.addWidget(self._lbl_next_step)
+        actions = QHBoxLayout()
+        self._btn_next_page = QPushButton("下一步：标定板")
+        self._btn_next_page.setIcon(app_icon("chevron-right"))
+        self._btn_next_page.setAutoDefault(False)
+        self._btn_next_page.clicked.connect(lambda: self._tabs.setCurrentIndex(2))
+        actions.addWidget(self._btn_next_page)
+        actions.addStretch()
         self._buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        self._buttons.button(QDialogButtonBox.Save).setText("保存配置")
+        self._buttons.button(QDialogButtonBox.Save).setText("应用配置")
+        self._buttons.button(QDialogButtonBox.Save).setIcon(app_icon("check"))
         self._buttons.button(QDialogButtonBox.Save).setProperty("class", "primary")
+        self._buttons.button(QDialogButtonBox.Save).setDefault(True)
         self._buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        self._buttons.button(QDialogButtonBox.Cancel).setIcon(app_icon("x"))
+        self._buttons.button(QDialogButtonBox.Cancel).setAutoDefault(False)
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self.reject)
-        row.addWidget(self._buttons)
+        actions.addWidget(self._buttons)
+        row.addLayout(actions)
         outer.addWidget(footer)
+        self._tabs.currentChanged.connect(self._update_next_step)
+        self._update_next_step()
+
+    def _update_next_step(self, *_):
+        page = self._tabs.currentIndex()
+        self._btn_next_page.setVisible(page != 2)
+        self._lbl_next_step.setText(
+            "下一步：核对标定板参数，应用配置后返回采集。" if page != 2 else
+            "下一步：应用配置并返回采集；取消不保留本次修改。"
+        )
 
     def _add_page(self, title, widgets, stretch=False):
         scroll = QScrollArea()
@@ -180,7 +207,7 @@ class ConfigDialog(QDialog):
         scroll.setFrameShape(QScrollArea.NoFrame)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(16)
         for widget in widgets:
             layout.addWidget(widget, 1 if stretch else 0)
@@ -256,6 +283,7 @@ class ConfigDialog(QDialog):
         self._btn_use_aux_service.clicked.connect(self._use_selected_aux_service)
         aux_pick_row.addWidget(self._btn_use_aux_service)
         self._btn_discover_aux = QPushButton("发现 / 刷新")
+        self._btn_discover_aux.setIcon(app_icon("scan-line"))
         self._btn_discover_aux.clicked.connect(self._on_scan)
         aux_pick_row.addWidget(self._btn_discover_aux)
         form.addRow("已发现辅助流:", aux_pick_row)
@@ -280,6 +308,7 @@ class ConfigDialog(QDialog):
         self._lbl_aux_reference.setAccessibleName("RGB 左目参考相机（只读）")
         form.addRow("参考相机:", self._lbl_aux_reference)
         self._btn_aux_board_page = QPushButton("辅助标定板设置...")
+        self._btn_aux_board_page.setIcon(app_icon("chevron-right"))
         self._btn_aux_board_page.clicked.connect(lambda: self._tabs.setCurrentIndex(2))
         form.addRow(self._btn_aux_board_page)
 
@@ -462,7 +491,7 @@ class ConfigDialog(QDialog):
         # ── discovery controls ──
         disc_row = QHBoxLayout()
         self._btn_scan = QPushButton("发现设备")
-        self._btn_scan.setIcon(standard_icon(self, QStyle.SP_BrowserReload))
+        self._btn_scan.setIcon(app_icon("scan-line"))
         self._btn_scan.setToolTip("通过 mDNS/Zeroconf 和子网扫描发现局域网中的推流服务")
         self._btn_scan.clicked.connect(self._on_scan)
         disc_row.addWidget(self._btn_scan)
@@ -482,6 +511,7 @@ class ConfigDialog(QDialog):
         self._scan_progress.setFormat("%v/%m 主机")
         self._scan_progress.setVisible(False)
         disc_row.addWidget(self._scan_progress, 1)
+        disc_row.addStretch()
 
         self._lbl_scan_status = QLabel("")
         layout.addLayout(disc_row)
@@ -566,16 +596,18 @@ class ConfigDialog(QDialog):
         btn_layout = QHBoxLayout()
         self._btn_add = QPushButton("添加")
         self._btn_add.setText("手动添加")
-        self._btn_add.setIcon(standard_icon(self, QStyle.SP_FileDialogNewFolder))
+        self._btn_add.setIcon(app_icon("camera"))
         self._btn_add.clicked.connect(self._add_row)
         btn_layout.addWidget(self._btn_add)
 
         self._btn_remove = QPushButton("删除选中")
+        self._btn_remove.setIcon(app_icon("circle-minus"))
         self._btn_remove.setEnabled(False)
         self._btn_remove.clicked.connect(self._remove_row)
         btn_layout.addWidget(self._btn_remove)
 
         self._btn_swap_sources = QPushButton("交换左右图像源")
+        self._btn_swap_sources.setIcon(app_icon("arrow-left-right"))
         self._btn_swap_sources.setEnabled(False)
         self._table.itemSelectionChanged.connect(self._update_row_actions)
         self._btn_swap_sources.setToolTip(
@@ -1150,7 +1182,7 @@ class ConfigDialog(QDialog):
             )
             color, valid = TEXT_DIM, True
         self._lbl_config_status.setText(text)
-        self._lbl_config_status.setStyleSheet(f"color:{color};")
+        self._lbl_config_status.setStyleSheet(f"color:{color}; background:transparent;")
         self._buttons.button(QDialogButtonBox.Save).setEnabled(valid)
         self._buttons.button(QDialogButtonBox.Save).setToolTip("" if valid else text)
 

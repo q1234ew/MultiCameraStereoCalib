@@ -74,15 +74,32 @@ def test_live_status_and_expansion_do_not_move_previews(stereo_bench, app, size,
     guide.refresh()
     unchanged('prepared')
     original = guide._analysis.recommendation
-    for phase, count, repairs in [('initial', 8, 0), ('repair', 23, 0), ('review', 27, 4)]:
+    for phase, count, repairs, pose_available in [('initial', 5, 0, False),
+            ('initial', 6, 0, False), ('initial', 7, 0, True),
+            ('repair', 23, 0, True), ('review', 27, 4, True)]:
         guide._analysis.recommendation = replace(original, phase=phase,
                                                  sample_count=count, repair_count=repairs,
+                                                 pose_available=pose_available,
                                                  repairing_distance=phase == 'repair',
                                                  next_hint='后续预计：本张保存后重新核对距离与倾角缺口' * 8)
         guide.refresh()
         unchanged(phase)
+        if phase == 'initial' and not pose_available:
+            assert '手动' in guide.next_step.visible_text()
+            assert '…' not in guide.reason.visible_text()
     guide._analysis.recommendation = original
     guide.refresh()
+    original_analysis = deepcopy(guide._analysis)
+    key, _ = guide._guidance_context()
+    guide._guidance_completed(key, None, 'synthetic analysis failure')
+    unchanged('analysis-error')
+    assert guide.btn_retry_guidance.isVisible()
+    assert '自动采集已暂停' in guide.instruction.text()
+    guide.btn_retry_guidance.click()
+    unchanged('analysis-retry')
+    settle(guide, app)
+    unchanged('analysis-recovered')
+    guide._analysis = original_analysis
     panel._pending_save_tokens.add('test-save')
     panel._lbl_capture_decision.setText('保存中 · 原图左右角点独立验收\n等待磁盘写入完成')
     panel._refresh_disk_hint()
@@ -165,11 +182,13 @@ def test_initial_guidance_separates_goal_action_and_manual_next_step(stereo_benc
     for measurement in samples:
         measurement.update(center=np.array([.5, .5]), area=.07, distance_area=.07)
     guide.refresh()
-    assert guide.reason.text().startswith('首轮 1/23 · 目标：')
-    assert '建立初始模型' in guide.reason.text()
+    assert guide.reason.text().startswith('初始建模 · 建模样本 0 组')
+    assert '建议：' in guide.reason.text()
     assert '冷启动' not in guide.reason.text()
     assert guide.instruction.text().startswith('操作：')
     assert '手动点击采集' in guide.instruction.text()
     assert guide.schematic.description.text() == guide.instruction.text()
-    assert '预计' in guide.next_step.text()
+    assert '需手动采图' in guide.next_step.text()
+    assert '无需等待绿色提示' in guide.next_step.text()
+    assert '预计' in guide.next_step.toolTip()
     assert '原图' not in guide.next_step.text() or '验收' in guide.next_step.text()
