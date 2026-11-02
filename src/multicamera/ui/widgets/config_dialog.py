@@ -89,6 +89,39 @@ class StreamTypeDelegate(QStyledItemDelegate):
         model.setData(index, editor.currentText(), Qt.EditRole)
 
 
+class _ResponsiveRow(QWidget):
+    """Keep complete fields together, stacking them before their minimum widths collide."""
+
+    def __init__(self, items):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._items = [widget for widget, _ in items]
+        self._box = QBoxLayout(QBoxLayout.LeftToRight, self)
+        self._box.setContentsMargins(0, 0, 0, 0)
+        self._box.setSpacing(8)
+        for widget, stretch in items:
+            self._box.addWidget(widget, stretch)
+
+    def _reflow(self):
+        margins = self._box.contentsMargins()
+        required = sum(max(widget.minimumSizeHint().width(), widget.minimumWidth())
+                       for widget in self._items if not widget.isHidden())
+        count = sum(not widget.isHidden() for widget in self._items)
+        required += max(0, count - 1) * self._box.spacing()
+        available = self.width() - margins.left() - margins.right()
+        direction = (QBoxLayout.LeftToRight if available >= required
+                     else QBoxLayout.TopToBottom)
+        if self._box.direction() != direction:
+            self._box.setDirection(direction)
+
+    def event(self, event):
+        result = super().event(event)
+        if hasattr(self, '_box') and event.type() in (
+                QEvent.Resize, QEvent.LayoutRequest, QEvent.Show, QEvent.FontChange):
+            self._reflow()
+        return result
+
+
 class ConfigDialog(QDialog):
     """Dialog for configuring stereo pairs, camera model, and ChArUco board."""
 
@@ -273,20 +306,20 @@ class ConfigDialog(QDialog):
         self._combo_fusion_mode.currentIndexChanged.connect(self._refresh_aux_dropdown)
         form.addRow("融合模式:", self._combo_fusion_mode)
 
-        aux_pick_row = QHBoxLayout()
         self._combo_aux_camera = QComboBox()
         self._combo_aux_camera.setPlaceholderText("暂无匹配辅助流")
         self._combo_aux_camera.setMinimumContentsLength(18)
         self._combo_aux_camera.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        aux_pick_row.addWidget(self._combo_aux_camera, 1)
         self._btn_use_aux_service = QPushButton("使用发现服务")
         self._btn_use_aux_service.clicked.connect(self._use_selected_aux_service)
-        aux_pick_row.addWidget(self._btn_use_aux_service)
         self._btn_discover_aux = QPushButton("发现 / 刷新")
         self._btn_discover_aux.setIcon(app_icon("scan-line"))
         self._btn_discover_aux.clicked.connect(self._on_scan)
-        aux_pick_row.addWidget(self._btn_discover_aux)
-        form.addRow("已发现辅助流:", aux_pick_row)
+        self._aux_service_picker = _ResponsiveRow([
+            (self._combo_aux_camera, 1), (self._btn_use_aux_service, 0),
+            (self._btn_discover_aux, 0),
+        ])
+        form.addRow("已发现辅助流:", self._aux_service_picker)
         self._lbl_aux_discovery = QLabel("尚未扫描设备")
         self._lbl_aux_discovery.setWordWrap(True)
         self._lbl_aux_discovery.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
@@ -520,27 +553,33 @@ class ConfigDialog(QDialog):
         layout.addWidget(self._lbl_scan_status)
 
         # ── discovered camera dropdowns ──
-        picker_row = QHBoxLayout()
-        picker_row.addWidget(QLabel("类型:"))
         self._combo_stream_type = QComboBox()
         self._combo_stream_type.addItem("RGB 双目", "rgb")
         self._combo_stream_type.addItem("红外双目", "ir")
         self._combo_stream_type.currentIndexChanged.connect(self._refresh_camera_dropdowns)
-        picker_row.addWidget(self._combo_stream_type)
-
-        picker_row.addWidget(QLabel("左目:"))
         self._combo_left_camera = QComboBox()
         self._combo_left_camera.setPlaceholderText("暂无左目服务")
         self._combo_left_camera.setMinimumContentsLength(12)
         self._combo_left_camera.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        picker_row.addWidget(self._combo_left_camera, 1)
-
-        picker_row.addWidget(QLabel("右目:"))
         self._combo_right_camera = QComboBox()
         self._combo_right_camera.setPlaceholderText("暂无右目服务")
         self._combo_right_camera.setMinimumContentsLength(12)
         self._combo_right_camera.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        picker_row.addWidget(self._combo_right_camera, 1)
+
+        def field(title, control):
+            widget = QWidget()
+            row = QHBoxLayout(widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            row.addWidget(QLabel(title))
+            row.addWidget(control, 1)
+            return widget
+
+        self._stereo_service_picker = _ResponsiveRow([
+            (field("类型:", self._combo_stream_type), 0),
+            (field("左目:", self._combo_left_camera), 1),
+            (field("右目:", self._combo_right_camera), 1),
+        ])
 
         self._btn_add_selected_pair = QPushButton("添加相机组")
         self._btn_add_selected_pair.clicked.connect(self._add_pair_from_dropdowns)
@@ -550,7 +589,7 @@ class ConfigDialog(QDialog):
         self._btn_auto_pair.clicked.connect(self._auto_pair_discovered)
         self._btn_auto_pair.setEnabled(False)
         self._btn_add_selected_pair.setEnabled(False)
-        layout.addLayout(picker_row)
+        layout.addWidget(self._stereo_service_picker)
         pair_actions = QHBoxLayout()
         pair_actions.addStretch()
         pair_actions.addWidget(self._btn_add_selected_pair)
