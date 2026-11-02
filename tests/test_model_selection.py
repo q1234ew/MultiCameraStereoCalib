@@ -48,11 +48,20 @@ def test_model_comparison_preserves_input_and_separates_holdouts():
     assert left.model == right.model == stereo.model == CameraModel.PINHOLE
     for old, new in zip(before, stereo._img_points_left):
         np.testing.assert_array_equal(old, new)
-    for candidate in result['candidates'].values():
+    for name, candidate in result['candidates'].items():
         assert len(candidate['folds']) == 3
         for fold in candidate['folds']:
             assert not set(fold['train_ids']) & set(fold['test_ids'])
             assert set(fold['train_ids']) | set(fold['test_ids']) == set(result['evaluated_ids'])
+            if fold['status'] == 'ok':
+                assert len(fold['training_corner_counts']) == len(fold['train_ids'])
+                if name == 'fisheye':
+                    assert fold['training_corner_policy'] == 'cross_view_common_ids'
+                    assert fold['shared_training_ids']
+                    assert set(fold['training_corner_counts']) == {len(fold['shared_training_ids'])}
+                else:
+                    assert fold['training_corner_policy'] == 'per_pair_common_ids'
+                    assert fold['shared_training_ids'] is None
     assert [f['test_ids'] for f in result['candidates']['pinhole']['folds']] == [
         f['test_ids'] for f in result['candidates']['fisheye']['folds']]
 

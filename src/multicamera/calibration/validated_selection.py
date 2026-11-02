@@ -35,7 +35,9 @@ def _fold_calibrators(left, right, stereo, ids):
                  if hasattr(cal, '_all_corners') else cal.copy_with_indices(indices))
         clone.min_frames = 6
         calibrators.append(clone)
-    calibrators[2] = calibrators[2].copy_with_common_ids()
+    # Pinhole supports different board IDs per view; only fisheye needs this subset.
+    if stereo.model == CameraModel.FISHEYE:
+        calibrators[2] = calibrators[2].copy_with_common_ids()
     return calibrators
 
 
@@ -63,7 +65,11 @@ def _cross_validate(left, right, stereo, candidate, ids, log):
         all_errors.append(errors)
         details.append({'train_ids': train, 'test_ids': test,
                         'rms_px': float(np.sqrt(np.mean(errors**2))),
-                        'point_count': len(errors), 'health': health})
+                        'point_count': len(errors), 'health': health,
+                        'training_corner_policy': ('cross_view_common_ids'
+                                                  if stereo.model == CameraModel.FISHEYE
+                                                  else 'per_pair_common_ids'),
+                        'training_corner_counts': sc.frame_common_corner_counts})
     errors = np.concatenate(all_errors)
     return {'rms_px': float(np.sqrt(np.mean(errors**2))), 'folds': details,
             'point_count': len(errors)}
@@ -79,7 +85,7 @@ def calibrate_validated(left, right, stereo, log=lambda _: None):
     if stereo.model == CameraModel.PINHOLE:
         names.append('rational')
     report = {'method': 'health_gated_within_family_selection', 'candidates': {},
-              'selected': None, 'policy_version': 2,
+              'selected': None, 'policy_version': 3,
               'validation_min_views': MIN_MODEL_VIEWS,
               'limits': '同序列留出及全视场数值采样，非独立测量精度验收'}
     fitted = {}
@@ -93,6 +99,12 @@ def calibrate_validated(left, right, stereo, log=lambda _: None):
         raise ValueError('观测帧编号重复，不能可靠择模')
     ids = [ids[i] for i in np.linspace(0, len(ids)-1, min(30, len(ids)), dtype=int)]
     report['evaluated_ids'] = ids
+    report['training_corner_policy'] = ('cross_view_common_ids'
+                                       if stereo.model == CameraModel.FISHEYE
+                                       else 'per_pair_common_ids')
+    log('留出验证角点策略：' + ('鱼眼使用训练帧间共同角点'
+                             if stereo.model == CameraModel.FISHEYE
+                             else '针孔/有理模型按每对左右共同角点，允许不同图像对使用不同角点'))
     for name in names:
         row = report['candidates'][name] = {'status': 'failed'}
         try:

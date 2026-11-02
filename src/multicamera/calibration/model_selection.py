@@ -48,9 +48,9 @@ def _predict_errors(cal, index, left, right, stereo):
 def assess_camera_models(left, right, stereo, cancelled=lambda: False, progress=lambda _: None):
     """Read-only, deterministic 3-fold comparison on matched raw observations.
 
-    Both models see the same input views and held-out points; each training
-    fold explicitly uses its cross-view common IDs for stereo solving. This
-    is within-sequence cross-validation, not external metrological evidence.
+    Both models see the same input views and held-out points. Pinhole keeps
+    per-pair common IDs; fisheye uses the cross-view common training subset.
+    This is within-sequence validation, not external metrological evidence.
     """
     def check():
         if cancelled():
@@ -97,9 +97,19 @@ def assess_camera_models(left, right, stereo, cancelled=lambda: False, progress=
             try:
                 lcal, rcal = [cal.copy_with_indices([mapping[key] for key in train], keep_images=False)
                               for cal, mapping in zip((left, right), maps)]
-                scal = stereo.copy_with_indices([stereo_map[key] for key in train]).copy_with_common_ids()
+                scal = stereo.copy_with_indices([stereo_map[key] for key in train])
                 for cal in (lcal, rcal, scal):
                     cal.model, cal.min_frames = model, 6
+                if model == CameraModel.FISHEYE:
+                    scal = scal.copy_with_common_ids()
+                detail.update({
+                    'training_corner_policy': ('cross_view_common_ids'
+                                               if model == CameraModel.FISHEYE
+                                               else 'per_pair_common_ids'),
+                    'training_corner_counts': scal.frame_common_corner_counts,
+                    'shared_training_ids': (scal.frame_corner_ids[0].tolist()
+                                            if model == CameraModel.FISHEYE else None),
+                })
                 lintr, rintr = lcal.calibrate(), rcal.calibrate()
                 _validate_intrinsics(lintr)
                 _validate_intrinsics(rintr)
@@ -115,8 +125,7 @@ def assess_camera_models(left, right, stereo, cancelled=lambda: False, progress=
                 errors = np.concatenate([_predict_errors(stereo, stereo_map[key], lintr, rintr, result)
                                          for key in test])
                 detail.update({'status': 'ok', 'rms_px': float(np.sqrt(np.mean(errors ** 2))),
-                               'point_count': len(errors), 'stereo_train_rms_px': result.rms_error,
-                               'shared_training_ids': scal.frame_corner_ids[0].tolist()})
+                               'point_count': len(errors), 'stereo_train_rms_px': result.rms_error})
                 all_errors.append(errors)
             except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                 check()
