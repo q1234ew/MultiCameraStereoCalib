@@ -156,6 +156,7 @@ def test_aux_save_failure_does_not_advance_data(capture_panel, monkeypatch, fini
     image = np.zeros((240, 320, 3), np.uint8)
     monkeypatch.setattr(panel, '_aux_live_frames', lambda: ((image, image, 0.), 'ready'))
     monkeypatch.setattr(panel, '_prepare_white_balance', lambda *args: True)
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
 
     def fail(*args, **kwargs):
         raise OSError('disk full')

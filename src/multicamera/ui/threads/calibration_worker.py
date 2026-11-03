@@ -231,6 +231,9 @@ class AuxCalibrationWorker(QThread):
         rgb_left_intrinsics: CameraIntrinsics,
         min_intrinsic_frames: int,
         parent=None,
+        offline_model_key=None,
+        offline_reviews=None,
+        offline_dataset_reviews=None,
     ):
         super().__init__(parent)
         self.aux_id = aux_id
@@ -239,9 +242,26 @@ class AuxCalibrationWorker(QThread):
         self.detections = list(detections)
         self.rgb_left_intrinsics = rgb_left_intrinsics
         self.min_intrinsic_frames = min_intrinsic_frames
+        self.offline_model_key = offline_model_key
+        self.offline_reviews = deepcopy(offline_reviews or [])
+        self.offline_dataset_reviews = deepcopy(offline_dataset_reviews or [])
 
     def run(self):
         try:
+            if self.offline_model_key is not None:
+                from ...calibration.joint_aux import calibrate_offline_aux
+                from ...calibration.offline_aux import verify_review_sources
+                verify_review_sources(self.offline_reviews)
+                if {str(row[0]) for row in self.detections} != {
+                        review['source_id'] for review in self.offline_reviews}:
+                    raise ValueError('求解数据与逐对复核编号不一致')
+                aux_intr, extr = calibrate_offline_aux(self.detections, self.board_config,
+                    self.rgb_left_intrinsics, self.offline_model_key, self.log.emit)
+                verify_review_sources(self.offline_reviews)
+                extr.calibration_info['offline_reviews'] = deepcopy(self.offline_reviews)
+                extr.calibration_info['offline_dataset_reviews'] = deepcopy(self.offline_dataset_reviews)
+                self.finished_ok.emit(aux_intr, extr)
+                return
             aux_intr_cal = AuxIntrinsicCalibrator(
                 self.board_config,
                 model=self.camera_model,

@@ -683,11 +683,13 @@ class MultiStreamView(QWidget):
         for cid in ids:
             view = self._get_or_create_view(cid)
             view.set_display_name(self._camera_label(cid))
-            if enabled and cid == self._multimodal_ids()[1] and (aux is None or not aux.url):
+            has_offline_image = cid in self._static_images.get(enabled, {}) or cid in (self._review_images or {})
+            if (enabled and cid == self._multimodal_ids()[1] and (aux is None or not aux.url)
+                    and not has_offline_image):
                 view.set_connected(False)
                 view.clear_frame("未配置红外/辅助视频流，可配置相机或导入离线图片")
                 continue
-            if enabled and cid == self._multimodal_ids()[0] and rgb_left_id is None:
+            if enabled and cid == self._multimodal_ids()[0] and rgb_left_id is None and not has_offline_image:
                 view.set_connected(False)
                 view.clear_frame("未配置 RGB 左相机，可配置相机或导入离线图片")
                 continue

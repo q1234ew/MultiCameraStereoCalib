@@ -45,6 +45,8 @@ def panel(app, tmp_path, monkeypatch, finish_aux_tasks):
     monkeypatch.setattr(panel, '_prepare_white_balance', lambda *args: True)
     # Isolate raw/stability contracts from the optional periodic preview sampler.
     monkeypatch.setattr(panel._aux_guide, '_request_preview', lambda: None)
+    # These tests exercise final snapshot acceptance, after the online wait gate.
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
     finish_aux_tasks(panel)
     yield panel
     finish_aux_tasks(panel)
@@ -496,10 +498,17 @@ def test_actual_import_button_to_completion_and_manual_supplement(panel, monkeyp
     monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *args: str(source))
     panel._btn_import_aux.click()
     finish_aux_tasks(panel)
+    # Import never substitutes single-image detection for physical correspondence.
+    assert not panel._aux_pairs
+    from multicamera.calibration.offline_aux import confirm_offline_pair
+    panel._apply_aux_offline_review({key: confirm_offline_pair(review, 'identity', 'identity')
+                                    for key, review in panel._aux_offline_reviews.items()})
+    finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 21
     assert panel._aux_guide.analysis.unique_count == 21
     assert panel._aux_guide.analysis.phase == 'complete'
-    assert '本轮引导结束' in panel._aux_guide.phase.text()
+    assert '离线候选复核' in panel._aux_guide.phase.text()
+    assert '离线未验证' in panel._aux_guide.check_values['stability'].text()
     assert '源目录 21' in panel._aux_guide.counts.text()
     assert panel._aux_capture_sequence.done_count == 0  # No invented pose verification.
     assert all('参考' in action.text() for action in panel._aux_seq_widget._step_actions)
@@ -512,7 +521,8 @@ def test_actual_import_button_to_completion_and_manual_supplement(panel, monkeyp
     assert panel._aux_saved_count == 1
     assert panel._aux_guide.analysis.phase == 'complete'
     assert panel._aux_guide.analysis.unique_count == 21
-    assert '重复构图' in panel._aux_guide.receipt.text()
+    assert '离线复核列表' in panel._aux_guide.receipt.text()
+    assert 'live_0000' not in panel._aux_offline_confirmations
     assert originals == {p.name: p.read_bytes() for p in source.iterdir()}
 
 

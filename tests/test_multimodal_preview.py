@@ -163,6 +163,7 @@ def test_live_capture_saves_raw_left_and_ir_not_right(window, tmp_path, monkeypa
     )
     panel.set_session(session)
     monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
     panel._on_capture_aux()
     finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 1
@@ -316,6 +317,7 @@ def test_fusion_capture_works_with_closed_previews_and_preserves_coverage(window
         tmp_path, window._board, list(manager.stereo_pairs.values()), manager.auxiliary_camera,
     ))
     monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
     panel._on_capture_aux()
     finish_aux_tasks(panel)
     tracker = view._trackers[IR]

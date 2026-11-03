@@ -90,6 +90,7 @@ def live_frames(panel, monkeypatch, image=None):
     image = board_image() if image is None else image
     monkeypatch.setattr(panel, '_aux_live_frames', lambda: ((image, image, .01), 'ready'))
     monkeypatch.setattr(panel._aux_guide, 'stability_reasons', lambda detections, snapshot=None: [])
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
     return image
 
 

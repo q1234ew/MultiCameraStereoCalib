@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import cv2
@@ -22,6 +22,7 @@ class CrossModalExtrinsicResult:
     rms_error: float
     frame_count: int
     per_frame_errors: List[float]
+    calibration_info: dict = field(default_factory=dict)
 
 
 class AuxIntrinsicCalibrator:

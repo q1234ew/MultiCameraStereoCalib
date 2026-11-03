@@ -51,6 +51,15 @@ class QualitySummary:
     valid: bool = True
 
 
+def aux_metrics_text(aux):
+    if aux.calibration_info.get('status') == 'offline_candidate_pending_physical_validation':
+        heldout = aux.calibration_info['heldout']
+        return (f'{aux.camera_id} · 离线候选，待实物验证 · {aux.frame_count} 组\n'
+                f"留出跨相机误差 RGB {heldout['rgb_transfer_rms_px']:.3f} px / "
+                f"IR辅助 {heldout['aux_transfer_rms_px']:.3f} px（各自原始像素）")
+    return f'{aux.camera_id} · 融合 RMS {aux.rms_error:.3f} px · {aux.frame_count} 组'
+
+
 def summarize_quality(rig):
     evaluator = CalibrationEvaluator()
     grades, risks, details = [], [], []
@@ -139,7 +148,13 @@ def summarize_quality(rig):
     for aux in rig.aux_cameras.values():
         try:
             intrinsic(aux.camera_id, aux.intrinsics)
-            details.append(f'{aux.camera_id} 融合 RMS {aux.rms_error:.3f} px · {aux.frame_count} 组')
+            details.append(aux_metrics_text(aux))
+            if aux.calibration_info.get('status') == 'offline_candidate_pending_physical_validation':
+                risks.append(f'{aux.camera_id}：离线候选，待实物验证；未验证采图时稳定性和同步')
+                holdout = aux.calibration_info.get('heldout', {})
+                details.append(f"{aux.camera_id} 留出跨相机误差：RGB "
+                    f"{holdout.get('rgb_transfer_rms_px')} px / IR辅助 "
+                    f"{holdout.get('aux_transfer_rms_px')} px（各自原始像素）")
             if not np.isfinite(aux.rms_error) or aux.rms_error < 0:
                 invalid = True
                 risks.append(f'{aux.camera_id}：融合误差指标无效')
@@ -157,6 +172,9 @@ def summarize_quality(rig):
         title, level = '质量指标无效，需重新核对', 'poor'
     elif Grade.POOR in grades:
         title, level = '不建议直接使用', 'poor'
+    elif any(aux.calibration_info.get('status') == 'offline_candidate_pending_physical_validation'
+             for aux in rig.aux_cameras.values()):
+        title, level = '离线候选，待实物验证', 'fair'
     elif Grade.FAIR in grades:
         title, level = '建议补拍后重新标定', 'fair'
     elif risks or not grades:

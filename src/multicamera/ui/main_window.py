@@ -1001,7 +1001,25 @@ class MainWindow(QMainWindow):
             logger.info("Load calibration session: %s", dir_path)
             try:
                 session = CalibrationSession.load(Path(dir_path))
-                self._calib_panel.set_session(session)
+                from ..calibration.offline_aux import validate_session_rig
+                rig = session.load_rig()
+                if rig is None:
+                    if self._rig is not None or self._calib_panel._active_step == 2:
+                        raise ValueError('会话缺少 RGB 标定结果，不能用于融合；已保留当前有效状态')
+                    self._calib_panel.set_session(session)
+                    self._calib_panel._reset_all()
+                    self._calib_panel.append_log('已加载原图会话，尚无 RGB 标定结果；融合前需完成 RGB 标定')
+                else:
+                    rig = validate_session_rig(session, self._stream_manager.stereo_pairs.values())
+                    if any(pair.stereo.model != self._camera_model for pair in rig.pairs.values()):
+                        raise ValueError('当前 RGB 相机模型与会话不同，请先选择相同模型')
+                    for pair in rig.pairs.values():
+                        for camera_id, intr in ((pair.left_id, pair.left_intrinsics),
+                                                 (pair.right_id, pair.right_intrinsics)):
+                            frame = self._stream_manager.get_latest_frame(camera_id)
+                            if frame is not None and frame[0].shape[1::-1] != intr.image_size:
+                                raise ValueError(f'{camera_id}: 当前预览分辨率与恢复内参不同')
+                    self._calib_panel.restore_session_result(session, rig)
             except Exception as exc:
                 text = f"加载会话失败，已保留当前会话：{exc}"
                 self._statusbar.showMessage(text)
@@ -1009,6 +1027,8 @@ class MainWindow(QMainWindow):
                 logger.exception("Load calibration session failed: %s", dir_path)
                 return
             self._current_session = session
+            self._rig = self._calib_panel.rig
+            self._act_export.setEnabled(self._rig is not None)
             self._empty_created_session = None
             self._empty_session_config = None
             self._refresh_session_button()

@@ -129,7 +129,8 @@ def test_save_failure_stays_visible_until_a_new_capture_receipt(panel, monkeypat
     guide.record_receipt('live_0001', '可采纳', [], guide._preview_detections)
     guide.refresh_workbench()
     assert '保存失败' not in guide.action.text()
-    assert '保存与验收后自动更新推荐' in guide.next_step.text()
+    assert '验收通过' in guide.next_step.text()
+    assert '正在更新引导进度' in guide.next_step.text()
 
 
 @pytest.mark.parametrize('operation', ['white_balance', 'import', 'capture'])

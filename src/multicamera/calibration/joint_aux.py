@@ -1,0 +1,217 @@
+"""Offline cross-modal refinement with fixed RGB optics and disjoint-view checks."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import replace
+
+import cv2
+import numpy as np
+
+from .auxiliary import (AuxIntrinsicCalibrator, CrossModalExtrinsicCalibrator,
+                        CrossModalExtrinsicResult, _solve_board_pose, _validated_detection,
+                        _validate_intrinsics)
+from .health import check_intrinsics
+from .models import CameraModel
+
+
+AUX_MODELS = {
+    'pinhole_constrained': ('针孔 · k1/k2/p1/p2', CameraModel.PINHOLE, cv2.CALIB_FIX_K3, 4),
+    'pinhole': ('针孔 · 五参数', CameraModel.PINHOLE, 0, 5),
+    'fisheye_2': ('鱼眼投影 · 两参数', CameraModel.FISHEYE,
+                  cv2.fisheye.CALIB_FIX_K3 | cv2.fisheye.CALIB_FIX_K4, 2),
+}
+MIN_OFFLINE_PAIRS = 6
+LIMITS = {'rgb_transfer_rms_px': 2., 'aux_transfer_rms_px': 1.,
+          'baseline_fold_relative': .2, 'baseline_fold_absolute_m': .005}
+
+
+def project(points, intrinsics):
+    fun = cv2.fisheye.projectPoints if intrinsics.model == CameraModel.FISHEYE else cv2.projectPoints
+    return fun(np.asarray(points, dtype=float).reshape(-1, 1, 3), np.zeros(3), np.zeros(3),
+               intrinsics.camera_matrix, intrinsics.dist_coeffs)[0].reshape(-1, 2)
+
+
+def _rms(residual):
+    return float(np.sqrt(np.mean(np.sum(np.asarray(residual) ** 2, axis=-1))))
+
+
+def _pose(det, intr):
+    pose = _solve_board_pose(det, intr)
+    if pose is None:
+        raise ValueError('板位姿求解失败或板点位于相机后方')
+    rvec, tvec = pose
+    return det.object_points @ cv2.Rodrigues(rvec)[0].T + tvec.reshape(3)
+
+
+def transfer_metrics(records, rgb_intrinsics, aux_intrinsics, transform):
+    """Predict the OTHER sensor from one sensor's PnP, in native pixels."""
+    rgb_residuals, aux_residuals, frames = [], [], []
+    rotation, translation = transform[:3, :3], transform[:3, 3]
+    for key, rgb, aux in records:
+        rgb_xyz = _pose(rgb, rgb_intrinsics)
+        aux_xyz = _pose(aux, aux_intrinsics)
+        predicted_rgb = aux_xyz @ rotation.T + translation
+        predicted_aux = (rgb_xyz - translation) @ rotation
+        if min(np.min(predicted_rgb[:, 2]), np.min(predicted_aux[:, 2])) <= 0:
+            raise ValueError(f'{key}: 跨相机投影出现负深度')
+        rgb_error = project(predicted_rgb, rgb_intrinsics) - rgb.image_points
+        aux_error = project(predicted_aux, aux_intrinsics) - aux.image_points
+        if not np.isfinite(rgb_error).all() or not np.isfinite(aux_error).all():
+            raise ValueError(f'{key}: 跨相机投影无效')
+        frames.append({'source_id': str(key), 'rgb_rms_px': _rms(rgb_error),
+                       'aux_rms_px': _rms(aux_error)})
+        rgb_residuals.extend(rgb_error)
+        aux_residuals.extend(aux_error)
+    return {'rgb_transfer_rms_px': _rms(rgb_residuals),
+            'aux_transfer_rms_px': _rms(aux_residuals), 'frames': frames}
+
+
+def _fit(records, board, rgb_intrinsics, model_key):
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+    from scipy.spatial.transform import Rotation
+
+    _, model, flags, parameter_count = AUX_MODELS[model_key]
+    mono = AuxIntrinsicCalibrator(board, model, min_frames=3)
+    cross = CrossModalExtrinsicCalibrator(board, min_frames=3)
+    for _, rgb, aux in records:
+        if not mono.add_detection(aux) or not cross.add_detection_pair(rgb, aux):
+            raise ValueError('观测网格或分辨率不一致')
+    seed = mono.calibrate(flags)
+    initial = cross.calibrate(rgb_intrinsics, seed).T_rgb_left_aux
+    poses = [_solve_board_pose(rgb, rgb_intrinsics) for _, rgb, _ in records]
+    if any(pose is None for pose in poses):
+        raise ValueError('RGB 初始板位姿无效')
+    shared = np.r_[Rotation.from_matrix(initial[:3, :3]).as_rotvec(), initial[:3, 3]]
+    optics = np.r_[np.log(seed.camera_matrix[0, 0]), np.log(seed.camera_matrix[1, 1]),
+                   seed.camera_matrix[:2, 2], seed.dist_coeffs.ravel()[:parameter_count]]
+    offset = 6 + len(optics)
+    initial_x = np.r_[shared, optics, np.array([np.r_[r.ravel(), t.ravel()]
+                                               for r, t in poses]).ravel()]
+    targets = np.asarray([[rgb.image_points, aux.image_points] for _, rgb, aux in records])
+    objects = records[0][1].object_points
+
+    def unpack(x):
+        k, d = seed.camera_matrix.copy(), seed.dist_coeffs.copy().ravel()
+        k[0, 0], k[1, 1] = np.exp(x[6]), np.exp(x[7])
+        k[:2, 2] = x[8:10]
+        d[:parameter_count] = x[10:10 + parameter_count]
+        return replace(seed, camera_matrix=k, dist_coeffs=d)
+
+    def residual(x):
+        intr = unpack(x)
+        poses = x[offset:].reshape(-1, 6)
+        rotations = Rotation.from_rotvec(poses[:, :3]).as_matrix()
+        xyz_rgb = np.einsum('nij,pj->npi', rotations, objects) + poses[:, None, 3:]
+        rot = Rotation.from_rotvec(x[:3]).as_matrix()
+        xyz_aux = (xyz_rgb - x[None, None, 3:6]) @ rot
+        predictions = np.stack((
+            project(xyz_rgb.reshape(-1, 3), rgb_intrinsics).reshape(targets[:, 0].shape),
+            project(xyz_aux.reshape(-1, 3), intr).reshape(targets[:, 1].shape)), axis=1)
+        return (predictions - targets).ravel()
+
+    rows_per_view = len(objects) * 4
+    sparse = lil_matrix((len(records) * rows_per_view, len(initial_x)), dtype=int)
+    for i in range(len(records)):
+        sparse[i*rows_per_view:(i+1)*rows_per_view, :offset] = 1
+        sparse[i*rows_per_view:(i+1)*rows_per_view, offset+i*6:offset+(i+1)*6] = 1
+    result = least_squares(residual, initial_x, jac_sparsity=sparse.tocsr(), x_scale='jac',
+                           loss='soft_l1', f_scale=.5, max_nfev=300,
+                           ftol=1e-9, xtol=1e-9, gtol=1e-9)
+    if not result.success or not np.isfinite(result.x).all():
+        raise ValueError('联合优化未收敛：' + str(result.message))
+    intr = unpack(result.x)
+    transform = np.eye(4)
+    transform[:3, :3] = Rotation.from_rotvec(result.x[:3]).as_matrix()
+    transform[:3, 3] = result.x[3:6]
+    final_poses = result.x[offset:].reshape(-1, 6)
+    depths = []
+    intr.rvecs, intr.tvecs = [], []
+    for pose in final_poses:
+        rotation = cv2.Rodrigues(pose[:3])[0]
+        xyz_rgb = objects @ rotation.T + pose[3:]
+        xyz_aux = (xyz_rgb - transform[:3, 3]) @ transform[:3, :3]
+        depths.extend((float(np.min(xyz_rgb[:, 2])), float(np.min(xyz_aux[:, 2]))))
+        aux_rotation = transform[:3, :3].T @ rotation
+        intr.rvecs.append(cv2.Rodrigues(aux_rotation)[0])
+        intr.tvecs.append((transform[:3, :3].T @ (pose[3:] - transform[:3, 3])).reshape(3, 1))
+    if not np.isfinite(depths).all() or min(depths) <= 0:
+        raise ValueError('联合优化后的板点深度无效')
+    health = check_intrinsics(intr)
+    if health['status'] != 'ok':
+        raise ValueError('辅助模型全视场有效性检查失败：' + '；'.join(health['reasons']))
+    raw = residual(result.x).reshape(len(records), 2, -1, 2)
+    intr.rms_error = _rms(raw[:, 1])
+    intr.per_frame_errors = [_rms(row[1]) for row in raw]
+    intr.per_frame_error_metric = 'joint_training_euclidean_rms_px'
+    intr.frame_ids = [str(key) for key, _, _ in records]
+    return intr, transform, {'converged': True, 'nfev': int(result.nfev), 'health': health,
+        'minimum_joint_depth_m': min(depths),
+        'joint_training_rgb_rms_px': _rms(raw[:, 0]),
+        'joint_training_aux_rms_px': _rms(raw[:, 1])}
+
+
+def calibrate_offline_aux(records, board, rgb_intrinsics, model_key, log=lambda text: None):
+    if model_key not in AUX_MODELS:
+        raise ValueError('请选择独立的辅助相机模型')
+    if len(records) < MIN_OFFLINE_PAIRS:
+        raise ValueError(f'离线联合验证至少需要 {MIN_OFFLINE_PAIRS} 组（数量不代表精度）')
+    if len({str(row[0]) for row in records}) != len(records):
+        raise ValueError('离线观测编号重复')
+    validated = []
+    for key, rgb, aux in records:
+        rgb, aux = _validated_detection(rgb, board), _validated_detection(aux, board)
+        if rgb is None or aux is None:
+            raise ValueError(f'{key}: 观测网格无效')
+        _validate_intrinsics(rgb_intrinsics, rgb.image_size)
+        validated.append((str(key), rgb, aux))
+    if len({aux.image_size for _, _, aux in validated}) != 1:
+        raise ValueError('辅助相机分辨率不一致')
+    rgb_health = check_intrinsics(rgb_intrinsics)
+    if rgb_health['status'] != 'ok':
+        raise ValueError('固定 RGB 内参未通过全视场检查')
+    rgb_intrinsics = deepcopy(rgb_intrinsics)
+    report = dict(schema_version=1, status='offline_candidate_pending_physical_validation',
+        method='fixed_rgb_joint_aux_intrinsics_and_extrinsics', aux_model=model_key,
+        transform_direction='aux_to_rgb_left', translation_unit='metre',
+        metric='cross_camera_transfer_native_pixels', rgb_intrinsics_fixed=True,
+        loss='soft_l1', loss_scale_px=.5, pixel_sigma={'rgb': 1., 'aux': 1.},
+        limits=dict(LIMITS), source_ids=[key for key, _, _ in validated], folds=[],
+        temporal_stability='not_verified_offline', synchronization='not_verified_offline',
+        qualification='Internal cross-validation only; not independent physical accuracy.')
+    fold_frames, baselines = [], []
+    for fold in range(3):
+        training = [row for i, row in enumerate(validated) if i % 3 != fold]
+        heldout = [row for i, row in enumerate(validated) if i % 3 == fold]
+        log(f'离线联合验证 {fold+1}/3：训练 {len(training)}，留出 {len(heldout)}')
+        intr, transform, fit = _fit(training, board, rgb_intrinsics, model_key)
+        metrics = transfer_metrics(heldout, rgb_intrinsics, intr, transform)
+        baselines.append(float(np.linalg.norm(transform[:3, 3])))
+        report['folds'].append(dict(train_ids=[row[0] for row in training],
+            heldout_ids=[row[0] for row in heldout], baseline_m=baselines[-1],
+            T_rgb_left_aux=transform.tolist(), fit=fit, **metrics))
+        fold_frames.extend(metrics['frames'])
+    holdout = {name: float(np.sqrt(np.mean([frame[field]**2 for frame in fold_frames])))
+               for name, field in [('rgb_transfer_rms_px', 'rgb_rms_px'),
+                                   ('aux_transfer_rms_px', 'aux_rms_px')]}
+    for metric, value in holdout.items():
+        if not np.isfinite(value) or value > LIMITS[metric]:
+            raise ValueError(f'离线留出检查失败：{metric}={value:.3f} px，'
+                             f'上限 {LIMITS[metric]:g} px；请复核角点对应、图像和模型')
+    log('留出检查完成，使用全部已确认观测进行最终联合细化')
+    intr, transform, fit = _fit(validated, board, rgb_intrinsics, model_key)
+    baseline = float(np.linalg.norm(transform[:3, 3]))
+    translation_deltas = [float(np.linalg.norm(np.asarray(fold['T_rgb_left_aux'])[:3, 3]
+                                               - transform[:3, 3])) for fold in report['folds']]
+    if baseline <= 1e-6 or max(translation_deltas) > max(
+            LIMITS['baseline_fold_absolute_m'], baseline*LIMITS['baseline_fold_relative']):
+        raise ValueError('跨折基线不稳定，请补充不同位置和倾角的观测并复核对应关系')
+    training_metrics = transfer_metrics(validated, rgb_intrinsics, intr, transform)
+    report.update(heldout=holdout, fit=fit, training=training_metrics, baseline_m=baseline,
+                  fold_translation_max_delta_m=max(translation_deltas))
+    # Legacy scalar is explicitly AUX transfer error, never pooled RGB/IR pixels.
+    extr = CrossModalExtrinsicResult(transform, training_metrics['aux_transfer_rms_px'],
+        len(validated), [row['aux_rms_px'] for row in training_metrics['frames']])
+    extr.calibration_info = report
+    return intr, extr

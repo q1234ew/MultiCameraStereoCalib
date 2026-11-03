@@ -58,6 +58,7 @@ class AuxGuidanceAnalysis:
     summary: str = ''
     poses: list = field(default_factory=list)
     sample_decisions: dict[str, str] = field(default_factory=dict)
+    provisional: bool = False
 
 
 def board_adapter(board):
@@ -147,7 +148,8 @@ def _bootstrap(board, model, detections):
     return None
 
 
-def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
+def _clean_aux_pairs(board, pairs):
+    """Share validation, defensive copies and duplicate decisions across both stages."""
     clean = []
     decisions = {}
     duplicates = 0
@@ -170,12 +172,52 @@ def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
             continue
         clean.append(pair)
         decisions[key] = 'included'
+    return clean, decisions, duplicates, expected
+
+
+def _usable_guidance_intrinsics(supplied, size):
+    if (supplied is not None and _valid_intrinsics(supplied, size, supplied.model)
+            and check_intrinsics(supplied)['status'] == 'ok'):
+        return supplied
+    return None
+
+
+def summarize_aux_progress(board, pairs, intrinsics=(None, None)) -> AuxGuidanceAnalysis:
+    """Advance the first pass without fitting intrinsics or measuring board poses.
+
+    Empty pose/distance statistics are pending, not evidence of missing coverage.
+    Only the full analysis may request repairs or declare completion.
+    """
+    clean, decisions, duplicates, expected = _clean_aux_pairs(board, pairs)
+    plan = initial_plan()
+    if len(clean) < len(plan):
+        phase, target = 'initial', plan[len(clean)]
+        if expected is not None:
+            target = fit_target(board, target, expected[1])
+            if target is None:
+                phase = 'blocked'
+    else:
+        phase, target = 'refining', None
+    fitted = tuple(_usable_guidance_intrinsics(
+        supplied, expected[i] if expected else getattr(supplied, 'image_size', ()))
+        for i, supplied in enumerate(intrinsics))
+    return AuxGuidanceAnalysis(
+        phase=phase, target=target, unique_count=len(clean), duplicate_count=duplicates,
+        pose_count=0, distance_counts={}, missing=(), intrinsics=fitted,
+        initial_total=len(plan),
+        summary=f'引导采用 {len(clean)} 组 · 重复构图 {duplicates} 组\n姿态与距离统计待更新',
+        sample_decisions=decisions, provisional=True,
+    )
+
+
+def analyze_aux_guidance(board, model, pairs, intrinsics=(None, None)):
+    clean, decisions, duplicates, expected = _clean_aux_pairs(board, pairs)
     fitted = []
     for i, supplied in enumerate(intrinsics):
         size = expected[i] if expected else getattr(supplied, 'image_size', ())
-        if (supplied is not None and _valid_intrinsics(supplied, size, supplied.model)
-                and check_intrinsics(supplied)['status'] == 'ok'):
-            fitted.append(supplied)
+        usable = _usable_guidance_intrinsics(supplied, size)
+        if usable is not None:
+            fitted.append(usable)
         else:
             fitted.append(_bootstrap(board, model, [p[i] for p in clean]))
     adapter = board_adapter(board)

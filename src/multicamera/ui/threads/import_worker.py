@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -11,12 +12,14 @@ from collections import Counter
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from ...board.detector import CharucoDetector
 from ...calibration.assessment import DataAssessor
 from ...calibration.aux_capture_quality import assess_aux_frame, quality_reason_text
-from ...calibration.planar import PlanarPatternDetector
+from ...calibration.planar import PatternBoardConfig, PlanarPatternDetector
+from ...calibration.offline_aux import offline_pair_review
 
 
 class StereoImageImportWorker(QThread):
@@ -93,12 +96,16 @@ class AuxImageImportWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, folder: str, board_config, parent=None, *, modality='ir'):
+    def __init__(self, folder: str, board_config, parent=None, *, modality='ir',
+                 offline_recheck=False):
         super().__init__(parent)
         self.folder = folder
         self.board_config = board_config
         self.modality = modality
         self.frame_reviews = {}
+        self.offline_recheck = offline_recheck
+        self.offline_reviews = {}
+        self.import_context = None
 
     def run(self):
         try:
@@ -112,12 +119,24 @@ class AuxImageImportWorker(QThread):
             detector = PlanarPatternDetector(self.board_config)
             imported = []
             for key in keys:
-                rgb = cv2.imread(rgb_files[key])
-                aux = cv2.imread(aux_files[key])
+                snapshots = []
+                if self.offline_recheck:
+                    images = []
+                    for source in (rgb_files[key], aux_files[key]):
+                        path = Path(source).resolve()
+                        payload = path.read_bytes()
+                        images.append(cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR))
+                        snapshots.append(dict(path=str(path), sha256=hashlib.sha256(payload).hexdigest()))
+                    rgb, aux = images
+                else:
+                    rgb = cv2.imread(rgb_files[key])
+                    aux = cv2.imread(aux_files[key])
                 if rgb is None or aux is None:
                     continue
-                rgb_det = detector.detect(rgb)
-                aux_det = detector.detect(aux)
+                rgb_det = (detector.detect_offline(rgb) if self.offline_recheck
+                           else detector.detect(rgb))
+                aux_det = (detector.detect_offline(aux, modality=self.modality)
+                           if self.offline_recheck else detector.detect(aux))
                 qualities = [assess_aux_frame(image, det, self.board_config,
                     modality='rgb' if i == 0 or self.modality == 'acoustic_rgb' else 'ir')
                     for i, (image, det) in enumerate(((rgb, rgb_det), (aux, aux_det)))]
@@ -125,11 +144,30 @@ class AuxImageImportWorker(QThread):
                            for name, quality in zip(('RGB', 'IR/辅助'), qualities)
                            for reason in quality.reasons]
                 review_path = Path(rgb_files[key]).with_name(f'quality_{key}.json')
+                prior = None
+                board_reasons = []
                 if review_path.exists():
                     prior = json.loads(review_path.read_text(encoding='utf-8'))
+                    if prior.get('board') is not None:
+                        try:
+                            recorded_board = PatternBoardConfig.from_dict(prior['board'])
+                            if recorded_board != self.board_config:
+                                board_reasons.append('历史标定板类型、检测点数或物理间距与当前配置不一致')
+                        except (TypeError, ValueError, KeyError):
+                            board_reasons.append('历史标定板记录无效，不能确定物理尺度')
                     if prior.get('state') != '可采纳':
                         reasons += ['原采图验收未通过，不能仅凭重新检测自动纳入']
                         reasons += prior.get('reasons', [])
+                reasons += board_reasons
+                if self.offline_recheck:
+                    self.offline_reviews[key] = offline_pair_review(key, (rgb, aux),
+                        (rgb_det, aux_det), self.board_config, modality=self.modality,
+                        paths=(rgb_files[key], aux_files[key]), capture_review=prior)
+                    if self.offline_reviews[key]['sources'] != snapshots:
+                        raise ValueError(f'{key}: 导入期间原图已变化，请等待文件保存完成后重新导入')
+                    if board_reasons:
+                        self.offline_reviews[key]['image_accepted'] = False
+                        self.offline_reviews[key]['image_reasons'] += board_reasons
                 self.frame_reviews[key] = dict(schema_version=1,
                     detected=bool(rgb_det.valid and aux_det.valid),
                     state='待复核' if reasons else '可采纳', reasons=reasons,
@@ -247,5 +285,8 @@ def _indexed_files(folder: str, prefix: str) -> dict[str, str]:
     for ext in ("png", "jpg", "jpeg", "bmp", "tif", "tiff"):
         for path in glob.glob(os.path.join(folder, f"{prefix}_*.{ext}")):
             stem = os.path.splitext(os.path.basename(path))[0]
-            files[stem[len(prefix) + 1 :]] = path
+            key = stem[len(prefix) + 1:]
+            if key in files:
+                raise ValueError(f'配对编号重复：{prefix}_{key}')
+            files[key] = path
     return files

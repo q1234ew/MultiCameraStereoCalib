@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import logging
 import math
 from contextlib import contextmanager
@@ -240,6 +241,17 @@ def _write_opencv_rig(fs, rig):
             fs.write(f"{prefix}_board_asymmetric", int(aux.board_config.get("asymmetric", False)))
         fs.write(f"{prefix}_frame_count", int(aux.frame_count))
         fs.write(f"{prefix}_rms_error", float(aux.rms_error))
+        if aux.calibration_info:
+            fs.write(f'{prefix}_calibration_status', aux.calibration_info.get('status', 'unverified'))
+            fs.write(f'{prefix}_rms_metric', 'training_aux_cross_camera_transfer_native_px')
+            fs.write(f'{prefix}_translation_unit', 'metre')
+            payload = base64.b64encode(json.dumps(aux.calibration_info, ensure_ascii=False,
+                allow_nan=False).encode('utf-8')).decode('ascii')
+            fs.write(f'{prefix}_calibration_info_encoding', 'base64_utf8_json')
+            fs.startWriteStruct(f'{prefix}_calibration_info_json_base64_chunks', cv2.FileNode_SEQ)
+            for offset in range(0, len(payload), 1024):
+                fs.write('', payload[offset:offset+1024])
+            fs.endWriteStruct()
         fs.write(f"{prefix}_T_rgb_left_aux", aux.T_rgb_left_aux)
         fs.write(f"{prefix}_R_rgb_left_aux", aux.R_rgb_left_aux)
         fs.write(f"{prefix}_t_rgb_left_aux", aux.t_rgb_left_aux)

@@ -261,6 +261,8 @@ def test_gallery_review_is_explicit_and_does_not_replace_capture_source(
     assert '正在回看' not in guide.phase.text()
     panel._refresh_aux_readiness()
     assert panel._btn_capture_aux.isEnabled()
+    # Source routing is checked after the separately tested live stability gate.
+    monkeypatch.setattr(panel._aux_live_gate, 'start', lambda **kw: panel._capture_aux_original())
     panel._btn_capture_aux.click()
     app.processEvents()
     finish_aux_tasks(panel)
@@ -572,16 +574,48 @@ def test_white_balance_preparation_captures_only_new_live_frames(bench, app, mon
         for cid, frame in ((LEFT, rgb_new), (IR, ir_new)):
             manager._latest_frames[cid] = FrameEntry(frame, time.time())
             manager.frame_received.emit(cid, frame, time.time())
-    QTimer.singleShot(1000, fresh_frames)
-    deadline = time.monotonic() + 4
-    while len(panel._aux_images) == initial and time.monotonic() < deadline:
-        app.processEvents()
-        time.sleep(.005)
+    publisher = QTimer()
+    publisher.setInterval(100)
+    publisher.timeout.connect(fresh_frames)
+    publisher.start()
+    deadline = time.monotonic() + 8
+    try:
+        while len(panel._aux_images) == initial and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.005)
+    finally:
+        publisher.stop()
     assert len(panel._aux_images) == initial + 1
     assert not panel._wb_progress.isVisible()
     np.testing.assert_array_equal(panel._aux_images[-1][0], rgb_new)
     saved = win._current_session.session_dir / 'multimodal/rgb_left_0000.png'
     np.testing.assert_array_equal(cv2.imread(str(saved)), rgb_new)
+
+
+@pytest.mark.parametrize('size', [(1440, 1024), (1000, 680)])
+def test_aux_wait_and_cancel_keep_preview_geometry(bench, app, monkeypatch, tmp_path, size):
+    win, rgb, ir = bench
+    panel = win._calib_panel
+    win.resize(*size)
+    publish(win, rgb, ir)
+    monkeypatch.setattr(panel, '_prepare_white_balance', lambda *args: True)
+    monkeypatch.setattr(panel._aux_guide, 'capture_problem', lambda: '保持整板可见，等待连续稳定检测')
+    app.processEvents()
+    geometry = {cid: tile.geometry() for cid, tile in win._stream_view._views.items()}
+    before = panel._aux_saved_count
+    panel._btn_capture_aux.click()
+    app.processEvents()
+    assert panel._aux_live_gate.waiting
+    assert panel._btn_cancel_wb.isVisible() and panel._btn_cancel_wb.isEnabled()
+    assert geometry == {cid: tile.geometry() for cid, tile in win._stream_view._views.items()}
+    directory = Path(os.environ.get('MULTICAMERA_UI_QA_DIR', tmp_path))
+    directory.mkdir(parents=True, exist_ok=True)
+    win.grab().save(str(directory / f'aux-online-wait-{size[0]}x{size[1]}.png'))
+    panel._btn_cancel_wb.click()
+    app.processEvents()
+    assert not panel._aux_live_gate.waiting and panel._aux_saved_count == before
+    assert '未保存' in panel._aux_guide.receipt.text()
+    assert geometry == {cid: tile.geometry() for cid, tile in win._stream_view._views.items()}
 
 
 @pytest.mark.parametrize("size", [(1440, 1024), (1280, 800), (1000, 680)])
