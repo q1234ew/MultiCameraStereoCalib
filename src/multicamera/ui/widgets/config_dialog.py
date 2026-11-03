@@ -166,6 +166,22 @@ class ConfigDialog(QDialog):
             self._combo_fusion_mode.setCurrentIndex(self._combo_fusion_mode.findData("ir"))
         self._edit_aux_url.setFocus()
 
+    def prefill_session_urls(self, metadata):
+        """Fill only empty transports for exact existing logical camera bindings."""
+        pairs = {pair['name']: pair for pair in metadata.get('pairs', [])}
+        for row in range(self._table.rowCount()):
+            binding = pairs.get(self._item_text(row, 0))
+            if binding is None or (self._item_text(row, 2), self._item_text(row, 4)) != (
+                    binding.get('left_id'), binding.get('right_id')):
+                continue
+            for column, key in ((3, 'left_url'), (5, 'right_url')):
+                if not self._item_text(row, column) and binding.get(key):
+                    self._table.item(row, column).setText(binding[key])
+        aux = metadata.get('auxiliary_camera') or {}
+        if self._edit_aux_id.text().strip() == aux.get('camera_id') and not self._edit_aux_url.text().strip():
+            self._edit_aux_url.setText(aux.get('url', ''))
+        self._refresh_validation()
+
     def _init_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)

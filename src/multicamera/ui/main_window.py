@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize, QTimer
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QInputDialog,
     QMenu,
     QLayout,
     QMessageBox,
@@ -48,7 +50,7 @@ from .widgets.rgb_settings_dialog import DEFAULT_RGB_SETTINGS_URL, RgbSettingsDi
 from .widgets.stream_view import MultiStreamView
 from .widgets.pair_gallery import PairGallery
 from .widgets.stereo_capture import StereoCaptureWorkspace
-from .configuration import configuration_impact
+from .configuration import configuration_impact, continuation_impact
 from .theme import TEXT, TEXT_DIM, SUCCESS, WARNING, BORDER, standard_icon, app_icon
 
 logger = logging.getLogger(__name__)
@@ -484,6 +486,8 @@ class MainWindow(QMainWindow):
         self._act_load_session = self._create_action("加载会话(&L)...")
         self._act_load_session.setShortcut(QKeySequence.Open)
         file_menu.addAction(self._act_load_session)
+        self._act_load_calibration = self._create_action('读取双目标定文件...')
+        file_menu.addAction(self._act_load_calibration)
 
         file_menu.addSeparator()
 
@@ -612,6 +616,7 @@ class MainWindow(QMainWindow):
         self._act_config_tb.triggered.connect(self._on_config)
         self._act_new_session.triggered.connect(self._on_new_session)
         self._act_load_session.triggered.connect(self._on_load_session)
+        self._act_load_calibration.triggered.connect(self._on_load_calibration_file)
         self._act_export.triggered.connect(self._on_export)
         self._act_exit.triggered.connect(self.close)
         self._act_start_streams.triggered.connect(self._on_start_streams)
@@ -638,6 +643,9 @@ class MainWindow(QMainWindow):
         self._calib_panel.aux_images_imported.connect(self._stream_view.show_multimodal_images)
         self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
         self._calib_panel.configure_aux_requested.connect(lambda: self._on_config(True))
+        self._calib_panel.load_rgb_session_requested.connect(self._on_load_session)
+        self._calib_panel.load_rgb_file_requested.connect(self._on_load_calibration_file)
+        self._calib_panel.continue_aux_capture_requested.connect(self._on_continue_aux_capture)
         self._calib_panel.configure_stereo_requested.connect(lambda: self._on_config(False))
         self._calib_panel.model_choice_requested.connect(self._on_model_choice)
         self._calib_panel.data_source_changed.connect(self._update_connection_summary)
@@ -791,7 +799,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.show_workflow("pointcloud")
 
     @Slot()
-    def _on_config(self, auxiliary: bool = False):
+    def _on_config(self, auxiliary: bool = False, *, resume_rgb: bool = False):
         logger.info("Open camera configuration dialog")
         if self._calib_panel.has_active_operations or self._calib_panel.has_failed_saves:
             QMessageBox.information(self, "配置暂不可修改", "请先停止自动采集，等待后台任务完成；原图保存失败时请重试或撤销对应采集。")
@@ -804,13 +812,51 @@ class MainWindow(QMainWindow):
         old_pairs = dict(self._stream_manager.stereo_pairs)
         old_aux = self._stream_manager.auxiliary_camera
         impact = None
+        if resume_rgb and self._current_session is not None:
+            dlg.prefill_session_urls(self._current_session.metadata)
+
+        def persist_resume(board, model, pairs, aux):
+            if not resume_rgb:
+                return True
+            try:
+                self._current_session.record_configuration(board, pairs, aux,
+                    camera_model=CameraModel(model).value, continuation={
+                        'confirmed_at': datetime.now().isoformat(),
+                        'same_rgb_device_lens_settings': 'user_confirmed',
+                        'rgb_result': deepcopy(self._calib_panel._rgb_result_provenance),
+                        'bindings': {name: {'left_id': pair.left_id, 'right_id': pair.right_id,
+                            'image_size': list(pair.left_intrinsics.image_size)}
+                            for name, pair in self._calib_panel._pair_calibs.items()},
+                    })
+            except Exception as exc:
+                text = f'续采配置记录失败，原配置和复核状态保留，未连接或采图：{exc}'
+                self._calib_panel.append_log(text)
+                QMessageBox.warning(self, '续采配置未应用', text)
+                return False
+            return True
 
         def confirm(board, model, pairs, aux):
             nonlocal impact
-            impact = configuration_impact(self._board, board, self._camera_model, model,
-                                          old_pairs, pairs, old_aux, aux)
+            if resume_rgb:
+                try:
+                    impact = continuation_impact(self._board, board, self._camera_model, model,
+                        old_pairs, pairs, old_aux, aux, self._calib_panel._pair_calibs)
+                    rgb_id = self._calib_panel._rgb_left_camera_id()
+                    reference = next((p for p in pairs if p.left.camera_id == rgb_id), None)
+                    if reference is None or not reference.left.url or aux is None or not aux.url:
+                        raise ValueError('在线续采需填写原 RGB 左右流地址，并启用红外/辅助实时地址')
+                    if self._current_session.multimodal_resume_state()['saved_pairs'] and old_aux and (
+                            aux.camera_id, aux.modality, aux.pattern_board_config()) != (
+                            old_aux.camera_id, old_aux.modality, old_aux.pattern_board_config()):
+                        raise ValueError('会话已有融合原图，续采不能更换辅助相机或标定板；请新建独立会话')
+                except ValueError as exc:
+                    QMessageBox.warning(self, '续采配置不兼容', str(exc))
+                    return False
+            else:
+                impact = configuration_impact(self._board, board, self._camera_model, model,
+                                              old_pairs, pairs, old_aux, aux)
             if not self._calib_panel.has_affected_work(impact):
-                return True
+                return persist_resume(board, model, pairs, aux)
             effects = []
             if impact.reset_stereo:
                 effects.append("全部双目采图缓存和标定结果（板规格或镜头模型改变）")
@@ -825,7 +871,7 @@ class MainWindow(QMainWindow):
             ) == QMessageBox.Yes
             if not approved:
                 logger.info("Configuration rejected before apply")
-            return approved
+            return approved and persist_resume(board, model, pairs, aux)
 
         dlg.before_apply = confirm
         if auxiliary:
@@ -869,7 +915,8 @@ class MainWindow(QMainWindow):
                     self._calib_panel._active_step == 2, self._calib_panel._rgb_left_camera_id(),
                     force_refresh=True,
                 )
-            if self._current_session is not None and (impact.streams_changed or impact.reset_stereo):
+            if (not resume_rgb and self._current_session is not None and
+                    (impact.streams_changed or impact.reset_stereo)):
                 try:
                     self._current_session.record_configuration(
                         self._board, list(self._stream_manager.stereo_pairs.values()),
@@ -890,8 +937,34 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage(
                 f"✓  已配置 {len(self._stream_manager.stereo_pairs)} 组相机 [{model_name}模型]"
             )
-            if was_streaming and impact.streams_changed:
+            if was_streaming and impact.streams_changed and not resume_rgb:
                 self._on_start_streams(preserve_trackers=True)
+            return True
+        return False
+
+    @Slot()
+    def _on_continue_aux_capture(self):
+        if self._background_tasks_block('继续融合采集'):
+            return
+        panel = self._calib_panel
+        if self._current_session is None or panel._rgb_left_camera_id() not in panel._intrinsics:
+            QMessageBox.information(self, '先加载双目结果', '请先加载已完成双目标定的会话，再继续融合采集。')
+            return
+        approved = QMessageBox.question(self, '确认沿用双目标定',
+            '请确认仍是原 RGB 左右相机、原左右顺序，镜头、焦距、对焦和输出分辨率未改变。\n'
+            '确认后可补充视频地址及红外配置，保留双目内参，并连接视频继续采图到当前会话。\n'
+            '已有红外原图保留，辅助相机和板规格也须保持一致；需逐对复核后纳入联合标定。'
+            '若设备或镜头改变，请取消并重新标定。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if approved != QMessageBox.Yes or self._background_tasks_block('继续融合采集'):
+            return
+        if not self._on_config(True, resume_rgb=True):
+            return
+        panel.restore_saved_aux_progress()
+        panel.show_workflow('capture', True)
+        panel.append_log('已保留 RGB 双目标定，继续当前会话融合采集；'
+                         '仅沿用已确认的设备/镜头设置，实时分辨率仍须匹配内参')
+        self._on_start_streams()
 
     @Slot(bool)
     def _on_preview_mode_changed(self, multimodal: bool):
@@ -1001,25 +1074,27 @@ class MainWindow(QMainWindow):
             logger.info("Load calibration session: %s", dir_path)
             try:
                 session = CalibrationSession.load(Path(dir_path))
-                from ..calibration.offline_aux import validate_session_rig
+                from ..io.session_restore import inspect_session_files
+                inventory = inspect_session_files(session)
+                self._calib_panel.append_log(inventory['text'])
                 rig = session.load_rig()
                 if rig is None:
                     if self._rig is not None or self._calib_panel._active_step == 2:
                         raise ValueError('会话缺少 RGB 标定结果，不能用于融合；已保留当前有效状态')
-                    self._calib_panel.set_session(session)
-                    self._calib_panel._reset_all()
+                    if session.metadata.get('board') and session.metadata.get('pairs'):
+                        from ..io.session_restore import prepare_session_restore
+                        plan = prepare_session_restore(session, allow_uncomputed=True)
+                        if not self._load_session_result(session, plan):
+                            return
+                    else:
+                        self._calib_panel.set_session(session)
+                        self._calib_panel._reset_all()
                     self._calib_panel.append_log('已加载原图会话，尚无 RGB 标定结果；融合前需完成 RGB 标定')
                 else:
-                    rig = validate_session_rig(session, self._stream_manager.stereo_pairs.values())
-                    if any(pair.stereo.model != self._camera_model for pair in rig.pairs.values()):
-                        raise ValueError('当前 RGB 相机模型与会话不同，请先选择相同模型')
-                    for pair in rig.pairs.values():
-                        for camera_id, intr in ((pair.left_id, pair.left_intrinsics),
-                                                 (pair.right_id, pair.right_intrinsics)):
-                            frame = self._stream_manager.get_latest_frame(camera_id)
-                            if frame is not None and frame[0].shape[1::-1] != intr.image_size:
-                                raise ValueError(f'{camera_id}: 当前预览分辨率与恢复内参不同')
-                    self._calib_panel.restore_session_result(session, rig)
+                    from ..io.session_restore import prepare_session_restore
+                    plan = prepare_session_restore(session)
+                    if not self._load_session_result(session, plan):
+                        return
             except Exception as exc:
                 text = f"加载会话失败，已保留当前会话：{exc}"
                 self._statusbar.showMessage(text)
@@ -1032,7 +1107,163 @@ class MainWindow(QMainWindow):
             self._empty_created_session = None
             self._empty_session_config = None
             self._refresh_session_button()
-            self._statusbar.showMessage(f"✓  加载会话: {self._current_session.name}")
+            self._session_button.setToolTip(inventory['text'] + '\n' + str(session.session_dir))
+            self._statusbar.showMessage(f'加载会话：{session.name}；融合原图 {inventory["aux_pairs"]} 组；'
+                                       '缺少项及下一步见会话文件检查日志')
+            self._calib_panel.restore_session_images(auto_aux=inventory['auto_import'])
+
+    def _load_session_result(self, session, plan, *, confirm_workspace=True, force_offline=False):
+        manager = self._stream_manager
+        current = manager.stereo_pairs
+        bindings_match = all(pair.name in current and
+            (current[pair.name].left.camera_id, current[pair.name].right.camera_id) ==
+            (pair.left.camera_id, pair.right.camera_id) for pair in plan.pairs)
+        recorded = {pair['name']: pair for pair in session.metadata.get('pairs', [])}
+        if bindings_match:
+            for name in plan.rig.pairs:
+                cfg, binding = current[name], recorded.get(name, {})
+                if not manager.is_virtual_pair(name) and (
+                        (cfg.left.url, cfg.right.url) !=
+                        (binding.get('left_url', ''), binding.get('right_url', ''))):
+                    bindings_match = False
+        aux = manager.auxiliary_camera
+        aux_matches = ((aux is None and plan.auxiliary is None) or
+            (aux is not None and plan.auxiliary is not None and
+             (aux.camera_id, aux.modality, aux.pattern_board_config().to_dict()) ==
+             (plan.auxiliary.camera_id, plan.auxiliary.modality,
+              plan.auxiliary.pattern_board_config().to_dict())))
+        if aux_matches and aux is not None and aux.url:
+            aux_matches = aux.url == (session.metadata.get('auxiliary_camera') or {}).get('url')
+        offline = (force_offline or plan.legacy_offline or not bindings_match or not aux_matches or
+                   self._camera_model != plan.model or self._board.to_dict() != plan.board.to_dict())
+        if not offline:
+            for pair in plan.rig.pairs.values():
+                for camera_id, intr in ((pair.left_id, pair.left_intrinsics),
+                                       (pair.right_id, pair.right_intrinsics)):
+                    frame = manager.get_latest_frame(camera_id)
+                    if frame is not None and frame[0].shape[1::-1] != intr.image_size:
+                        offline = True
+        if offline and confirm_workspace:
+            details = '\n'.join(f'{pair.name}: 左 {pair.left.camera_id} / 右 {pair.right.camera_id}'
+                                for pair in plan.pairs)
+            legacy = ('\n旧版离线结果未记录虚拟相机绑定；仅按 offline_L/R 恢复离线组，'
+                      '不映射到真实相机。' if plan.legacy_offline else '')
+            answer = QMessageBox.question(self, '按会话信息离线打开',
+                '当前相机、模型或标定板配置与会话不同。是否切换到该会话的离线工作区？\n'
+                f'{details}{legacy}\n\n将断开当前视频流，替换内存中的采图和结果，恢复会话板规格及模型；'
+                '不自动连接历史地址，不把旧内参应用到当前设备，磁盘历史文件不变。\n'
+                '后续可导入配对原图；如需在线补拍，请重新配置并核对设备及镜头。',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                text = '已取消加载会话，当前会话和相机配置未改变'
+                self._calib_panel.append_log(text)
+                self._statusbar.showMessage(text)
+                return False
+            if self._background_tasks_block('加载会话'):
+                return False
+        # Prepare all file-derived state before stopping streams or replacing configuration.
+        if plan.rig.pairs:
+            self._calib_panel.restore_session_result(session, plan.rig,
+                board=plan.board, camera_model=plan.model)
+        else:
+            self._calib_panel.set_session(session)
+            self._calib_panel._board, self._calib_panel._camera_model = plan.board, plan.model
+            self._calib_panel._reset_all()
+        self._board, self._camera_model = plan.board, plan.model
+        if offline:
+            self._on_stop_streams()
+            manager.clear_auxiliary_camera()
+            for name in list(manager.stereo_pairs):
+                manager.remove_stereo_pair(name)
+            for pair in plan.pairs:
+                manager.add_virtual_stereo_pair(pair)
+            if plan.auxiliary is not None:
+                manager.set_auxiliary_camera(plan.auxiliary)
+            self._calib_panel.append_log('已按会话配置离线打开；未连接设备，历史原图和结果未改写')
+            if plan.legacy_offline:
+                self._calib_panel.append_log('旧版 offline_L/R 已恢复为虚拟离线组；未绑定真实设备')
+        if offline:
+            self._stream_view.clear_all()
+            self._stream_view.update_board(self._board)
+        else:
+            self._stream_view.begin_capture_session()
+        self._calib_panel.refresh_pairs()
+        self._calib_panel.show_workflow('results' if plan.rig.pairs else 'calibration',
+                                       plan.auxiliary is not None and bool(plan.rig.pairs))
+        return True
+
+    @Slot()
+    def _on_load_calibration_file(self):
+        if self._background_tasks_block('读取双目标定文件'):
+            return
+        filename, _ = QFileDialog.getOpenFileName(self, '读取双目标定文件', '',
+            '双目标定 (*.json *.yml *.yaml *.xml)')
+        if not filename or self._background_tasks_block('读取双目标定文件'):
+            return
+        try:
+            from ..io.calibration_import import load_stereo_calibration
+            unit = None
+            if Path(filename).suffix.lower() != '.json':
+                text, approved = QInputDialog.getItem(self, '确认平移单位',
+                    '请按文件中 T 的实际单位选择；不根据基线大小猜测。', ['米 (m)', '毫米 (mm)'], 0, False)
+                if not approved:
+                    return
+                unit = 'mm' if text == '毫米 (mm)' else 'm'
+            rig, provenance = load_stereo_calibration(filename, translation_unit=unit)
+            pairs = [self._stream_manager.stereo_pairs.get(name) for name in rig.pairs]
+            compatible = self._current_session is not None and all(
+                cfg is not None and (cfg.left.camera_id, cfg.right.camera_id) ==
+                (pair.left_id, pair.right_id) for cfg, pair in zip(pairs, rig.pairs.values()))
+            compatible = compatible and all(p.stereo.model == self._camera_model for p in rig.pairs.values())
+            if compatible:
+                recorded = {p['name']: p for p in self._current_session.metadata.get('pairs', [])}
+                compatible = all(name in recorded and
+                    (recorded[name].get('left_id'), recorded[name].get('right_id')) ==
+                    (p.left_id, p.right_id) for name, p in rig.pairs.items()) and (
+                    self._current_session.metadata.get('camera_model', 'pinhole') == self._camera_model.value)
+            details = '\n'.join(f'{name}: 左 {p.left_id} / 右 {p.right_id}；'
+                f'{p.left_intrinsics.image_size[0]}×{p.left_intrinsics.image_size[1]}，{p.stereo.model.value}'
+                for name, p in rig.pairs.items())
+            message = ('结果将存入当前会话的新批次，原图和旧批次保留。' if compatible else
+                       '将新建独立会话，原工作区的磁盘文件保留。')
+            if QMessageBox.question(self, '确认读取双目参数', f'{details}\n\n{message}\n'
+                '将清理内存中的旧检测/复核并重读当前会话原图，不自动连接设备。\n'
+                '若关联当前会话，请确认其原图确实来自同一套设备、镜头及输出设置；不一致请取消并新建会话。\n'
+                '请确认左/右对应；OpenCV M1/D1 为左，M2/D2 为右，R/T 表示左到右。\n'
+                '文件有效不代表精度已验收；后续在线使用仍需确认同一设备、镜头与输出尺寸。',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            if self._background_tasks_block('读取双目标定文件'):
+                return
+            provenance['physical_rgb_binding'] = 'user_confirmed_for_session' if compatible else 'unbound_offline'
+            from ..streaming.stream_manager import CameraConfig, StereoPairConfig
+            configs = [StereoPairConfig(name, CameraConfig(p.left_id, '', 'left', name),
+                CameraConfig(p.right_id, '', 'right', name)) for name, p in rig.pairs.items()]
+            model = next(iter(rig.pairs.values())).stereo.model
+            session = self._current_session if compatible else self._session_manager.create_session(
+                self._board, configs, auxiliary=self._stream_manager.auxiliary_camera,
+                name='calib', camera_model=model.value)
+            saved, errors = session.save_calibration_results(rig)
+            if session.result_path.resolve() != saved[0].resolve():
+                raise OSError('新标定批次索引未成功发布，未恢复旧参数冒充本次导入；'
+                              '当前状态保留，新文件位于：' + str(saved[0].parent) + '；' + '；'.join(errors))
+            from ..io.session_restore import prepare_session_restore, inspect_session_files
+            plan = prepare_session_restore(session)
+            if not self._load_session_result(session, plan, confirm_workspace=False, force_offline=True):
+                return
+            self._current_session, self._rig = session, self._calib_panel.rig
+            self._calib_panel._rgb_result_provenance = provenance
+            self._act_export.setEnabled(True)
+            self._empty_created_session = self._empty_session_config = None
+            self._refresh_session_button()
+            inventory = inspect_session_files(session)
+            self._calib_panel.append_log('已读取双目标定文件；参数通过有效性检查，精度待实际验证\n' + inventory['text'])
+            self._calib_panel.restore_session_images(auto_aux=inventory['auto_import'])
+            self._statusbar.showMessage('双目参数已读取：可继续 RGB+IR 采集或导入配对原图')
+        except Exception as exc:
+            logger.exception('Read stereo calibration failed: %s', filename)
+            self._calib_panel.append_log(f'读取双目标定文件失败：{exc}')
+            QMessageBox.warning(self, '标定文件不完整或不兼容', str(exc))
 
     @Slot()
     def _on_export(self):
@@ -1220,6 +1451,10 @@ class MainWindow(QMainWindow):
                 )
                 self._calib_panel.set_session(self._current_session, preserve_model_assessment=True)
                 self._refresh_session_button()
+            if 'offline' in rig.pairs and self._stream_manager.is_virtual_pair('offline'):
+                self._current_session.record_configuration(
+                    self._board, list(self._stream_manager.stereo_pairs.values()),
+                    self._stream_manager.auxiliary_camera, camera_model=self._camera_model.value)
             saved, errors = self._current_session.save_calibration_results(rig)
         except Exception as exc:
             logger.exception("Automatic calibration result save failed")
@@ -1230,6 +1465,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "标定文件保存失败", text)
             return
         directory = saved[0].parent.resolve()
+        from ..calibration.offline_aux import file_identity
+        self._calib_panel._rgb_result_provenance = dict(kind='session_result',
+            result=file_identity(saved[0]), session_name=self._current_session.name)
         self._calib_panel.set_result_storage(directory, saved, errors)
         text = f"标定完成，已保存 {len(saved)} 个文件：{directory}"
         self._calib_panel.append_log(text)

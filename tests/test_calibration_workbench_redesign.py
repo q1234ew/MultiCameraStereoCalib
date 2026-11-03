@@ -127,7 +127,7 @@ def test_result_risks_and_outdated_data_do_not_imply_success(panel):
 def test_auxiliary_next_step_uses_existing_prerequisite_gate(panel):
     panel.show_workflow('calibration', True)
     assert panel._aux_calibration_problem() in panel._lbl_workflow_next.text()
-    assert '先完成 RGB' in panel._lbl_workflow_next.text()
+    assert '先加载已完成的双目会话' in panel._lbl_workflow_next.text()
     assert not panel._btn_calib_aux.isEnabled()
     panel._btn_back_to_aux_capture.click()
     assert panel.workflow_phase == 'capture'

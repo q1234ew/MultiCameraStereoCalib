@@ -110,6 +110,8 @@ class CalibrationSession:
             ),
             "frame_count": 0,
             "multimodal_frame_count": 0,
+            "multimodal_rgb_left_id": next((p.left.camera_id for p in pairs
+                                              if p.left.stream_type == 'rgb'), None),
         }
         session._creation_metadata = deepcopy(session._metadata)
         try:
@@ -184,7 +186,8 @@ class CalibrationSession:
     # ── Image storage ─────────────────────────────────────────
 
     def record_configuration(self, board: CharucoBoard, pairs: List[StereoPairConfig],
-                             auxiliary: AuxiliaryCameraConfig | None, camera_model: str = "pinhole"):
+                             auxiliary: AuxiliaryCameraConfig | None, camera_model: str = "pinhole",
+                             *, continuation: dict | None = None):
         """Record configuration revisions without deleting historical images/results."""
         keys = ("board", "pairs", "auxiliary_camera", "camera_model")
         previous = {key: self._metadata.get(key) for key in keys}
@@ -196,20 +199,29 @@ class CalibrationSession:
             "auxiliary_camera": auxiliary.to_dict() if auxiliary else None,
             "camera_model": camera_model,
         }
-        if previous == current:
+        if previous == current and continuation is None:
             return
         revision = {
             "changed_at": datetime.now().isoformat(), "previous": previous,
             "frame_count": self.frame_count,
             "multimodal_frame_count": self._metadata.get("multimodal_frame_count", 0),
         }
-        self._metadata["configuration_history"] = [*self._metadata.get("configuration_history", []), revision]
-        self._metadata.update(current)
+        updated = deepcopy(self._metadata)
+        if not updated.get('multimodal_rgb_left_id'):
+            updated['multimodal_rgb_left_id'] = next((p.get('left_id') for p in self._metadata.get('pairs', [])
+                if p.get('stream_type', 'rgb') == 'rgb'), None)
+        if previous != current:
+            updated["configuration_history"] = [*updated.get("configuration_history", []), revision]
+        updated.update(current)
+        if continuation is not None:
+            updated['rgb_continuation_history'] = [*updated.get('rgb_continuation_history', []),
+                                                    deepcopy(continuation)]
         path = self.session_dir / self.METADATA_FILE
         with _staging_directory(dir=self.session_dir) as staging:
             staged = Path(staging) / path.name
-            staged.write_text(json.dumps(self._metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            staged.write_text(json.dumps(updated, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
             staged.replace(path)
+        self._metadata = updated
 
     def save_frame_pair(
         self,
@@ -303,14 +315,27 @@ class CalibrationSession:
         frame_idx: Optional[int] = None,
     ) -> int:
         """Save a paired RGB_L/AUX observation under the session multimodal folder."""
-        if frame_idx is None:
-            frame_idx = self._metadata.get("multimodal_frame_count", 0)
-
         mm_dir = self.session_dir / self.MULTIMODAL_DIR
         mm_dir.mkdir(parents=True, exist_ok=True)
-        self._save_image_pair(mm_dir, "rgb_left", "aux", rgb_left, aux, frame_idx,
-                              "multimodal_frame_count", pending_review=True)
+        with self._io_lock:
+            if frame_idx is None:
+                frame_idx = self.multimodal_resume_state()['next_index']
+            self._save_image_pair(mm_dir, "rgb_left", "aux", rgb_left, aux, frame_idx,
+                                  "multimodal_frame_count", pending_review=True)
         return frame_idx
+
+    def multimodal_resume_state(self):
+        """Count saved PNG pairs, reserving even orphan image/review indices."""
+        folder = self.session_dir / self.MULTIMODAL_DIR
+        indices = {}
+        for prefix, suffix in (('rgb_left_', '.png'), ('aux_', '.png'), ('quality_', '.json')):
+            indices[prefix] = {int(path.stem[len(prefix):])
+                for path in folder.glob(f'{prefix}*{suffix}')
+                if path.stem[len(prefix):].isascii() and path.stem[len(prefix):].isdecimal()}
+        reserved = set().union(*indices.values())
+        return dict(saved_pairs=len(indices['rgb_left_'] & indices['aux_']),
+            next_index=max(self._metadata.get('multimodal_frame_count', 0),
+                           max(reserved, default=-1) + 1))
 
     def save_multimodal_review(self, frame_idx: int, review: dict) -> None:
         """Keep raw admission evidence next to the successfully saved pair."""
@@ -376,6 +401,16 @@ class CalibrationSession:
     @property
     def frame_count(self) -> int:
         return self._metadata.get("frame_count", 0)
+
+    @property
+    def next_stereo_frame_index(self) -> int:
+        indices = []
+        for path in (self.session_dir / self.IMAGES_DIR).rglob('*'):
+            if path.stem.startswith(('left_', 'right_', 'quality_')):
+                key = path.stem.rsplit('_', 1)[-1]
+                if key.isascii() and key.isdecimal():
+                    indices.append(int(key))
+        return max(self.frame_count, max(indices, default=-1) + 1)
 
     # ── Calibration results ───────────────────────────────────
 
@@ -482,11 +517,20 @@ class CalibrationSession:
         return directory
 
     def load_rig(self) -> Optional[MultiCameraRig]:
-        path = self.result_directory / "rig.json"
+        path = self.result_path
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
         return MultiCameraRig.from_dict(data)
+
+    @property
+    def result_path(self) -> Path:
+        path = self.result_directory / 'rig.json'
+        if path.exists() or (self.session_dir / self.RESULTS_DIR / 'latest.json').exists():
+            return path
+        # Legacy manual complete-JSON export; never bypass a damaged latest batch pointer.
+        legacy = self.session_dir / 'calibration_all_json.json'
+        return legacy if legacy.is_file() else path
 
     # ── Metadata ──────────────────────────────────────────────
 

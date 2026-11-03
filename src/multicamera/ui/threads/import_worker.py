@@ -62,14 +62,19 @@ class StereoImageImportWorker(QThread):
                 review_path = lp.with_name(lp.stem.replace('left_', 'quality_', 1) + '.json')
                 if lp.name.startswith('left_') and review_path.exists():
                     review = json.loads(review_path.read_text(encoding='utf-8'))
+                    if review.get('board') is not None and review['board'] != self.board.to_dict():
+                        skipped += 1
+                        self.log.emit(f'[{idx}] 历史 RGB 标定板与当前会话不一致，未纳入；原图保留')
+                        continue
                     if review.get('state') != '可采纳':
                         skipped += 1
                         self.log.emit(f'[{idx}] {review.get("state", "待复核")}：未纳入导入标定数据；原图保留')
                         continue
-                img_l = cv2.imread(str(lp))
-                img_r = cv2.imread(str(rp))
+                img_l = cv2.imdecode(np.frombuffer(lp.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+                img_r = cv2.imdecode(np.frombuffer(rp.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
                 if img_l is None or img_r is None:
                     skipped += 1
+                    self.log.emit(f'[{idx}] 图片无法读取：{lp.name} / {rp.name}，请检查文件损坏')
                     continue
                 det_l = detector.detect(img_l)
                 det_r = detector.detect(img_r)
@@ -106,6 +111,7 @@ class AuxImageImportWorker(QThread):
         self.offline_recheck = offline_recheck
         self.offline_reviews = {}
         self.import_context = None
+        self.read_errors = []
 
     def run(self):
         try:
@@ -132,6 +138,7 @@ class AuxImageImportWorker(QThread):
                     rgb = cv2.imread(rgb_files[key])
                     aux = cv2.imread(aux_files[key])
                 if rgb is None or aux is None:
+                    self.read_errors.append(f'[{key}] 图片无法读取：{rgb_files[key]} / {aux_files[key]}')
                     continue
                 rgb_det = (detector.detect_offline(rgb) if self.offline_recheck
                            else detector.detect(rgb))

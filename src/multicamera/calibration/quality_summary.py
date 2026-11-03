@@ -114,6 +114,10 @@ def summarize_quality(rig):
 
     for name, pair in rig.pairs.items():
         try:
+            if pair.calibration_info.get('imported_calibration'):
+                risks.append(f'{name}：外部导入参数，未在本次会话重新验证标定精度')
+            if pair.calibration_info.get('missing_imported_metrics'):
+                risks.append(f'{name}：原文件未记录完整 RMS，不能将兼容存储值当作实测误差')
             intrinsic(f'{name} 左目', pair.left_intrinsics)
             intrinsic(f'{name} 右目', pair.right_intrinsics)
             health = check_stereo_health(pair.left_intrinsics, pair.right_intrinsics,
@@ -172,6 +176,8 @@ def summarize_quality(rig):
         title, level = '质量指标无效，需重新核对', 'poor'
     elif Grade.POOR in grades:
         title, level = '不建议直接使用', 'poor'
+    elif any(p.calibration_info.get('imported_calibration') for p in rig.pairs.values()):
+        title, level = '导入参数，精度待验证', 'fair'
     elif any(aux.calibration_info.get('status') == 'offline_candidate_pending_physical_validation'
              for aux in rig.aux_cameras.values()):
         title, level = '离线候选，待实物验证', 'fair'

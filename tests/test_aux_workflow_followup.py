@@ -147,7 +147,7 @@ def test_capture_before_rgb_intrinsics_saves_raw_but_cannot_calibrate(panel, mon
     assert len(panel._aux_pairs) == 1
     assert panel._aux_saved_count == 1
     assert '实时原图已落盘 1 组' in panel._lbl_raw_save.text()
-    assert '请先完成 RGB 左目' in panel._aux_calibration_problem()
+    assert '请先加载已完成的双目会话' in panel._aux_calibration_problem()
     assert not panel._btn_calib_aux.isEnabled()
     session = CalibrationSession.load(panel._session.session_dir)
     assert session.metadata['multimodal_frame_count'] == 1

@@ -67,24 +67,35 @@ def confirm_offline_pair(review, rgb_order, aux_order):
     return result
 
 
-def validate_session_rig(session, configured_pairs):
+def is_legacy_offline_pair(name, pair, recorded):
+    return (name == 'offline' and name not in recorded and
+            (pair.left_id, pair.right_id) == ('offline_L', 'offline_R'))
+
+
+def validate_session_rig(session, configured_pairs=None, *, allow_legacy_offline=False):
     """Preflight before replacing current UI state. No network or source writes."""
     rig = session.load_rig()
     if rig is None or not rig.pairs:
         raise ValueError('会话缺少已保存的 RGB 双目标定结果；请先完成 RGB 标定')
     metadata = session.metadata
     recorded = {pair['name']: pair for pair in metadata.get('pairs', [])}
-    if not recorded:
+    if not recorded and not allow_legacy_offline:
         raise ValueError('会话缺少左右相机绑定信息，不能恢复 RGB 内参')
-    configured = {pair.name: pair for pair in configured_pairs}
+    configured = ({pair.name: pair for pair in configured_pairs}
+                  if configured_pairs is not None else None)
     for name, pair in rig.pairs.items():
         binding = recorded.get(name)
-        if binding is None or (pair.left_id, pair.right_id) != (
-                binding.get('left_id'), binding.get('right_id')) or pair.left_id == pair.right_id:
-            raise ValueError(f'{name}: RGB 结果与会话左右相机 ID 不一致')
-        current = configured.get(name)
-        if current is None or (current.left.camera_id, current.right.camera_id) != (
-                pair.left_id, pair.right_id):
+        legacy = allow_legacy_offline and is_legacy_offline_pair(name, pair, recorded)
+        if not legacy and (binding is None or (pair.left_id, pair.right_id) != (
+                binding.get('left_id'), binding.get('right_id')) or pair.left_id == pair.right_id):
+            stored = binding or {}
+            raise ValueError(f'{name}: RGB 结果与会话左右相机 ID 不一致；'
+                f'结果 左={pair.left_id} / 右={pair.right_id}；'
+                f'会话 左={stored.get("left_id", "未记录")} / 右={stored.get("right_id", "未记录")}')
+        binding = binding or {}
+        current = configured.get(name) if configured is not None else None
+        if configured is not None and (current is None or
+                (current.left.camera_id, current.right.camera_id) != (pair.left_id, pair.right_id)):
             raise ValueError(f'{name}: 当前相机配置与会话左右绑定不同，请先配置相同相机组')
         model = CameraModel(metadata.get('camera_model', 'pinhole'))
         intrinsics = (pair.left_intrinsics, pair.right_intrinsics)

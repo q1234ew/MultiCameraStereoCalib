@@ -473,8 +473,8 @@ def test_sidebar_rgb_prerequisite_navigates_without_losing_auxiliary_data(bench,
     assert not panel._btn_rgb_prerequisite.isVisible()  # RGB intrinsics are not a capture prerequisite.
     panel.show_workflow('calibration', True)
     assert panel._btn_rgb_prerequisite.isVisible()
-    assert panel._aux_task_values['intrinsics'].text() == '未完成'
-    assert panel._aux_task_values['calibration'].text() == '需先标定 RGB'
+    assert panel._aux_task_values['intrinsics'].text() == '未加载双目结果'
+    assert panel._aux_task_values['calibration'].text() == '先加载双目结果'
     assert not panel._btn_calib_aux.isEnabled()
     panel._btn_rgb_prerequisite.click()
     app.processEvents()

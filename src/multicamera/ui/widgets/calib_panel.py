@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 import uuid
 from copy import deepcopy
@@ -471,6 +472,9 @@ class CalibrationPanel(QWidget):
     aux_images_imported = Signal(dict)
     preview_mode_changed = Signal(bool)
     configure_aux_requested = Signal()
+    load_rgb_session_requested = Signal()
+    load_rgb_file_requested = Signal()
+    continue_aux_capture_requested = Signal()
     configure_stereo_requested = Signal()
     data_source_changed = Signal()
     offline_imported = Signal()
@@ -540,6 +544,9 @@ class CalibrationPanel(QWidget):
         self._model_error = ''
         self._aux_worker: Optional[AuxCalibrationWorker] = None
         self._stereo_import_worker: Optional[StereoImageImportWorker] = None
+        self._session_restore_queue = []
+        self._session_restore_aux = False
+        self._session_source_paths = {}
         self._aux_import_worker: Optional[AuxImageImportWorker] = None
         self._calib_queue: List[str] = []
         self._aux_pairs: list[tuple[str, PlanarDetectionResult, PlanarDetectionResult]] = []
@@ -618,7 +625,7 @@ class CalibrationPanel(QWidget):
         self._session = session
         if rebind_assessment:
             self._model_report_key = self._model_snapshot_key(assessment_name)
-        self._next_session_frame_idx = session.frame_count
+        self._next_session_frame_idx = session.next_stereo_frame_index
         self._log(f"会话: {session.name}")
         self._refresh_disk_hint()
         self._refresh_model_choice_ui()
@@ -627,27 +634,48 @@ class CalibrationPanel(QWidget):
     def rig(self) -> Optional[MultiCameraRig]:
         return self._rig
 
-    def restore_session_result(self, session, rig):
+    def restore_session_result(self, session, rig, *, board=None, camera_model=None):
         """Apply a preflighted session; do not trigger a new result generation."""
         from ...calibration.offline_aux import file_identity
-        directory = session.result_directory
+        directory = session.result_path.parent
         provenance = dict(kind='restored_session_result',
-            result=file_identity(directory / 'rig.json'), session_name=session.name)
+            result=file_identity(session.result_path), session_name=session.name)
         restored_rig, restored_pairs = deepcopy(rig), deepcopy(rig.pairs)
         restored_intrinsics = {camera_id: deepcopy(intr)
             for pair in rig.pairs.values()
             for camera_id, intr in ((pair.left_id, pair.left_intrinsics),
                                     (pair.right_id, pair.right_intrinsics))}
-        files = sorted(directory.glob('*'))
+        files = ([session.result_path] if directory == session.session_dir else
+                 sorted(path for path in directory.glob('*') if path.is_file()))
+        manifest = directory / 'calibration_manifest.json'
+        errors = json.loads(manifest.read_text(encoding='utf-8')).get('errors', []) if manifest.is_file() else []
         self.set_session(session)
+        if board is not None:
+            self._board = board
+        if camera_model is not None:
+            self._camera_model = camera_model
         self._reset_all()
         self._pair_calibs, self._rig = restored_pairs, restored_rig
         self._intrinsics, self._rgb_result_provenance = restored_intrinsics, provenance
         self._sync_pair_states()
         self.set_result_model(self._rig)
-        self.set_result_storage(directory, files)
+        self.set_result_storage(directory, files, errors)
+        self.restore_saved_aux_progress()
         self._refresh_aux_readiness()
         self._log('已恢复 RGB 左右绑定、内参及结果；离线图像仍需逐对复核，镜头/焦距一致性需人工确认')
+
+    def restore_saved_aux_progress(self):
+        if self._session is None:
+            return
+        state = self._session.multimodal_resume_state()
+        self._aux_saved_count = state['saved_pairs']
+        self._aux_capture_count = max(self._aux_capture_count, state['next_index'])
+        self._white_balance_guard.invalidate()
+        self._aux_guide.invalidate_live()
+        if state['saved_pairs']:
+            self._aux_guide.show_receipt_message(
+                f'会话已保存 {state["saved_pairs"]} 组融合原图\n可继续补拍；历史原图需逐对复核后纳入联合标定')
+        self._refresh_aux_readiness()
 
     @property
     def has_failed_saves(self) -> bool:
@@ -665,7 +693,8 @@ class CalibrationPanel(QWidget):
     def has_active_operations(self) -> bool:
         return bool(self._auto_timer.isActive() or self._model_worker or self._calib_worker or self._aux_worker or
                     self._stereo_import_worker or self._aux_import_worker or
-                    self._save_workers or self._save_queue or self._aux_dataset_busy())
+                    self._save_workers or self._save_queue or self._session_restore_queue
+                    or self._session_restore_aux or self._aux_dataset_busy())
 
     def has_active_background_tasks(self) -> bool:
         # Result signals can arrive before QThread.run() has actually returned.
@@ -697,6 +726,7 @@ class CalibrationPanel(QWidget):
             self._reset_all()
         else:
             for name in impact.changed_pairs:
+                self._session_source_paths.pop(name, None)
                 self._live_preview_indices.pop(name, None)
                 self._capture_reviews.pop(name, None)
                 self._stereo_cals.pop(name, None)
@@ -861,10 +891,13 @@ class CalibrationPanel(QWidget):
         else:
             decision = summarize_quality(rig)
             metrics = [
-                f'{name} · 双目 RMS {pair.stereo.rms_error:.3f} px\n'
+                (f'{name} · 导入参数 · 原文件 RMS 未完整记录\n'
+                 f'基线 {np.linalg.norm(pair.stereo.T) * 1000:.2f} mm'
+                 if pair.calibration_info.get('missing_imported_metrics') else
+                 f'{name} · 双目 RMS {pair.stereo.rms_error:.3f} px\n'
                 f'内参 RMS 左 {pair.left_intrinsics.rms_error:.3f} / '
                 f'右 {pair.right_intrinsics.rms_error:.3f} px · '
-                f'基线 {np.linalg.norm(pair.stereo.T) * 1000:.2f} mm'
+                f'基线 {np.linalg.norm(pair.stereo.T) * 1000:.2f} mm')
                 for name, pair in rig.pairs.items()
             ]
             metrics.extend(aux_metrics_text(aux) for aux in rig.aux_cameras.values())
@@ -878,6 +911,9 @@ class CalibrationPanel(QWidget):
             self._lbl_result_risks.setToolTip('\n'.join(decision.risks))
             lines = [f"参考相机：{rig.reference_camera}", f"双目 {len(rig.pairs)} 组 · 辅助 {len(rig.aux_cameras)} 路", ""]
             for name, pair in rig.pairs.items():
+                if pair.calibration_info.get('missing_imported_metrics'):
+                    lines.extend([name, '原文件未记录完整 RMS；未实测误差，精度待验证', ''])
+                    continue
                 lines.extend([name, f"左右内参 RMS  {pair.left_intrinsics.rms_error:.3f} / "
                               f"{pair.right_intrinsics.rms_error:.3f} px",
                               f"双目 RMS  {pair.stereo.rms_error:.3f} px", ""])
@@ -939,6 +975,12 @@ class CalibrationPanel(QWidget):
         self._btn_open_results.setEnabled(self._result_directory is not None)
         self._btn_copy_results.setEnabled(self._result_directory is not None)
         self._btn_view_results.setEnabled(rig is not None)
+        self._btn_continue_aux.setEnabled(self._session is not None and
+                                         self._rgb_left_camera_id() in self._intrinsics)
+        modality = self._aux_modality()
+        self._btn_continue_aux.setText('继续 RGB + 声像仪 RGB 采集' if modality == 'acoustic_rgb'
+                                       else '继续 RGB + 红外采集')
+        self._btn_continue_aux.setToolTip('沿用当前会话双目结果，确认同一设备与镜头设置后配置实时流')
         self._refresh_workflow_guidance()
 
     def _refresh_workflow_guidance(self):
@@ -1423,6 +1465,14 @@ class CalibrationPanel(QWidget):
         self._btn_rgb_prerequisite.clicked.connect(lambda: self.show_workflow('calibration'))
         task_grid.addWidget(self._btn_rgb_prerequisite, 1, 2)
         l2.addLayout(task_grid)
+        self._btn_load_rgb_session = QPushButton('加载双目标定会话')
+        self._btn_load_rgb_session.setIcon(app_icon('folder-open'))
+        self._btn_load_rgb_session.clicked.connect(self.load_rgb_session_requested)
+        l2.addWidget(self._btn_load_rgb_session)
+        self._btn_load_rgb_file = QPushButton('读取双目标定文件')
+        self._btn_load_rgb_file.setIcon(app_icon('folder-input'))
+        self._btn_load_rgb_file.clicked.connect(self.load_rgb_file_requested)
+        l2.addWidget(self._btn_load_rgb_file)
 
         self._aux_board_section = QWidget()
         board_layout = QVBoxLayout(self._aux_board_section)
@@ -1894,6 +1944,10 @@ class CalibrationPanel(QWidget):
         aux_calibration.addWidget(self._btn_back_to_aux_capture)
 
         result_page = page()
+        self._btn_continue_aux = QPushButton('继续 RGB + 红外采集')
+        self._btn_continue_aux.setIcon(app_icon('camera'))
+        self._btn_continue_aux.clicked.connect(self.continue_aux_capture_requested)
+        result_page.addWidget(self._btn_continue_aux)
         self._btn_export_results = QPushButton("导出标定结果")
         self._btn_export_results.setIcon(app_icon('download', '#ffffff'))
         self._btn_export_results.setProperty("class", "primary")
@@ -2557,7 +2611,7 @@ class CalibrationPanel(QWidget):
         if self._session is None:
             return None, None
         if self._next_session_frame_idx is None:
-            self._next_session_frame_idx = self._session.frame_count
+            self._next_session_frame_idx = self._session.next_stereo_frame_index
         frame_idx = self._next_session_frame_idx
         self._next_session_frame_idx += 1
         token = uuid.uuid4().hex
@@ -3020,6 +3074,13 @@ class CalibrationPanel(QWidget):
 
     @Slot(object)
     def _on_import_images_ready(self, img_pairs):
+        worker = self._stereo_import_worker
+        if getattr(worker, 'restore_pair_name', None) is not None:
+            self._stereo_import_worker = None
+            self._restore_stereo_observations(worker.restore_pair_name, img_pairs, worker)
+            self._set_import_busy(False)
+            self._start_next_session_restore()
+            return
         self._offline_frame_qualities = dict(getattr(self._stereo_import_worker, 'frame_qualities', {}))
         self._offline_source_paths = dict(getattr(self._stereo_import_worker, 'source_paths', {}))
         self._stereo_import_worker = None
@@ -3138,10 +3199,64 @@ class CalibrationPanel(QWidget):
 
     @Slot(str)
     def _on_import_images_failed(self, message: str):
+        restoring = getattr(self._stereo_import_worker, 'restore_pair_name', None)
         self._stereo_import_worker = None
         self._pending_import_folder = None
         self._set_import_busy(False)
         self._log('离线导入失败：' + message.splitlines()[0])
+        if restoring is not None:
+            self._log(f'{restoring}: 原图恢复失败，已保存标定结果仍保留；可检查文件后重试')
+            self._start_next_session_restore()
+
+    def restore_session_images(self, *, auto_aux=False):
+        self._session_restore_aux = auto_aux
+        self._session_restore_queue = [(name, self._session.session_dir / 'images' / name)
+            for name in self._sm.stereo_pairs
+            if (self._session.session_dir / 'images' / name).is_dir() and
+            any((self._session.session_dir / 'images' / name).iterdir())]
+        self._start_next_session_restore()
+
+    def _start_next_session_restore(self):
+        if self._session_restore_queue:
+            name, folder = self._session_restore_queue.pop(0)
+            worker = StereoImageImportWorker(str(folder), self._board, parent=self)
+            worker.restore_pair_name = name
+            worker.log.connect(self._log)
+            worker.finished_ok.connect(self._on_import_images_ready)
+            worker.failed.connect(self._on_import_images_failed)
+            worker.finished.connect(worker.deleteLater)
+            self._stereo_import_worker = worker
+            self._set_import_busy(True)
+            self._log(f'{name}: 自动恢复会话双目原图，保留原组及左右 ID')
+            worker.start()
+        elif self._session_restore_aux:
+            self._session_restore_aux = False
+            self._start_aux_image_import(str(self._session.session_dir / 'multimodal'), auto_restore=True)
+
+    def _restore_stereo_observations(self, name, records, worker):
+        pair = self._sm.stereo_pairs[name]
+        lid, rid = pair.left.camera_id, pair.right.camera_id
+        minimum = self._spin_min.value()
+        self._intr_cals[lid] = IntrinsicCalibrator(self._board, self._camera_model, minimum)
+        self._intr_cals[rid] = IntrinsicCalibrator(self._board, self._camera_model, minimum)
+        self._stereo_cals[name] = StereoCalibrator(self._board, self._camera_model, minimum)
+        self._fqs[lid], self._fqs[rid] = [], []
+        self._capture_reviews[name] = []
+        self._session_source_paths[name] = dict(worker.source_paths)
+        for key, left, right, det_l, det_r in records:
+            self._intr_cals[lid].add_detection(det_l, image=left, frame_id=str(key))
+            self._intr_cals[rid].add_detection(det_r, image=right, frame_id=str(key))
+            usable = self._store_stereo_detection(name, det_l, det_r, source=str(key))
+            for cid, quality in zip((lid, rid), worker.frame_qualities[str(key)]):
+                self._fqs[cid].append(quality)
+            self._capture_reviews[name].append(PreviewPair(f'{name} {key}', lid, rid, left, right,
+                deepcopy(det_l), deepcopy(det_r), '会话原图', self._board.num_corners,
+                save_state='历史已保存', quality_state='可采纳' if usable else '待复核'))
+        self._pair_capture_press_count[name] = len(records)
+        self._update_capture_stats()
+        self._refresh_preview_pairs()
+        self._log(f'{name}: 已恢复 {len(records)} 对原图，'
+                  f'{self._stereo_cals[name].num_frames} 对可用于重新标定；未重命名为 offline')
 
     def _reset_offline_pair(self, pair_name: str, lid: str, rid: str, min_f: int):
         self._pair_failures.pop(pair_name, None)
@@ -3606,6 +3721,7 @@ class CalibrationPanel(QWidget):
                 sources = {key: paths[::-1] if self._offline_lr_swapped else paths
                            for key, paths in self._offline_source_paths.items()}
             else:
+                sources.update(self._session_source_paths.get(name, {}))
                 for entries, _ in self._undo_stack:
                     for entry in entries:
                         if (entry.pair_name != name or entry.session is None
@@ -4044,7 +4160,8 @@ class CalibrationPanel(QWidget):
         elif not admitted:
             self._log(f"{idx}: 原图已保存，验收待复核，未计入验收通过或引导采用 — " + '；'.join(reasons))
 
-        self._aux_capture_count = capture_index + 1
+        self._aux_capture_count = max(capture_index + 1,
+            self._session.multimodal_resume_state()['next_index'] if self._session is not None else 0)
         self._aux_dataset_revision += 1
         if self._aux_offline_records:
             self._log(f'{idx}: 已加入离线复核列表，需逐对确认后才纳入离线联合求解')
@@ -4070,13 +4187,14 @@ class CalibrationPanel(QWidget):
             return
         self._start_aux_image_import(folder)
 
-    def _start_aux_image_import(self, folder, *, review_saved=False):
+    def _start_aux_image_import(self, folder, *, review_saved=False, auto_restore=False):
         board_cfg = self._aux_board_config()
         self._log(f"正在后台导入多模态图片，板参数: {board_cfg.to_dict()}")
         self._set_aux_import_busy(True)
         worker = AuxImageImportWorker(folder, board_cfg, parent=self, modality=self._aux_modality(),
                                       offline_recheck=True)
         worker.review_saved = review_saved
+        worker.auto_restore = auto_restore
         worker.import_context = (id(self._session), self._rgb_left_camera_id(),
                                  self._aux_camera_id(), self._aux_modality())
         worker.finished_ok.connect(self._on_import_aux_images_ready)
@@ -4103,6 +4221,8 @@ class CalibrationPanel(QWidget):
     def _on_import_aux_images_ready(self, img_pairs):
         worker = self._aux_import_worker
         self._aux_import_worker = None
+        for message in getattr(worker, 'read_errors', []):
+            self._log('会话原图检查：' + message)
         self._set_aux_import_busy(False)
         board_cfg = worker.board_config if worker is not None else self._aux_board_config()
         if board_cfg != self._aux_board_config() or (worker is not None and
@@ -4115,7 +4235,8 @@ class CalibrationPanel(QWidget):
             return
         self._aux_dataset_revision += 1
         self._aux_observation_board = board_cfg
-        self._invalidate_aux_result()
+        if not getattr(worker, 'auto_restore', False):
+            self._invalidate_aux_result()
         self._aux_pairs.clear()
         self._aux_images.clear()
         self._aux_reviews.clear()
@@ -4169,6 +4290,9 @@ class CalibrationPanel(QWidget):
             self.aux_images_imported.emit({rgb_left_id: rgb, aux_id: aux})
         self._log(f"多模态导入完成：验收通过 {valid}/{len(img_pairs)} 组；引导采用待分析")
         self._log('离线原图保留在源目录，未复制到会话；导入不自动确认引导姿态')
+        if getattr(worker, 'auto_restore', False):
+            self.restore_saved_aux_progress()
+            self._log('已自动读取会话融合原图；历史结果保留，逐对对应尚未确认，不自动纳入联合求解')
         if self._aux_offline_records:
             self._check_aux_order.setEnabled(False)
             count = sum(review['image_accepted'] for review in self._aux_offline_reviews.values())
@@ -4445,13 +4569,18 @@ class CalibrationPanel(QWidget):
         if dt > self._sm.sync_tolerance_seconds:
             return None, (f"视频未配对：两路时间差 {dt * 1000:.0f} ms，"
                           f"超过 {self._sm.sync_tolerance_seconds * 1000:.0f} ms")
+        intr = self._intrinsics.get(rgb_id)
+        if intr is not None and entries[0][0].shape[1::-1] != tuple(intr.image_size):
+            actual = entries[0][0].shape[1::-1]
+            return None, (f'RGB 左目分辨率不匹配：当前 {actual[0]}×{actual[1]}，'
+                          f'内参 {intr.image_size[0]}×{intr.image_size[1]}；请恢复原分辨率或重新标定')
         return (entries[0][0], entries[1][0], dt), (f"视频已配对：{'；'.join(states)}；"
                                                   f"软件配对时间差 {dt * 1000:.0f} ms（非硬件同步）")
 
     def _aux_calibration_problem(self) -> str:
         rgb_id = self._rgb_left_camera_id()
         if not rgb_id or rgb_id not in self._intrinsics:
-            return "标定未就绪：请先完成 RGB 左目所在双目标定"
+            return "标定未就绪：请先加载已完成的双目会话，或完成 RGB 左目所在双目标定"
         if self._aux_offline_records:
             if any(key not in self._aux_offline_confirmations for key, _, _ in self._aux_pairs):
                 return '标定未就绪：所有离线观测均需逐对复核物理角点对应'
@@ -4627,11 +4756,14 @@ class CalibrationPanel(QWidget):
         intrinsics_ready = self._rgb_left_camera_id() in self._intrinsics
         summary = {
             'sensor': ('RGB + 声像仪 RGB' if aux and aux.modality == 'acoustic_rgb' else 'RGB + 红外', TEXT),
-            'intrinsics': ('已就绪' if intrinsics_ready else '未完成', SUCCESS if intrinsics_ready else WARNING),
+            'intrinsics': ('已恢复' if intrinsics_ready and self._rgb_result_provenance.get('kind') == 'restored_session_result' else
+                           '已读取' if intrinsics_ready and self._rgb_result_provenance.get('kind') == 'imported_stereo_file' else
+                           '已就绪' if intrinsics_ready else '配置变更后失效' if self._rgb_result_provenance
+                           else '未加载双目结果', SUCCESS if intrinsics_ready else WARNING),
             'capture': ('白平衡准备中' if self._white_balance_guard.busy else '等待双路稳定'
                         if self._aux_live_gate.waiting else '处理中' if busy else '视频已配对' if frames is not None else '视频未配对',
                         TEXT_DIM if frames is not None and not busy else WARNING),
-            'calibration': ('等待白平衡' if self._white_balance_guard.busy else '处理中' if busy else '已就绪' if not problem else '需先标定 RGB' if not intrinsics_ready else '数据待就绪',
+            'calibration': ('等待白平衡' if self._white_balance_guard.busy else '处理中' if busy else '已就绪' if not problem else '先加载双目结果' if not intrinsics_ready else '数据待就绪',
                             SUCCESS if not problem and not busy else WARNING),
         }
         if self._aux_offline_records:
@@ -4650,6 +4782,8 @@ class CalibrationPanel(QWidget):
         self._aux_task_values['calibration'].setToolTip(calibration_status)
         self._btn_rgb_prerequisite.setVisible(not intrinsics_ready and
                                               not (self._active_step == 2 and self._workflow_phase == 'capture'))
+        self._btn_load_rgb_session.setVisible(not intrinsics_ready)
+        self._btn_load_rgb_file.setVisible(not intrinsics_ready)
         self._lbl_aux_pair_count.setText(
             f"{'离线确认' if self._aux_offline_records else '验收通过'} {len(self._aux_pairs)} 组")
         self._lbl_aux_pair_count.setToolTip(
@@ -4721,6 +4855,15 @@ class CalibrationPanel(QWidget):
         return aux.modality if aux is not None else "ir"
 
     def _rgb_left_camera_id(self) -> Optional[str]:
+        if self._session is not None:
+            metadata = self._session.metadata
+            locked = metadata.get('multimodal_rgb_left_id')
+            if not locked:
+                locked = next((p.get('left_id') for p in metadata.get('pairs', [])
+                               if p.get('stream_type', 'rgb') == 'rgb' and
+                               p.get('name') in self._sm.stereo_pairs), None)
+            if locked:
+                return locked if any(p.left.camera_id == locked for p in self._sm.stereo_pairs.values()) else None
         for pair in self._sm.stereo_pairs.values():
             if pair.left.stream_type == "rgb":
                 return pair.left.camera_id
@@ -4847,6 +4990,9 @@ class CalibrationPanel(QWidget):
 
     def _reset_all(self):
         self._aux_live_gate.cancel('数据已重置，本次采图已取消')
+        self._session_restore_queue.clear()
+        self._session_restore_aux = False
+        self._session_source_paths.clear()
         self._aux_dataset_revision += 1
         self._pair_failures.clear()
         self._active_calibration_pair = None

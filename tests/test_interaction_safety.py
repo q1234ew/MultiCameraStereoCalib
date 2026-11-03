@@ -212,7 +212,7 @@ def test_readiness_requires_rgb_intrinsics_but_offline_does_not_require_live_str
     intr = panel._intrinsics.pop("left")
     panel._refresh_aux_readiness()
     assert not panel._btn_calib_aux.isEnabled()
-    assert "请先完成 RGB" in panel._lbl_aux_readiness.text()
+    assert "请先加载已完成的双目会话" in panel._lbl_aux_readiness.text()
     assert "待就绪" in panel._sections[2]._header.text()
     panel._intrinsics["left"] = intr
     panel._refresh_aux_readiness()
@@ -514,6 +514,7 @@ def test_configuration_metadata_write_failure_keeps_previous_file(window, calibr
     monkeypatch.setattr(type(metadata), "write_text", fail)
     run_config(window, monkeypatch, lambda dlg: dlg._edit_aux_url.setText("http://device/new-ir"))
     assert metadata.read_bytes() == previous
-    assert session.metadata["auxiliary_camera"]["url"] == "http://device/new-ir"
+    assert session.metadata["auxiliary_camera"]["url"] == "http://device/ir"
+    assert sm.auxiliary_camera.url == "http://device/new-ir"
     assert "配置记录失败" in window._calib_panel._log_text.toPlainText()
     assert set(window._rig.pairs) == {"rgb", "rgb2"}
