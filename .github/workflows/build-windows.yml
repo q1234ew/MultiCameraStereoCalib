@@ -233,6 +233,7 @@ jobs:
             "Windows x64 build of MultiCamera Stereo Calibration.",
             "", "Version: $env:PRODUCT_VERSION", "Tag: $tag",
             "Commit: $env:GITHUB_SHA", "Variant: $variant",
+            "Features: session image/result restoration, verified RGB+IR continuation, and standalone stereo JSON/OpenCV parameter import with explicit units.",
             "Changes: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/docs/CHANGELOG.md",
             "Known limitations: self-tests do not establish hardware calibration accuracy or replace physical camera/UI checks on the target Windows device.",
             "RGB+auxiliary joint results are candidates pending physical validation; per-pair board correspondence must be confirmed. Recorded-stream replay does not verify real-device white balance or synchronization.",
