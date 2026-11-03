@@ -2591,3 +2591,13 @@ OpenCV读取`M1/D1/M2/D2`（兼容K1/K2与cameraMatrix等别名）、R/T、模�
 会话恢复、RGB+IR续采和独立标定文件读取属于新增能力，产品版本提升至0.6.0，预览标签为`v0.6.0-build.20261103.1`。默认轻量x64包不包含Open3D，使用`MultiCamera_Setup_0.6.0_x64.exe`与`MultiCamera_portable_0.6.0_x64.zip`命名；保留源码和最终EXE两份标定报告、打包指标与SHA256校验清单，不覆盖旧标签或附件。
 
 README及Release说明同步本轮入口和使用边界。完整Windows回归、源码自检、打包和最终EXE自检成功后才发布Release；本机源码验证、本地回放通过、已推送源码、Actions构建中和安装包已发布需分别确认。离线/回放结果不证明实体相机白平衡、同步、物理角点对应或独立测量精度通过，融合结果仍按候选处理。
+
+## 77. Windows中文路径文件保存兼容（2026-11-03）
+
+Windows构建33的三个回归失败均发生在OpenCV直接访问中文路径时：会话PNG写入失败，以及标准/完整OpenCV YAML写出后目标文件不存在。并非标定求解失败，也不是缺少OpenCV库；原有macOS测试通过不能证明Windows文件名接口可用。
+
+原图保存通过`io/image_io.py`的`write_png`在内存中无损编码PNG，再用Python `Path.write_bytes`写入原有同目录暂存区。编码返回失败、空编码、写盘异常或短写入均作为保存失败处理；保持双路提交、metadata仅在成功后推进、半对回滚及不覆盖历史文件的约束。`load_frame_pairs`使用Python读取字节再交给`imdecode`，不依赖`imread`的文件名编码。
+
+两种OpenCV导出统一使用`FILE_STORAGE_MEMORY | FILE_STORAGE_FORMAT_YAML`生成OpenCV原生YAML，通过Python UTF-8写入原有暂存路径，检查非空后再发布到目标位置。K/D/R/T/Q、左右角色、模型及单位不变，不替换成自定义YAML序列化器；异常保留旧文件，不为兼容路径而放宽数据健康检查。独立参数文件读取继续采用Python读取UTF-8字节及FileStorage内存解析。
+
+跨平台回归保留中文目录、中文文件名和空格，额外禁止生产代码调用OpenCV文件名写入接口，检查矩阵及PNG像素逐值一致，并注入编码、空输出、写盘、短写入和metadata错误验证回滚。源码及最终EXE共用的标定自检也增加中文目录/文件名的JSON、两种OpenCV、Kalibr导出回读，以及8位彩色/16位灰度PNG无损回读；结果记录在`calibration.unicode_file_io`。最终EXE必须实际通过该检查，源码通过不替代Windows验证。

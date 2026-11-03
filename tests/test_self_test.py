@@ -31,6 +31,10 @@ def test_full_calibration_without_legacy_binding(tmp_path, monkeypatch):
     assert report["calibration"]["detected_corners"] == 126
     assert report["calibration"]["baseline_m"] == pytest.approx(.12, abs=.0001)
     assert len(report["calibration"]["exports"]) == 4
+    unicode_io = report['calibration']['unicode_file_io']
+    assert unicode_io['pixel_exact']
+    assert len(unicode_io['images']) == 2
+    assert all('标定 文件' in name for name in unicode_io['exports'])
     health = report['calibration']['health_checks']
     assert health['health']['status'] == 'ok'
     assert health['invalid_lens_rejected'] and health['overzoom_rejected']
@@ -69,6 +73,20 @@ def test_fisheye_calibration_failure_fails_self_test(tmp_path, monkeypatch, api,
     assert report["status"] == "failed"
     assert report["stage"] == stage
     assert "simulated fisheye calibration failure" in report["error"]
+
+
+def test_unicode_image_write_failure_fails_self_test(tmp_path, monkeypatch):
+    from multicamera.io import image_io
+
+    def fail(*args):
+        raise OSError('simulated Unicode image write failure')
+
+    monkeypatch.setattr(image_io, 'write_png', fail)
+    path = tmp_path / 'failed-unicode.json'
+    assert self_test.run_self_test(path) == 1
+    report = json.loads(path.read_text())
+    assert report['status'] == 'failed' and report['stage'] == 'unicode_image_roundtrip'
+    assert 'Unicode image write failure' in report['error']
 
 
 @pytest.mark.parametrize("failure", ["import", "api", "calibration", "conflicting_distribution"])

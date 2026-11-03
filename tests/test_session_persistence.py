@@ -30,23 +30,38 @@ def rig():
 
 
 @pytest.mark.parametrize('kind', ['stereo', 'multimodal'])
-@pytest.mark.parametrize('failure', ['false', 'exception', 'metadata'])
+@pytest.mark.parametrize('failure', ['false', 'empty', 'exception', 'write', 'short_write', 'metadata'])
 def test_capture_failure_does_not_advance_or_leave_half_pair(session, monkeypatch, kind, failure):
     previous = (session.session_dir / 'session.json').read_bytes()
     image = np.zeros((16, 24, 3), np.uint8)
-    original = cv2.imwrite
+    original = cv2.imencode
     calls = []
 
-    def write(path, img):
-        calls.append(path)
+    def encode(extension, img):
+        calls.append(extension)
         if len(calls) == 2:
             if failure == 'false':
-                return False
+                return False, None
+            if failure == 'empty':
+                return True, np.empty(0, dtype=np.uint8)
             if failure == 'exception':
-                raise OSError('simulated image write error')
-        return original(path, img)
+                raise OSError('simulated image encoding error')
+        return original(extension, img)
 
-    monkeypatch.setattr(cv2, 'imwrite', write)
+    monkeypatch.setattr(cv2, 'imencode', encode)
+    if failure in {'write', 'short_write'}:
+        from pathlib import Path
+        original_write = Path.write_bytes
+
+        def partial(path, payload):
+            if path.name.startswith(('right_', 'aux_')):
+                count = original_write(path, payload[:10])
+                if failure == 'short_write':
+                    return count
+                raise OSError('simulated disk full')
+            return original_write(path, payload)
+
+        monkeypatch.setattr(Path, 'write_bytes', partial)
     if failure == 'metadata':
         def fail():
             raise PermissionError('session metadata is read-only')
@@ -69,6 +84,31 @@ def test_existing_capture_never_overwritten(session):
     with pytest.raises(FileExistsError):
         session.save_frame_pair('rgb', image + 255, image + 255, frame_idx=0)
     assert path.read_bytes() == previous and session.frame_count == 1
+
+
+def test_unicode_session_saves_and_reloads_both_modes_without_opencv_filename_io(
+        tmp_path, monkeypatch):
+    session = CalibrationSession(tmp_path / '标定 会话')
+    image = np.arange(16 * 24 * 3, dtype=np.uint8).reshape(16, 24, 3)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('OpenCV filename I/O is not portable on Windows')
+
+    monkeypatch.setattr(cv2, 'imwrite', forbidden)
+    monkeypatch.setattr(cv2, 'imread', forbidden)
+    session.save_frame_pair('双目 一组', image, image[:, ::-1].copy())
+    session.save_multimodal_pair(image, image[:, ::-1].copy())
+    frames = session.load_frame_pairs('双目 一组')
+    assert len(frames) == 1 and frames[0][0] == 0
+    np.testing.assert_array_equal(frames[0][1], image)
+    np.testing.assert_array_equal(frames[0][2], image[:, ::-1])
+    for name, expected in (('rgb_left_0000.png', image), ('aux_0000.png', image[:, ::-1])):
+        path = session.session_dir / 'multimodal' / name
+        restored = cv2.imdecode(np.frombuffer(path.read_bytes(), np.uint8), cv2.IMREAD_UNCHANGED)
+        np.testing.assert_array_equal(restored, expected)
+    loaded = CalibrationSession.load(session.session_dir)
+    assert loaded.frame_count == loaded.metadata['multimodal_frame_count'] == 1
+    assert not list(session.session_dir.rglob('.capture-*'))
 
 
 def test_metadata_write_error_preserves_previous_json(session, monkeypatch):

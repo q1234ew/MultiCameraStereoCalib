@@ -22,6 +22,7 @@ from ..board.charuco_board import CharucoBoard
 from ..calibration.models import CameraModel, MultiCameraRig
 from ..perf import perf_timer
 from ..streaming.stream_manager import AuxiliaryCameraConfig, StereoPairConfig
+from .image_io import write_png
 
 logger = logging.getLogger(__name__)
 
@@ -302,8 +303,8 @@ class CalibrationSession:
             idx = int(idx_str)
             rf = pair_dir / f"right_{idx_str}.png"
             if rf.exists():
-                left = cv2.imread(str(lf))
-                right = cv2.imread(str(rf))
+                left = cv2.imdecode(np.frombuffer(lf.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+                right = cv2.imdecode(np.frombuffer(rf.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
                 if left is not None and right is not None:
                     frames.append((idx, left, right))
         return frames
@@ -358,8 +359,7 @@ class CalibrationSession:
                 with _staging_directory(prefix=".capture-", dir=directory) as staging:
                     staged = [Path(staging) / target.name for target in targets]
                     for path, image in zip(staged, (first, second)):
-                        if not cv2.imwrite(str(path), image):
-                            raise OSError(f"无法保存图片：{path.name}")
+                        write_png(path, image)
                     if pending_review:
                         self._atomic_json(staged[-1], dict(schema_version=1, state='待复核',
                             reasons=['原图已落盘，验收尚未提交；请勿自动纳入标定'],

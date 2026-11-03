@@ -74,7 +74,7 @@ def test_cleanup_does_not_mask_original_capture_failure(session, monkeypatch):
     def fail(*args):
         raise OSError('original image write failure')
 
-    monkeypatch.setattr(cv2, 'imwrite', fail)
+    monkeypatch.setattr(cv2, 'imencode', fail)
     with pytest.raises(OSError, match='original image write failure'):
         session.save_frame_pair('rgb', np.zeros((8, 8), np.uint8), np.zeros((8, 8), np.uint8))
     assert session.frame_count == 0

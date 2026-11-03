@@ -369,6 +369,67 @@ def test_opencv_open_failure_releases_storage_and_preserves_target(tmp_path, rig
     assert target.read_bytes() == b"previous"
 
 
+@pytest.mark.parametrize('writer', [export.export_rig_opencv_yaml,
+                                  export.export_rig_opencv_standard_yaml])
+def test_opencv_unicode_path_uses_memory_storage_and_preserves_matrices(
+        tmp_path, rig, monkeypatch, writer):
+    directory = tmp_path / '标定 会话'
+    directory.mkdir()
+    target = directory / '标定 文件.yml'
+    factory = cv2.FileStorage
+    calls = []
+
+    def memory_only(source, flags):
+        assert flags & cv2.FILE_STORAGE_MEMORY, 'OpenCV must never open a filesystem path'
+        assert flags & cv2.FILE_STORAGE_FORMAT_YAML
+        assert not source
+        calls.append(flags)
+        return factory(source, flags)
+
+    monkeypatch.setattr(export.cv2, 'FileStorage', memory_only)
+    assert writer(rig, target) == target
+    assert len(calls) == 1
+    payload = target.read_text(encoding='utf-8')
+    assert payload.startswith('%YAML:1.0')
+    fs = factory(payload, cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
+    try:
+        pair = rig.pairs['rgb']
+        for key, value in (('M1', pair.left_intrinsics.camera_matrix),
+                           ('D1', pair.left_intrinsics.dist_coeffs),
+                           ('M2', pair.right_intrinsics.camera_matrix),
+                           ('D2', pair.right_intrinsics.dist_coeffs),
+                           ('R', pair.stereo.R), ('T', pair.stereo.T), ('Q', pair.stereo.Q)):
+            np.testing.assert_array_equal(fs.getNode(key).mat(), value)
+    finally:
+        fs.release()
+    assert list(directory.iterdir()) == [target]
+
+
+@pytest.mark.parametrize('failure', ['empty', 'disk'])
+def test_memory_opencv_export_failure_preserves_existing_target(tmp_path, rig, monkeypatch, failure):
+    target = tmp_path / 'old.yml'
+    target.write_bytes(b'previous')
+    if failure == 'empty':
+        storage = Mock()
+        storage.isOpened.return_value = True
+        storage.releaseAndGetString.return_value = ''
+        monkeypatch.setattr(export.cv2, 'FileStorage', lambda *a: storage)
+    else:
+        original = Path.write_text
+
+        def partial(path, payload, **kwargs):
+            original(path, payload[:20], **kwargs)
+            raise OSError('simulated disk full')
+
+        monkeypatch.setattr(Path, 'write_text', partial)
+    with pytest.raises(OSError, match='non-empty|disk full'):
+        export.export_rig_opencv_yaml(rig, target)
+    assert target.read_bytes() == b'previous'
+    assert list(tmp_path.iterdir()) == [target]
+    if failure == 'empty':
+        storage.release.assert_called_once()
+
+
 def test_bundle_finishes_all_formats_before_replacing_previous_members(tmp_path, rig):
     paths = export.export_rig_calibration_bundle(rig, tmp_path)
     previous = {path: path.read_bytes() for path in paths}

@@ -153,11 +153,17 @@ def _validate_rig(rig: MultiCameraRig):
 
 @contextmanager
 def _opencv_storage(path):
-    storage = cv2.FileStorage(str(path), cv2.FILE_STORAGE_WRITE)
+    # FileStorage's filename I/O is not Unicode-safe on Windows.
+    storage = cv2.FileStorage('', cv2.FILE_STORAGE_WRITE | cv2.FILE_STORAGE_MEMORY |
+                               cv2.FILE_STORAGE_FORMAT_YAML)
     try:
         if not storage.isOpened():
             raise OSError(f"Cannot open OpenCV export: {path}")
         yield storage
+        payload = storage.releaseAndGetString()
+        if not payload:
+            raise OSError(f"OpenCV export did not produce a non-empty file: {path}")
+        Path(path).write_text(payload, encoding='utf-8')
     finally:
         storage.release()
 

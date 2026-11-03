@@ -135,7 +135,8 @@ def _exercise_fisheye(report: dict) -> dict:
         np.testing.assert_allclose(pair.stereo.T, result.T)
         np.testing.assert_allclose(pair.stereo.Q, result.Q)
         for path in paths[1:3]:
-            fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+            fs = cv2.FileStorage(path.read_text(encoding='utf-8'),
+                                 cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
             try:
                 _check(fs.isOpened(), f"Cannot reopen fisheye {path.name}")
                 for key in ("camera_model", "left_model", "right_model"):
@@ -285,11 +286,13 @@ def _exercise_calibration(report: dict) -> dict:
     # Exercise the real exporters, then reopen their output using consumer APIs.
     report["stage"] = "export_and_readback"
     with tempfile.TemporaryDirectory(prefix="multicamera-selftest-") as temp:
-        paths = export_rig_calibration_bundle(rig, temp)
+        directory = Path(temp) / '标定 会话'
+        paths = export_rig_calibration_bundle(rig, directory, stem='标定 文件')
         restored = MultiCameraRig.from_dict(json.loads(paths[0].read_text(encoding="utf-8")))
         np.testing.assert_allclose(restored.pairs["selftest"].stereo.T, result.T)
         for path in paths[1:3]:
-            fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+            fs = cv2.FileStorage(path.read_text(encoding='utf-8'),
+                                 cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
             try:
                 _check(fs.isOpened(), f"Cannot reopen {path.name}")
                 for key, expected in (("M1", intr_l.camera_matrix), ("M2", intr_r.camera_matrix),
@@ -304,11 +307,26 @@ def _exercise_calibration(report: dict) -> dict:
                "Kalibr chain incomplete")
         _check(all(path.stat().st_size > 0 for path in paths), "Empty export file")
         exports = [path.name for path in paths]
+        report['stage'] = 'unicode_image_roundtrip'
+        from .io.image_io import write_png
+
+        images = {
+            '彩色 原图.png': np.arange(16 * 24 * 3, dtype=np.uint8).reshape(16, 24, 3),
+            '灰度 原图.png': np.arange(16 * 24, dtype=np.uint16).reshape(16, 24) * 100,
+        }
+        for name, image in images.items():
+            path = directory / name
+            write_png(path, image)
+            restored_image = cv2.imdecode(np.frombuffer(path.read_bytes(), np.uint8),
+                                           cv2.IMREAD_UNCHANGED)
+            np.testing.assert_array_equal(restored_image, image)
+        unicode_io = dict(exports=exports, images=list(images), pixel_exact=True)
     return {
         "detected_corners": detection.num_corners, "frames": 24,
         "left_rms": float(intr_l.rms_error), "right_rms": float(intr_r.rms_error),
         "stereo_rms": float(result.rms_error), "baseline_m": float(np.linalg.norm(result.T)),
         "exports": exports,
+        "unicode_file_io": unicode_io,
         "coverage": "pinhole intrinsics, stereo, rectification, JSON/OpenCV readback, Kalibr export",
         "fisheye": _exercise_fisheye(report),
         "health_checks": _exercise_health(report),
