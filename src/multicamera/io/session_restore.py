@@ -1,11 +1,16 @@
 """Read-only preparation of a historical calibration's offline workspace."""
 
+from copy import deepcopy
 from dataclasses import dataclass
+import json
+import math
+from numbers import Real
 from pathlib import Path
 
+from ..calibration.aux_binding import auxiliary_binding_issue
 from ..board.charuco_board import CharucoBoard
 from ..calibration.models import CameraModel, MultiCameraRig
-from ..calibration.offline_aux import is_legacy_offline_pair, validate_session_rig
+from ..calibration.offline_aux import file_identity, is_legacy_offline_pair, validate_session_rig
 from ..calibration.planar import PatternBoardConfig
 from ..streaming.stream_manager import AuxiliaryCameraConfig, CameraConfig, StereoPairConfig
 
@@ -18,6 +23,121 @@ class SessionRestorePlan:
     pairs: list[StereoPairConfig]
     auxiliary: AuxiliaryCameraConfig | None
     legacy_offline: bool
+    identities: dict
+
+    def verify_sources(self):
+        _verify_sources(self.identities)
+
+
+def _verify_sources(identities):
+    for path, expected in identities.items():
+        actual = file_identity(path)['sha256'] if path.is_file() else None
+        if actual != expected:
+            raise ValueError(f'会话文件在准备期间变化，未切换工作区：{path}')
+
+
+def _source_identities(session):
+    # Capture the pointer before resolving it; recheck both pointer and target after parsing.
+    session.verify_loaded_metadata()
+    root = session.session_dir
+    paths = [root / session.METADATA_FILE, root / session.RESULTS_DIR / 'latest.json']
+    identities = {p: file_identity(p)['sha256'] if p.is_file() else None for p in paths}
+    path = session.result_path
+    identities[path] = file_identity(path)['sha256'] if path.is_file() else None
+    return identities
+
+
+@dataclass
+class PreparedSessionResult:
+    rig: MultiCameraRig
+    historical_aux: dict
+    directory: Path
+    files: list[Path]
+    errors: list[str]
+    provenance: dict
+    aux_id: str | None
+    aux_model_key: str | None
+    aux_status: str
+    resume_state: dict
+    identities: dict
+
+    def verify_sources(self):
+        _verify_sources(self.identities)
+
+
+def prepare_session_result(session, rig, auxiliary=None):
+    """All file reads and declared AUX validation precede any workspace mutation."""
+    from ..calibration.joint_aux import AUX_MODELS
+    from ..calibration.quality_summary import aux_metrics_text, summarize_quality
+    from .export import _validate_rig
+
+    session.verify_loaded_metadata()
+    directory = session.result_path.parent
+    manifest = directory / 'calibration_manifest.json'
+    sources = (session.result_path, session.session_dir / session.METADATA_FILE,
+               session.session_dir / session.RESULTS_DIR / 'latest.json', manifest)
+    identities = {path: file_identity(path)['sha256'] if path.is_file() else None for path in sources}
+    loaded = session.load_rig()
+    def canonical(value):
+        return json.loads(json.dumps(value.to_dict(), allow_nan=False))
+    if loaded is None or canonical(loaded) != canonical(rig):
+        raise ValueError('会话结果与准备的参数不一致，未切换工作区')
+    for field in ('frame_count', 'multimodal_frame_count'):
+        value = session.metadata.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f'会话 {field} 必须是非负整数')
+    active = deepcopy(rig)
+    historical = {}
+    rgb_ids = {cid for pair in active.pairs.values() for cid in (pair.left_id, pair.right_id)}
+    # Validate malformed declarations even if the AUX ID/config itself mismatches.
+    for cid, aux in list(active.aux_cameras.items()):
+        reason = auxiliary_binding_issue(active, aux)
+        if auxiliary is None or cid != auxiliary.camera_id:
+            reason = reason or '会话未配置该辅助相机'
+        elif aux.modality != auxiliary.modality:
+            reason = reason or '辅助模态与会话不一致'
+        elif aux.board_config is not None:
+            board = PatternBoardConfig.from_dict(aux.board_config)
+            if board != auxiliary.pattern_board_config():
+                reason = reason or '辅助板配置与会话不一致'
+        aux_metrics_text(aux)  # Reject unrenderable legacy/result metadata before committing.
+        if reason:
+            historical[cid] = {'calibration': aux, 'reason': reason}
+            del active.aux_cameras[cid]
+            if cid not in rgb_ids:
+                active.extrinsics.pop(cid, None)
+    _validate_rig(active)
+    for pair in active.pairs.values():
+        for value in (pair.left_intrinsics.rms_error, pair.right_intrinsics.rms_error,
+                      pair.stereo.rms_error):
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+                raise ValueError('会话RMS必须是有限非负数值')
+    summarize_quality(active)
+    provenance = dict(kind='restored_session_result', result=file_identity(session.result_path),
+                      session_name=session.name)
+    files = ([session.result_path] if directory == session.session_dir else
+             sorted(path for path in directory.glob('*') if path.is_file()))
+    errors = []
+    if manifest.is_file():
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+        if not isinstance(data, dict) or not isinstance(data.get('errors', []), list) or any(
+                not isinstance(value, str) for value in data.get('errors', [])):
+            raise ValueError('calibration_manifest.json 的 errors 必须是字符串列表')
+        errors = data.get('errors', [])
+    resume = session.multimodal_resume_state()
+    session.next_stereo_frame_index
+    aux_id = auxiliary.camera_id if auxiliary and auxiliary.camera_id in active.aux_cameras else None
+    model_key, status = None, ''
+    if aux_id:
+        aux = active.aux_cameras[aux_id]
+        key = aux.calibration_info.get('aux_model')
+        if isinstance(key, str) and key in AUX_MODELS and AUX_MODELS[key][1] == aux.intrinsics.model:
+            model_key = key
+        status = aux_metrics_text(aux)
+    result = PreparedSessionResult(active, historical, directory, files, errors, provenance,
+                                   aux_id, model_key, status, resume, identities)
+    result.verify_sources()
+    return result
 
 
 def inspect_session_files(session):
@@ -77,6 +197,7 @@ def inspect_session_files(session):
 
 
 def prepare_session_restore(session, *, allow_uncomputed=False):
+    identities = _source_identities(session)
     rig = session.load_rig()
     rig = (validate_session_rig(session, allow_legacy_offline=True) if rig is not None
            else MultiCameraRig() if allow_uncomputed else validate_session_rig(session))
@@ -112,5 +233,8 @@ def prepare_session_restore(session, *, allow_uncomputed=False):
         if auxiliary.modality not in ('ir', 'acoustic_rgb'):
             raise ValueError('会话辅助相机模态无效')
         auxiliary.pattern_board_config()
+    session.verify_loaded_metadata()
+    _verify_sources(identities)
     return SessionRestorePlan(rig, board, model, pairs, auxiliary,
-        any(is_legacy_offline_pair(name, pair, recorded) for name, pair in rig.pairs.items()))
+        any(is_legacy_offline_pair(name, pair, recorded) for name, pair in rig.pairs.items()),
+        identities)

@@ -333,6 +333,7 @@ def test_real_main_window_restores_rgb_and_missing_result_preserves_state(app, t
     monkeypatch.setattr(main_window.QFileDialog, 'getExistingDirectory',
                          lambda *a: str(session.session_dir))
     win._on_load_session()
+    panel = win._calib_panel
     assert panel._intrinsics['left'].image_size == (1280, 720)
     assert 'rgb' in panel._pair_calibs and win._rig is panel.rig
     assert win._act_export.isEnabled()

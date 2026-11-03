@@ -215,6 +215,25 @@ class PairCalibrationWorker(QThread):
             self.failed.emit(self.pair_name, f"{exc}\n{traceback.format_exc(limit=3)}")
 
 
+class AuxCorrespondenceWorker(QThread):
+    """Read-only grid symmetry inspection; never modifies admission decisions."""
+
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, records, board, rgb_intrinsics, model_key, parent=None):
+        super().__init__(parent)
+        self.inputs = deepcopy((records, board, rgb_intrinsics, model_key))
+
+    def run(self):
+        try:
+            from ...calibration.joint_aux import inspect_aux_correspondences
+            self.finished_ok.emit(inspect_aux_correspondences(*self.inputs))
+        except Exception as exc:
+            logger.exception('Auxiliary correspondence inspection failed')
+            self.failed.emit(str(exc))
+
+
 class AuxCalibrationWorker(QThread):
     """Run auxiliary mono intrinsics and AUX-to-RGB_L extrinsics off the UI thread."""
 

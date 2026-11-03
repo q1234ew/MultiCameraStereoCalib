@@ -179,7 +179,8 @@ def test_load_failure_preserves_current_session(window, monkeypatch, tmp_path, f
 @pytest.mark.parametrize("operation", ["new", "load"])
 def test_idle_session_switch_clears_previous_undo(window, monkeypatch, tmp_path, operation):
     panel = window._calib_panel
-    target = CalibrationSession(tmp_path / "target")
+    target = CalibrationSession.create(tmp_path / 'target', window._board,
+                                       list(window._stream_manager.stereo_pairs.values()))
     panel._undo_stack.append(([], False))
     panel._refresh_undo_btn()
     assert panel._btn_undo.isEnabled()
@@ -190,6 +191,7 @@ def test_idle_session_switch_clears_previous_undo(window, monkeypatch, tmp_path,
         monkeypatch.setattr(main_window.QFileDialog, "getExistingDirectory", lambda *a: str(target.session_dir))
         monkeypatch.setattr(CalibrationSession, "load", lambda *a: target)
         window._on_load_session()
+        panel = window._calib_panel
     assert window._current_session is target and panel._session is target
     assert not panel._undo_stack and not panel._btn_undo.isEnabled()
     assert panel._next_session_frame_idx == target.frame_count
@@ -217,12 +219,13 @@ def test_set_session_backstop_and_first_automatic_session(window, tmp_path):
 def test_set_session_rejection_keeps_main_window_reference(window, monkeypatch, tmp_path, operation):
     panel = window._calib_panel
     old = window._current_session
-    target = CalibrationSession(tmp_path / "target")
+    target = CalibrationSession.create(tmp_path / 'target', window._board,
+                                       list(window._stream_manager.stereo_pairs.values()))
 
-    def reject(session):
+    def reject(*args):
         raise RuntimeError("background ownership changed")
 
-    monkeypatch.setattr(panel, "set_session", reject)
+    monkeypatch.setattr(main_window.CalibrationPanel, "set_session", reject)
     monkeypatch.setattr(main_window.QMessageBox, "warning", Mock())
     if operation == "new":
         monkeypatch.setattr(window._session_manager, "create_session", lambda *a, **kw: target)

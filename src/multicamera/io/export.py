@@ -88,6 +88,8 @@ def _check_rotation(value, label):
 
 
 def _validate_rig(rig: MultiCameraRig):
+    from ..calibration.aux_binding import validate_auxiliary_bindings
+    validate_auxiliary_bindings(rig)
     for camera_id, intr in _camera_intrinsics(rig).items():
         label = f"Camera {camera_id!r}"
         _check_shape(intr.camera_matrix, (3, 3), f"{label} camera_matrix")

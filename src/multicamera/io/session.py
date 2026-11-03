@@ -173,7 +173,8 @@ class CalibrationSession:
         meta_path = session_dir / cls.METADATA_FILE
         if not meta_path.is_file():
             raise ValueError("所选目录不是标定会话：缺少 session.json")
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        metadata_bytes = meta_path.read_bytes()
+        metadata = json.loads(metadata_bytes.decode('utf-8'))
         if not isinstance(metadata, dict):
             raise ValueError("session.json 必须包含会话对象")
         for counter in ("frame_count", "multimodal_frame_count"):
@@ -182,7 +183,16 @@ class CalibrationSession:
                 raise ValueError(f"会话计数 {counter} 无效")
         session = cls(session_dir)
         session._metadata = metadata
+        session._loaded_metadata_bytes = metadata_bytes
         return session
+
+    def verify_loaded_metadata(self):
+        """Bind restored configuration to the exact bytes parsed by load()."""
+        original = getattr(self, '_loaded_metadata_bytes', None)
+        if original is not None and (
+                (self.session_dir / self.METADATA_FILE).read_bytes() != original or
+                self._metadata != json.loads(original.decode('utf-8'))):
+            raise ValueError('session.json 在加载期间变化，未切换工作区，请重新加载')
 
     # ── Image storage ─────────────────────────────────────────
 
@@ -218,11 +228,14 @@ class CalibrationSession:
             updated['rgb_continuation_history'] = [*updated.get('rgb_continuation_history', []),
                                                     deepcopy(continuation)]
         path = self.session_dir / self.METADATA_FILE
+        content = json.dumps(updated, indent=2, ensure_ascii=False, allow_nan=False)
         with _staging_directory(dir=self.session_dir) as staging:
             staged = Path(staging) / path.name
-            staged.write_text(json.dumps(updated, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            staged.write_text(content, encoding='utf-8', newline='')
             staged.replace(path)
         self._metadata = updated
+        if hasattr(self, '_loaded_metadata_bytes'):
+            self._loaded_metadata_bytes = content.encode('utf-8')
 
     def save_frame_pair(
         self,
@@ -544,14 +557,18 @@ class CalibrationSession:
 
     def _save_metadata(self):
         path = self.session_dir / self.METADATA_FILE
-        self._atomic_json(path, self._metadata)
+        content = self._atomic_json(path, self._metadata)
+        if hasattr(self, '_loaded_metadata_bytes'):
+            self._loaded_metadata_bytes = content
 
     @staticmethod
     def _atomic_json(path, data):
+        content = json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False).encode('utf-8')
         with _staging_directory(prefix=".metadata-", dir=path.parent) as staging:
             staged = Path(staging) / path.name
-            staged.write_text(json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            staged.write_text(content.decode('utf-8'), encoding='utf-8', newline='')
             staged.replace(path)
+        return content
 
     def delete(self):
         if self.session_dir.exists():

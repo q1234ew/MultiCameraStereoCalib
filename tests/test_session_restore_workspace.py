@@ -253,7 +253,7 @@ def test_session_backstop_rejection_never_replaces_stream_configuration(window, 
     monkeypatch.setattr(main_window.QMessageBox, 'question', lambda *a: main_window.QMessageBox.Yes)
     def reject(*args, **kwargs):
         raise RuntimeError('Session ownership changed')
-    monkeypatch.setattr(window._calib_panel, 'set_session', reject)
+    monkeypatch.setattr(main_window.CalibrationPanel, 'set_session', reject)
     window._on_load_session()
     assert window._current_session is None and window._session_configuration() == before
     assert 'ownership changed' in window.statusBar().currentMessage()

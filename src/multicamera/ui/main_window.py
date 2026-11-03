@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize, QTimer
+from PySide6.QtCore import Qt, QUrl, Slot, QSignalBlocker, QSize, QTimer, QObject, QEvent
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
@@ -56,6 +56,23 @@ from .theme import TEXT, TEXT_DIM, SUCCESS, WARNING, BORDER, standard_icon, app_
 logger = logging.getLogger(__name__)
 
 
+class _WorkbenchVisibilityGuard(QObject):
+    """A tentative central-widget swap must not reset the old live-guide samples."""
+
+    def __init__(self, central):
+        super().__init__()
+        self.widgets = [central, *central.findChildren(QWidget)]
+        for widget in self.widgets:
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        return event.type() in (QEvent.Show, QEvent.Hide)
+
+    def release(self):
+        for widget in self.widgets:
+            widget.removeEventFilter(self)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -88,12 +105,12 @@ class MainWindow(QMainWindow):
 
     # ── UI construction ───────────────────────────────────────
 
-    def _init_widgets(self):
+    def _init_widgets(self, *, publish=True):
         # Left: camera views  |  Right: control panel + 3D viewer (tabs)
-        self._stream_view = MultiStreamView(self._stream_manager, self._board)
+        self._stream_view = MultiStreamView(self._stream_manager, self._board, parent=self)
 
         self._calib_panel = CalibrationPanel(
-            self._stream_manager, self._board
+            self._stream_manager, self._board, parent=self
         )
         self._stream_view.set_capture_sequence(self._calib_panel._capture_sequence)
 
@@ -262,14 +279,16 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setSizes([1000, 430])
 
-        central = QWidget()
+        central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_workbench_header())
         layout.addWidget(self._splitter, 1)
-        self.setCentralWidget(central)
+        if publish:
+            self.setCentralWidget(central)
         self._set_stereo_capture_layout(True)
+        return central
 
     def _set_stereo_capture_layout(self, active):
         panel = self._calib_panel
@@ -626,7 +645,17 @@ class MainWindow(QMainWindow):
         self._act_rgb_settings.triggered.connect(self._on_rgb_settings)
         self._act_rgb_settings_tb.triggered.connect(self._on_rgb_settings)
         self._act_open_logs.triggered.connect(self._on_open_logs)
-        self._act_restore_previews.triggered.connect(self._stream_view.restore_closed_previews)
+        self._act_restore_previews.triggered.connect(lambda: self._stream_view.restore_closed_previews())
+        self._session_button.clicked.connect(self._open_session_directory)
+        self._act_cloud_tools.triggered.connect(self._show_cloud_tools)
+        self._connect_workspace_signals()
+        self._connect_manager_signals()
+
+    def _connect_manager_signals(self):
+        self._stream_manager.camera_connected.connect(self._on_camera_connected)
+        self._stream_manager.camera_disconnected.connect(self._on_camera_disconnected)
+
+    def _connect_workspace_signals(self):
         self._stream_view.preview_visibility_changed.connect(
             lambda: self._act_restore_previews.setEnabled(self._stream_view.has_closed_previews)
         )
@@ -668,13 +697,6 @@ class MainWindow(QMainWindow):
         self._view_aux.clicked.connect(lambda: self._stream_view.set_presentation("aux_focus"))
         self._combo_task.currentIndexChanged.connect(self._on_workflow_navigation)
         self._workflow_tabs.currentChanged.connect(self._on_workflow_navigation)
-        self._session_button.clicked.connect(self._open_session_directory)
-        self._act_cloud_tools.triggered.connect(self._show_cloud_tools)
-
-        self._stream_manager.camera_connected.connect(self._on_camera_connected)
-        self._stream_manager.camera_disconnected.connect(
-            self._on_camera_disconnected
-        )
 
     # ── Slots ─────────────────────────────────────────────────
 
@@ -1087,8 +1109,7 @@ class MainWindow(QMainWindow):
                         if not self._load_session_result(session, plan):
                             return
                     else:
-                        self._calib_panel.set_session(session)
-                        self._calib_panel._reset_all()
+                        raise ValueError('会话缺少标定板或相机组配置，无法恢复工作区')
                     self._calib_panel.append_log('已加载原图会话，尚无 RGB 标定结果；融合前需完成 RGB 标定')
                 else:
                     from ..io.session_restore import prepare_session_restore
@@ -1113,6 +1134,9 @@ class MainWindow(QMainWindow):
             self._calib_panel.restore_session_images(auto_aux=inventory['auto_import'])
 
     def _load_session_result(self, session, plan, *, confirm_workspace=True, force_offline=False):
+        from ..io.session_restore import prepare_session_result
+        plan.verify_sources()
+        prepared = prepare_session_result(session, plan.rig, plan.auxiliary) if plan.rig.pairs else None
         manager = self._stream_manager
         current = manager.stereo_pairs
         bindings_match = all(pair.name in current and
@@ -1161,36 +1185,138 @@ class MainWindow(QMainWindow):
                 return False
             if self._background_tasks_block('加载会话'):
                 return False
-        # Prepare all file-derived state before stopping streams or replacing configuration.
-        if plan.rig.pairs:
-            self._calib_panel.restore_session_result(session, plan.rig,
-                board=plan.board, camera_model=plan.model)
-        else:
-            self._calib_panel.set_session(session)
-            self._calib_panel._board, self._calib_panel._camera_model = plan.board, plan.model
-            self._calib_panel._reset_all()
-        self._board, self._camera_model = plan.board, plan.model
-        if offline:
-            self._on_stop_streams()
-            manager.clear_auxiliary_camera()
-            for name in list(manager.stereo_pairs):
-                manager.remove_stereo_pair(name)
-            for pair in plan.pairs:
-                manager.add_virtual_stereo_pair(pair)
-            if plan.auxiliary is not None:
-                manager.set_auxiliary_camera(plan.auxiliary)
-            self._calib_panel.append_log('已按会话配置离线打开；未连接设备，历史原图和结果未改写')
-            if plan.legacy_offline:
-                self._calib_panel.append_log('旧版 offline_L/R 已恢复为虚拟离线组；未绑定真实设备')
-        if offline:
-            self._stream_view.clear_all()
-            self._stream_view.update_board(self._board)
-        else:
-            self._stream_view.begin_capture_session()
-        self._calib_panel.refresh_pairs()
-        self._calib_panel.show_workflow('results' if plan.rig.pairs else 'calibration',
-                                       plan.auxiliary is not None and bool(plan.rig.pairs))
+        self._stage_session_workspace(session, plan, prepared, offline)
         return True
+
+    def _stage_session_workspace(self, session, plan, prepared, offline):
+        """Build a detached workbench; keep the old QObject graph and streams untouched."""
+        previous = dict(self.__dict__)
+        old_central = self.centralWidget()
+        old_visible = old_central.isVisible()
+        old_children = set(self.children())
+        old_objects = {id(obj) for obj in self.findChildren(QObject)}
+        candidate = None
+        visibility = _WorkbenchVisibilityGuard(old_central)
+        try:
+            self._board, self._camera_model = plan.board, plan.model
+            self._current_session = session
+            if offline:
+                self._stream_manager = StreamManager(parent=self)
+                for pair in plan.pairs:
+                    self._stream_manager.add_virtual_stereo_pair(pair)
+                if plan.auxiliary is not None:
+                    self._stream_manager.set_auxiliary_camera(plan.auxiliary)
+            # Density caching belongs to the widgets, not the top-level window.
+            self._capture_density = None
+            candidate = self._init_widgets(publish=False)
+            self._calib_panel._camera_model = plan.model
+            old_panel = previous['_calib_panel']
+            for name in ('_combo_calib_strategy', '_combo_data_filter',
+                         '_combo_capture_quality', '_combo_wb_mode'):
+                combo = getattr(self._calib_panel, name)
+                with QSignalBlocker(combo):
+                    combo.setCurrentIndex(combo.findData(getattr(old_panel, name).currentData()))
+            self._calib_panel._spin_min.setValue(old_panel._spin_min.value())
+            self._calib_panel._check_wb.setChecked(old_panel._check_wb.isChecked())
+            self._stereo_capture.guide_mode.setCurrentIndex(self._stereo_capture.guide_mode.findData(
+                previous['_stereo_capture'].guide_mode.currentData()))
+            self._calib_panel._log_text.setPlainText(old_panel._log_text.toPlainText())
+            if plan.rig.pairs:
+                self._calib_panel.restore_session_result(session, plan.rig,
+                    board=plan.board, camera_model=plan.model, auxiliary=plan.auxiliary,
+                    prepared=prepared)
+            else:
+                self._calib_panel.set_session(session)
+            if offline:
+                self._stream_view.update_board(plan.board)
+                self._calib_panel.append_log('已按会话配置离线打开；未连接设备，历史原图和结果未改写')
+                if plan.legacy_offline:
+                    self._calib_panel.append_log('旧版 offline_L/R 已恢复为虚拟离线组；未绑定真实设备')
+            else:
+                self._stream_view.begin_capture_session()
+            self._calib_panel.refresh_pairs()
+            multimodal = plan.auxiliary is not None and bool(plan.rig.pairs)
+            phase = 'results' if plan.rig.pairs else 'calibration'
+            self._calib_panel.show_workflow(phase, multimodal)
+            self._on_preview_mode_changed(multimodal)
+            self._stream_view.set_presentation(previous['_stream_view'].presentation_mode)
+            self._sync_workbench_header(phase, multimodal)
+            self._connect_workspace_signals()
+            if offline:
+                self._connect_manager_signals()
+            session.verify_loaded_metadata()
+            plan.verify_sources()
+            if prepared is not None:
+                prepared.verify_sources()
+            self._rig = self._calib_panel.rig
+            # Only this pointer swap publishes the fully prepared workbench.
+            self.takeCentralWidget()
+            self.setCentralWidget(candidate)
+        except Exception:
+            abandoned = dict(self.__dict__)
+            new_children = set(self.children()) - old_children
+            self.__dict__.clear()
+            self.__dict__.update(previous)
+            if self.centralWidget() is not old_central:
+                self.takeCentralWidget()
+                QMainWindow.setCentralWidget(self, old_central)
+                old_central.setVisible(old_visible)
+            self._dispose_session_workspace(abandoned, candidate, new_children,
+                                            keep_manager=previous['_stream_manager'],
+                                            protected=old_objects)
+            raise
+        finally:
+            visibility.release()
+        # Cleanup happens after publication and cannot turn success into a false rollback report.
+        self._dispose_session_workspace(previous, old_central, (),
+                                        keep_manager=self._stream_manager)
+        try:
+            if offline:
+                self._connection_expected = set()
+                self._connection_connected = set()
+                self._connection_failures_shown = set()
+                self._act_start_streams.setEnabled(True)
+                self._act_stop_streams.setEnabled(False)
+            self._act_restore_previews.setEnabled(False)
+            self._update_connection_summary()
+        except Exception:
+            logger.exception('Session committed; connection header refresh failed')
+
+    def _dispose_session_workspace(self, state, central, children, *, keep_manager, protected=()):
+        """Retire only workspace-owned resources, never shared menus/actions or a live manager."""
+        roots = [central, state.get('_capture_ui_timer'), state.get('_view_group'),
+                 *state.get('_aux_panel_dialogs', {}).values()]
+        # Include partially constructed widgets if preparation failed before returning a root.
+        shared = {id(v) for v in self.__dict__.values()}
+        shared.update(protected)
+        roots.extend(obj for obj in state.values() if isinstance(obj, QObject))
+        roots.extend(obj for obj in children if id(obj) not in shared)
+        manager = state.get('_stream_manager')
+        if manager is not keep_manager:
+            roots.append(manager)
+        seen = set()
+        for obj in roots:
+            if (not isinstance(obj, QObject) or id(obj) in seen or obj is keep_manager
+                    or id(obj) in shared):
+                continue
+            seen.add(id(obj))
+            try:
+                for child in [obj, *obj.findChildren(QObject)]:
+                    child.blockSignals(True)
+                    if isinstance(child, QTimer):
+                        child.stop()
+                    if isinstance(child, QDialog):
+                        child.hide()
+                if obj is manager:
+                    manager.stop_all()
+                    manager.clear_auxiliary_camera()
+                    for name in list(manager.stereo_pairs):
+                        manager.remove_stereo_pair(name)
+                if isinstance(obj, QWidget):
+                    obj.hide()
+                obj.deleteLater()
+            except Exception:
+                logger.exception('Retired session workspace cleanup failed')
 
     @Slot()
     def _on_load_calibration_file(self):
@@ -1274,7 +1400,8 @@ class MainWindow(QMainWindow):
                 "当前没有可导出的标定结果。请先完成双目标定或多模态标定。",
             )
             return
-        dialog = ExportDialog(self._rig, self)
+        dialog = ExportDialog(self._rig, self, excluded_aux={cid: entry['reason'] for cid, entry
+            in self._calib_panel._historical_aux_results.items()})
         if not dialog.exec():
             return
         path, _ = QFileDialog.getSaveFileName(

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...calibration.models import MultiCameraRig
+from ...calibration.aux_binding import validate_auxiliary_bindings
 from ...calibration.multiview import MultiViewCalibrator
 from ...io.export import (
     export_rig_json, export_rig_kalibr_yaml, export_rig_opencv_standard_yaml,
@@ -31,12 +32,13 @@ class ExportDialog(QDialog):
         "kalibr": ("Kalibr camchain YAML", "Kalibr YAML (*.yaml *.yml)", ".yaml", export_rig_kalibr_yaml),
     }
 
-    def __init__(self, rig: MultiCameraRig, parent=None):
+    def __init__(self, rig: MultiCameraRig, parent=None, *, excluded_aux=None):
         super().__init__(parent)
         self.setWindowTitle("导出标定结果")
         self.setMinimumSize(560, 360)
         self.resize(680, 540)
         self._rig = MultiCameraRig.from_dict(rig.to_dict())
+        self._excluded_aux = dict(excluded_aux or {})
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -174,6 +176,9 @@ class ExportDialog(QDialog):
             f"不包含：{'、'.join(sorted(available - included)) or '无'}\n"
             f"建议文件名：{self.suggested_filename}"
         )
+        if self._excluded_aux:
+            self._summary.appendPlainText('已隔离，不参与当前融合导出：\n' + '\n'.join(
+                f'{cid}：{reason}' for cid, reason in self._excluded_aux.items()))
         notes = {
             "json": "包含所选对象的内参、外参及质量指标。",
             "opencv": "保留所选对象的项目完整字段；包含辅助相机时写入 AUX→RGB 左目变换。",
@@ -187,6 +192,10 @@ class ExportDialog(QDialog):
             note += ' 当前为鱼眼模型，第三方必须按 fisheye/equidistant 解释畸变，不能按普通针孔处理。'
         self._note.setText(note)
         problem = ""
+        try:
+            validate_auxiliary_bindings(rig)
+        except ValueError as exc:
+            problem = str(exc)
         if self.format_key == "standard" and self._scope.currentData()[0] != "pair":
             problem = "标准 Stereo 格式必须明确选择一组双目。"
         if self.format_key == "kalibr":
