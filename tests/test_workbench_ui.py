@@ -57,6 +57,10 @@ def bench(app, monkeypatch, tmp_path, finish_aux_tasks):
     publish(window, rgb, ir)
     app.processEvents()
     finish_aux_tasks(panel)
+    # Preview/detection setup may take longer than the live-frame age limit on CI.
+    now = time.time()
+    for cid, frame in ((LEFT, rgb), (IR, ir)):
+        manager._latest_frames[cid] = FrameEntry(frame, now)
     yield window, rgb, ir
     finish_aux_tasks(panel)
     manager.stop_all()
@@ -65,6 +69,21 @@ def bench(app, monkeypatch, tmp_path, finish_aux_tasks):
     window.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     app.processEvents()
+
+
+@pytest.fixture
+def continuous_aux_source(bench, monkeypatch):
+    """A continuing camera source for routing tests, not an exemption from capture gates."""
+    win, _, _ = bench
+    manager = win._stream_manager
+    original = manager.get_latest_frame
+
+    def sample(camera_id):
+        frame = original(camera_id)
+        return (frame[0], time.time()) if frame is not None else None
+
+    monkeypatch.setattr(manager, 'get_latest_frame', sample)
+    return original
 
 
 def publish(window, rgb, ir):
@@ -395,6 +414,7 @@ def test_result_summary_and_native_actions_use_real_results(bench, monkeypatch, 
     assert not panel._btn_open_results.isEnabled()
 
 
+@pytest.mark.usefixtures('continuous_aux_source')
 def test_first_capture_creates_session_before_acquiring(bench, monkeypatch):
     win, _, _ = bench
     panel = win._calib_panel
@@ -409,6 +429,7 @@ def test_first_capture_creates_session_before_acquiring(bench, monkeypatch):
     assert panel._session.session_dir.exists()
 
 
+@pytest.mark.usefixtures('continuous_aux_source')
 def test_session_creation_failure_prevents_capture(bench, monkeypatch):
     win, _, _ = bench
     panel = win._calib_panel
@@ -506,6 +527,7 @@ def test_sidebar_footer_sizes_to_current_actions_and_guide_keeps_navigation(benc
     assert not panel._aux_progress_header.isVisible()
 
 
+@pytest.mark.usefixtures('continuous_aux_source')
 def test_live_aux_capture_requires_white_balance_for_both_rgb_sources(bench, monkeypatch):
     win, _, _ = bench
     panel, manager = win._calib_panel, win._stream_manager
@@ -524,6 +546,7 @@ def test_live_aux_capture_requires_white_balance_for_both_rgb_sources(bench, mon
     assert len(calls) == 1
 
 
+@pytest.mark.usefixtures('continuous_aux_source')
 def test_explicit_automatic_white_balance_policy_routes_both_rgb_sources(bench, monkeypatch):
     win, _, _ = bench
     panel, manager = win._calib_panel, win._stream_manager
@@ -544,6 +567,44 @@ def test_explicit_automatic_white_balance_policy_routes_both_rgb_sources(bench, 
     panel._on_white_balance_busy(False)
     panel._check_wb.setChecked(False)
     assert not panel._combo_wb_mode.isVisible()
+
+
+def test_continuous_source_survives_slow_setup_but_never_revives_missing_camera(
+        bench, continuous_aux_source):
+    win, rgb, ir = bench
+    panel, manager = win._calib_panel, win._stream_manager
+    for age in (3., 60.):
+        now = time.time()
+        for cid, frame in ((LEFT, rgb), (IR, ir)):
+            manager._latest_frames[cid] = FrameEntry(frame, now - age)
+            assert now - continuous_aux_source(cid)[1] > panel.AUX_MAX_FRAME_AGE_SEC
+        frames, _ = panel._aux_live_frames()
+        assert frames is not None and frames[2] <= manager.sync_tolerance_seconds
+        assert frames[0] is rgb and frames[1] is ir
+    for cid in (LEFT, IR):
+        entry = manager._latest_frames.pop(cid)
+        assert manager.get_latest_frame(cid) is None
+        assert panel._aux_live_frames()[0] is None
+        manager._latest_frames[cid] = entry
+
+
+def test_real_stale_or_invalid_aux_frames_block_session_and_white_balance(bench, monkeypatch):
+    win, rgb, ir = bench
+    panel, manager = win._calib_panel, win._stream_manager
+    sessions, white_balance = [], []
+    monkeypatch.setattr(panel, '_ensure_capture_session', lambda: sessions.append(True) or False)
+    monkeypatch.setattr(panel, '_prepare_white_balance', lambda *args: white_balance.append(True) or False)
+    before = len(panel._aux_images), panel._aux_saved_count
+    for camera_id in (LEFT, IR):
+        for age in (3., 60., -3., float('nan')):
+            now = time.time()
+            for cid, frame in ((LEFT, rgb), (IR, ir)):
+                manager._latest_frames[cid] = FrameEntry(frame, now - age if cid == camera_id else now)
+            assert panel._aux_live_frames()[0] is None
+            panel._on_capture_aux()
+            assert '无新帧' in panel._log_text.toPlainText().splitlines()[-1]
+    assert not sessions and not white_balance
+    assert (len(panel._aux_images), panel._aux_saved_count) == before
 
 
 def test_white_balance_busy_protects_configuration_and_session_invalidates_ready(bench):
