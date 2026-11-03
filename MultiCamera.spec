@@ -85,6 +85,9 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        "pytest",
+        "xdist",
+        "execnet",
         "tkinter",
         "matplotlib",
         "notebook",
@@ -100,6 +103,9 @@ a = Analysis(
         "open3d",
         "PySide6.scripts.deploy_lib",
     ] if not include_open3d else [
+        "pytest",
+        "xdist",
+        "execnet",
         "tkinter",
         "matplotlib",
         "notebook",

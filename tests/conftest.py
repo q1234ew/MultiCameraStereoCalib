@@ -7,8 +7,22 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+import cv2
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
+
+
+def pytest_configure(config):
+    value = os.environ.get('MULTICAMERA_TEST_OPENCV_THREADS')
+    if value is None:
+        return
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise pytest.UsageError('MULTICAMERA_TEST_OPENCV_THREADS must be a positive integer')
+    # GCD only supports nonpositive values; zero disables OpenCV parallel regions.
+    gcd = any(line.split(':', 1)[-1].strip() == 'GCD'
+              for line in cv2.getBuildInformation().splitlines()
+              if 'Parallel framework:' in line)
+    cv2.setNumThreads(0 if gcd else int(value))
 
 
 @pytest.fixture

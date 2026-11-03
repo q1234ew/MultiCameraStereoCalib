@@ -63,9 +63,9 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ inputs.pointcloud }}" -eq "true") {
-            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win,pointcloud]" pytest
+            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win,test,pointcloud]"
           } else {
-            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win]" pytest
+            python -m pip install --disable-pip-version-check --prefer-binary -c packaging/windows/constraints.txt -e ".[build-win,test]"
           }
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
           python -m pip check
@@ -105,13 +105,30 @@ jobs:
           python scripts/inspect_packaged_opencv.py $zipPath --report installer_output/previous_opencv_audit.json
           if ($LASTEXITCODE -ne 0) { throw "Previous OpenCV inspection failed" }
 
-      - name: Validate calibration workflow
+      - name: Validate calibration regressions
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          MULTICAMERA_TEST_OPENCV_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: |
-          python -m pytest -q tests
+          python -m pytest -q tests -n 2 --dist loadfile --max-worker-restart=0 --durations=30 --junitxml=installer_output/regression_tests.xml
           if ($LASTEXITCODE -ne 0) { throw "Calibration regression tests failed" }
+
+      - name: Summarize regression timing
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if (Test-Path "installer_output/regression_tests.xml") {
+            python scripts/report_test_timing.py installer_output/regression_tests.xml --output installer_output/regression_metrics.json --summary $env:GITHUB_STEP_SUMMARY
+            if ($LASTEXITCODE -ne 0) { throw "Regression timing report failed" }
+          }
+
+      - name: Validate source calibration
+        shell: pwsh
+        run: |
           python -m multicamera --self-test-calibration --report installer_output/calibration_source_test.json
           if ($LASTEXITCODE -ne 0) { throw "Source calibration self-test failed" }
 

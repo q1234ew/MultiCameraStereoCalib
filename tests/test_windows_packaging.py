@@ -196,6 +196,20 @@ def test_scipy_collection_keeps_runtime_but_excludes_tests():
 def test_workflow_keeps_release_gates_and_fast_packaging_contract():
     workflow = (ROOT / '.github/workflows/build-windows.yml').read_text(encoding='utf-8')
     assert 'python -m pytest -q tests' in workflow
+    assert '-n 2 --dist loadfile --max-worker-restart=0' in workflow
+    assert '--durations=30 --junitxml=installer_output/regression_tests.xml' in workflow
+    regression = workflow.split('- name: Validate calibration regressions')[1].split(
+        '- name: Summarize regression timing')[0]
+    assert 'MULTICAMERA_TEST_OPENCV_THREADS: "1"' in regression
+    for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        assert f'{variable}: "1"' in regression
+    assert 'Calibration regression tests failed' in regression
+    source = workflow.split('- name: Validate source calibration')[1].split(
+        '- name: Build portable app')[0]
+    assert 'env:' not in source and 'Source calibration self-test failed' in source
+    assert workflow.index('Validate source calibration') < workflow.index('Build portable app')
+    assert 'build-win,test,pointcloud' in workflow and 'build-win,test]' in workflow
+    assert 'report_test_timing.py' in workflow
     assert '--self-test-calibration' in workflow and 'test_packaged_calibration.ps1' in workflow
     assert workflow.index('test_packaged_calibration.ps1') < workflow.index('scripts/package_windows.py')
     assert workflow.index('scripts/package_windows.py') < workflow.index('Publish Windows Release')
@@ -210,3 +224,13 @@ def test_workflow_keeps_release_gates_and_fast_packaging_contract():
     batch = (ROOT / 'scripts/build_windows_installer.bat').read_text(encoding='utf-8')
     assert 'package_windows.py --version "%PRODUCT_VERSION%"' in batch
     assert 'MultiCamera_portable_%PRODUCT_VERSION%_x64.zip' in batch
+
+
+def test_test_workers_are_excluded_from_both_packaged_variants():
+    tree = ast.parse((ROOT / 'MultiCamera.spec').read_text(encoding='utf-8'))
+    exclusions = next(keyword.value for node in ast.walk(tree) if isinstance(node, ast.Call)
+                      for keyword in node.keywords if keyword.arg == 'excludes')
+    assert isinstance(exclusions, ast.IfExp)
+    for variant in (exclusions.body, exclusions.orelse):
+        names = ast.literal_eval(variant)
+        assert all(name in names for name in ('pytest', 'xdist', 'execnet'))

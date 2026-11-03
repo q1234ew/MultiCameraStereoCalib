@@ -1,6 +1,7 @@
 """Native Qt workbench layout, navigation, review and data-path regressions."""
 
 import os
+from copy import deepcopy
 from pathlib import Path
 import time
 
@@ -21,6 +22,13 @@ from multicamera.ui.theme import configure_application_style
 from multicamera.ui.widgets.pair_gallery import PreviewPair
 
 from test_multimodal_preview import LEFT, RIGHT, IR, board_image, configure
+
+
+def bench_pairs(rgb, ir, board_config):
+    detector = PlanarPatternDetector(board_config)
+    detections = detector.detect(rgb), detector.detect(ir)
+    return [(str(i), rgb, ir, deepcopy(detections[0]), deepcopy(detections[1]))
+            for i in range(8)]
 
 
 @pytest.fixture
@@ -45,10 +53,7 @@ def bench(app, monkeypatch, tmp_path, finish_aux_tasks):
     window.show()
     app.processEvents()
     panel.show_workflow("capture", True)
-    detector = PlanarPatternDetector(panel._aux_board_config())
-    panel._on_import_aux_images_ready([
-        (str(i), rgb, ir, detector.detect(rgb), detector.detect(ir)) for i in range(8)
-    ])
+    panel._on_import_aux_images_ready(bench_pairs(rgb, ir, panel._aux_board_config()))
     publish(window, rgb, ir)
     app.processEvents()
     finish_aux_tasks(panel)

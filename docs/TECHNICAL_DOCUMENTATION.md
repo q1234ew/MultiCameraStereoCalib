@@ -2601,3 +2601,33 @@ Windows构建33的三个回归失败均发生在OpenCV直接访问中文路径�
 两种OpenCV导出统一使用`FILE_STORAGE_MEMORY | FILE_STORAGE_FORMAT_YAML`生成OpenCV原生YAML，通过Python UTF-8写入原有暂存路径，检查非空后再发布到目标位置。K/D/R/T/Q、左右角色、模型及单位不变，不替换成自定义YAML序列化器；异常保留旧文件，不为兼容路径而放宽数据健康检查。独立参数文件读取继续采用Python读取UTF-8字节及FileStorage内存解析。
 
 跨平台回归保留中文目录、中文文件名和空格，额外禁止生产代码调用OpenCV文件名写入接口，检查矩阵及PNG像素逐值一致，并注入编码、空输出、写盘、短写入和metadata错误验证回滚。源码及最终EXE共用的标定自检也增加中文目录/文件名的JSON、两种OpenCV、Kalibr导出回读，以及8位彩色/16位灰度PNG无损回读；结果记录在`calibration.unicode_file_io`。最终EXE必须实际通过该检查，源码通过不替代Windows验证。
+
+## 78. 完整回归提速与耗时诊断（2026-11-03）
+
+### 78.1 验证范围与执行顺序
+
+构建34总耗时14分52秒，其中回归和源码自检合计10分50秒，生成应用59秒、最终EXE自检5秒、分发压缩74秒。本机原串行全量回归1711项通过、8项跳过，328.76秒；该本机数据仅用于定位，不能直接作为Windows耗时或加速比例。
+
+Windows工作流仍先运行完整`tests`，再执行默认运行环境的源码标定自检、PyInstaller、最终EXE自检及分发/发布。回归使用`-n 2 --dist loadfile --max-worker-restart=0`，按文件分配到两个独立进程；每个进程拥有自己的QApplication、临时文件和测试环境，同一文件的状态和压力用例不拆开。未添加`-k`、`-m`或失败即停来缩小验证范围，不复用旧测试结论，也不自动重启崩溃worker掩盖错误。失败仍由pytest非零退出码阻断后续构建/发布，未执行或中断的测试不能视为通过。
+
+### 78.2 仅测试阶段限制线程
+
+新增`test`安装extra，包含pytest和pytest-xdist；`dev`也包含并行插件，不增加应用运行依赖。CI安装`.[build-win,test]`，点云构建使用`.[build-win,test,pointcloud]`。PyInstaller两个变体均排除pytest、xdist和execnet。
+
+仅回归步骤设置`MULTICAMERA_TEST_OPENCV_THREADS=1`以及`OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`为1，避免多进程叠加库内线程争抢CPU。测试conftest在配置阶段设置OpenCV，非法线程数立即报错；未设置该变量的本机普通测试不改OpenCV默认线程数。macOS GCD后端不支持正线程数，测试中使用0禁用OpenCV并行区域；Windows Concurrency等后端使用请求的正整数。跨平台子进程回归实际检查两个worker的有效单线程状态、6项全部运行及故意失败的非零退出码，不只检查环境字符串。
+
+线程变量只属于回归步骤，不传给独立源码自检、PyInstaller或最终EXE步骤；应用默认线程、在线白平衡、采集门槛、真实线程稳定时间、标定算法及数值健康检查不变。每例Qt删除/事件清理及完整垃圾回收、40次主窗口构造和250轮布局迁移压力测试保留，不以减少循环或降低超时换取提速。
+
+### 78.3 避免重复准备与报告
+
+工作台界面fixture原先为8条相同示例记录重复执行16次棋盘格检测，现对RGB/IR各检测一次，再深拷贝检测结果；每条角点及object points数组独立，图像引用与源编号保持原约定。只优化界面测试的数据准备，不缓存被测试求解器的真实运行结果，不改变检测器测试和集成测试的实际计算。
+
+回归输出`--durations=30`及`installer_output/regression_tests.xml`。随后`python scripts/report_test_timing.py installer_output/regression_tests.xml --output installer_output/regression_metrics.json --summary <GitHub步骤摘要路径>`用标准库解析JUnit，记录实际已报告数量、通过/失败/错误/跳过、排序无关的用例身份摘要、最慢模块与用例。`junit_elapsed_seconds`为JUnit套件耗时，`reported_test_seconds`含各用例准备/执行/清理的累计时间；并行累计值不是墙钟时间，不能据此夸大加速。空报告标为`no_tests`，无效时间/XML明确报错；该报告不替代pytest退出码和完整验证。摘要使用追加写入，保留源码/EXE/打包阶段既有报告，不新增Actions附件存储占用。
+
+### 78.4 验证方式
+
+先运行`python -m pytest -q tests`建立当前代码串行结果，再以CI同样的线程环境和`python -m pytest -q tests -n 2 --dist loadfile --max-worker-restart=0 --durations=30 --junitxml=<并行报告路径>`运行完整并行回归。对比两份JUnit的用例身份多重集、通过/失败/跳过状态和数量，不仅比较最终总数；同一用例不能被另一项替代或重复上报。两份验证应分开运行，避免同时争抢CPU影响耗时对照。
+
+新增回归覆盖线程配置/GCD兼容/非法值、真实双worker线程限制与失败传播、示例检测次数及深拷贝隔离、JUnit身份与重复项、异常时间、UTF-8路径和摘要追加、两个打包变体排除测试运行库及源码/EXE发布门禁。完成本机对照后仍须由新Windows构建确认实际耗时、完整测试和最终EXE通过，不因本机提速承诺Windows固定时间。
+
+本轮最终本机对照：默认线程串行1735项通过/8项跳过，用时329.67秒；受控线程两进程按文件并行，同样1735项通过/8项跳过，用时154.23秒，约减少53.2%。比对1743条JUnit记录的身份多重集及通过/跳过状态完全一致，身份摘要为`15b5491e289269e7dd7731f9562d964c78910b4c95b51291386e24695dbde9d1`。原1719条记录均保留，新增24项，无删除；较早并行试运行1734项通过/8项跳过、150.77秒，其后补齐一项报告回归再完成最终对照，不能将两次不同用例数直接混作等量比较。诊断文件位于忽略跟踪的`data/diagnostics/regression_speed_20261103/`；Ruff、编译、源码自检及版本检查通过，Windows实际构建耗时另行验收。
