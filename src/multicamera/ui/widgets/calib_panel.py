@@ -74,6 +74,7 @@ from ...calibration.planar import (
 )
 from ...calibration.stereo import StereoCalibrator
 from ...calibration.quality_summary import aux_metrics_text, summarize_quality
+from ...calibration.offline_aux import numbering_provenance_summary
 from ...io.session import CalibrationSession
 from ...perf import perf_timer
 from ...streaming.stream_manager import StreamManager
@@ -681,11 +682,12 @@ class CalibrationPanel(QWidget):
             key = prepared.aux_model_key
             with QSignalBlocker(self._combo_aux_model):
                 self._combo_aux_model.setCurrentIndex(self._combo_aux_model.findData(key) if key else -1)
-            self._lbl_aux_status.setText(prepared.aux_status)
+            self._lbl_aux_status.setText(self._aux_result_text(saved_aux))
             self._timeline.mark_completed(2)
             self._log('已恢复辅助标定参数；' + (f'独立模型：{key}' if key else
                 '历史结果未明确记录可用独立模型，重新求解前请手动选择') +
                 '；未恢复观测纳入确认，实物精度仍需验证')
+            self._log_aux_numbering(saved_aux)
         for cid, entry in self._historical_aux_results.items():
             self._log(f'{cid}: 辅助结果已隔离，不参与当前融合及导出：{entry["reason"]}；历史文件未修改')
         self._sync_pair_states()
@@ -931,7 +933,7 @@ class CalibrationPanel(QWidget):
                 f'基线 {np.linalg.norm(pair.stereo.T) * 1000:.2f} mm')
                 for name, pair in rig.pairs.items()
             ]
-            metrics.extend(aux_metrics_text(aux) for aux in rig.aux_cameras.values())
+            metrics.extend(self._aux_result_text(aux) for aux in rig.aux_cameras.values())
             self._lbl_result_metrics.setText('\n'.join(metrics))
             for name, pair in rig.pairs.items():
                 validation_lines.extend([name, *self._result_validation_lines(pair)])
@@ -969,7 +971,7 @@ class CalibrationPanel(QWidget):
                     if excluded:
                         lines.append('未参与帧：' + '、'.join(map(str, excluded)))
             for aux in rig.aux_cameras.values():
-                lines.extend([aux_metrics_text(aux), ""])
+                lines.extend([self._aux_result_text(aux), ""])
             lines.extend(['', *decision.details, '', *decision.risks])
             self._lbl_result_summary.setText("\n".join(lines).rstrip())
         self._lbl_result_validation.setText('\n'.join(validation_lines))
@@ -4367,7 +4369,8 @@ class CalibrationPanel(QWidget):
                                         decisions=self._aux_offline_confirmations)
         context = self._aux_solver_context()
         dialog.check_requested.connect(lambda: self._check_aux_correspondences(dialog, context))
-        dialog.accepted.connect(lambda: self._apply_aux_offline_review(dialog.decisions, context))
+        dialog.accepted.connect(lambda: self._apply_aux_offline_review(
+            dialog.decisions, context, correspondence_check=dialog.correspondence_check()))
         dialog.finished.connect(lambda: setattr(self, '_aux_offline_dialog', None))
         self._aux_offline_dialog = dialog
         dialog.show()
@@ -4410,6 +4413,11 @@ class CalibrationPanel(QWidget):
                 ids = report.get('suspect_ids', [])
                 self._log('角点编号方向检查（不改变图像配对）：' + ('请逐对复核 ' + '、'.join(ids) if ids else
                     '未发现明确冲突或共识不足，仍须核对物理对应') + '；未自动纳入或修改原图')
+                if report.get('refinement_error'):
+                    self._log('编号检查几何细化未通过：' + report['refinement_error'])
+                elif report.get('diagnostic_refinement'):
+                    self._log('本批编号候选已通过有界多假设几何细化；各训练折仍独立初始化，'
+                              '候选不证明物理0点或硬件同步')
             else:
                 dialog.set_check_error(outcome.get('error', '检查未返回结果'))
 
@@ -4419,8 +4427,9 @@ class CalibrationPanel(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _apply_aux_offline_review(self, decisions, context=None):
-        from ...calibration.offline_aux import reordered_detection, verify_review_sources
+    def _apply_aux_offline_review(self, decisions, context=None, *, correspondence_check=None):
+        from ...calibration.offline_aux import (detection_fingerprint, reordered_detection,
+                                               review_order_check, verify_review_sources)
         if self._aux_operation_busy() or (context is not None and context != self._aux_solver_context()):
             self._log('离线复核上下文已变化，未应用旧确认；请重新打开复核')
             return
@@ -4429,6 +4438,29 @@ class CalibrationPanel(QWidget):
             return
         selected, reviews = [], {}
         try:
+            report = correspondence_check['report'] if correspondence_check else None
+            if report is None and sum(review['image_accepted']
+                    for review in self._aux_offline_reviews.values()) >= 3:
+                raise ValueError('请先完成本批“检查原始编号”，再应用已确认观测')
+            if correspondence_check:
+                intrinsics = self._intrinsics.get(self._rgb_left_camera_id())
+                accepted_ids = [str(row[0]) for row in self._aux_offline_records
+                                if self._aux_offline_reviews[str(row[0])]['image_accepted']]
+                if (intrinsics is None or report.get('aux_model') != self._combo_aux_model.currentData()
+                        or report.get('board') != self._aux_board_config().to_dict()
+                        or report.get('fixed_rgb_intrinsics') != intrinsics.to_dict()
+                        or report.get('source_ids') != accepted_ids):
+                    raise ValueError('编号检查的模型、固定RGB内参、板配置或观测批次已变化，请重新检查')
+                fingerprints = {str(key): [detection_fingerprint(rgb), detection_fingerprint(aux)]
+                    for key, _, _, rgb, aux in self._aux_offline_records}
+                if fingerprints != correspondence_check['input_fingerprints']:
+                    raise ValueError('原始角点已变化，旧编号检查不再适用；请重新打开复核并检查')
+            order_state = review_order_check(decisions, report, self._aux_board_config())
+            if order_state['invalid_order_ids']:
+                raise ValueError('当前板型不支持此非刚性排列：' + '、'.join(order_state['invalid_order_ids']))
+            if order_state['conflict_ids']:
+                raise ValueError('当前编号仍与几何候选冲突：' + '、'.join(order_state['conflict_ids'])
+                                 + '；请调整后逐对确认，或不纳入冲突观测')
             for key, _, _, rgb, aux in self._aux_offline_records:
                 review = decisions.get(str(key))
                 if review is None:
@@ -4445,12 +4477,28 @@ class CalibrationPanel(QWidget):
                 selected.append((key, reordered_detection(rgb, self._aux_board_config(), orders['rgb']),
                                  reordered_detection(aux, self._aux_board_config(), orders['aux'])))
                 reviews[str(key)] = deepcopy(review)
+                if correspondence_check:
+                    reviews[str(key)]['numbering_check'] = dict(
+                        status=('matches_geometric_candidate' if str(key) in
+                                order_state['matched_ids'] else 'no_reliable_candidate'),
+                        physical_correspondence_verified=False,
+                        raw_fingerprints=fingerprints[str(key)],
+                        selected_fingerprints=[detection_fingerprint(det)
+                                               for det in selected[-1][1:]],
+                        report=deepcopy(report))
         except Exception as exc:
             self._log('离线复核未应用，保留当前数据：' + str(exc))
             return
         if not selected:
             self._log('离线复核未应用：没有匹配的已确认图像对，保留当前观测及标定结果')
             return
+        for key, rgb, aux in selected:
+            orders = reviews[str(key)]['corner_orders']
+            state = ('与几何候选一致（非实物验证）' if str(key) in order_state['matched_ids']
+                     else '无可靠几何候选，仅人工确认')
+            self._log(f'离线编号应用 {key}: RGB={orders["rgb"]} / IR辅助={orders["aux"]}；'
+                      f'{state}；输入指纹 RGB={detection_fingerprint(rgb)[:12]} '
+                      f'AUX={detection_fingerprint(aux)[:12]}')
         fields = ('source_id', 'sources', 'board', 'corner_orders')
         same_reviews = (reviews.keys() == self._aux_offline_confirmations.keys() and all(
             all(review.get(field) == self._aux_offline_confirmations[key].get(field)
@@ -4463,6 +4511,10 @@ class CalibrationPanel(QWidget):
                 for det, old in ((rgb, old_rgb), (aux, old_aux)))
             for (key, rgb, aux), (old_key, old_rgb, old_aux) in zip(selected, self._aux_pairs))
         if same_reviews and same_points:
+            for key, review in reviews.items():
+                if 'numbering_check' in review:
+                    self._aux_offline_confirmations[key]['numbering_check'] = deepcopy(
+                        review['numbering_check'])
             self._log('离线复核未改变观测、编号及来源，保留已有确认和标定结果')
             return
         self._invalidate_aux_result()
@@ -4475,7 +4527,8 @@ class CalibrationPanel(QWidget):
             if key in by_key:
                 preview.left_detection, preview.right_detection = deepcopy(by_key[key])
                 preview.quality_state = '离线候选已纳入'
-                preview.quality_reasons = ('逐对物理对应已确认；历史稳定性/同步未验证',)
+                preview.quality_reasons = ('用户已声明输入编号物理对应；算法最终对应仍待实物验证；'
+                                           '历史稳定性/同步未验证',)
             else:
                 preview.quality_state = '离线未纳入'
                 preview.quality_reasons = tuple(self._aux_offline_reviews[key]['image_reasons'])
@@ -4489,6 +4542,7 @@ class CalibrationPanel(QWidget):
             self.diagnostic_preview_requested.emit(preview.key,
                 {preview.left_id: preview.left, preview.right_id: preview.right})
         self._log(f'离线逐对复核已应用：纳入 {len(selected)} 组；历史验收和原图未修改，'
+                  '用户确认仅指输入编号，不代表确认算法最终对应；'
                   '稳定性/同步仍为未验证；输出为待实物验证候选')
 
     @Slot(str)
@@ -4566,6 +4620,8 @@ class CalibrationPanel(QWidget):
             calibration_info=deepcopy(getattr(extr, 'calibration_info', {})),
         )
         if aux_calib.calibration_info:
+            aux_calib.calibration_info['numbering_provenance'] = numbering_provenance_summary(
+                aux_calib.calibration_info)
             pair = next((pair for pair in self._pair_calibs.values()
                          if pair.left_id == rgb_left_id), None)
             aux_calib.calibration_info['rgb_binding'] = dict(
@@ -4580,8 +4636,9 @@ class CalibrationPanel(QWidget):
         rig.aux_cameras[aux_id] = aux_calib
         self._historical_aux_results.pop(aux_id, None)
         self._lbl_aux_status.setText(
-            aux_metrics_text(aux_calib)
+            self._aux_result_text(aux_calib)
         )
+        self._log_aux_numbering(aux_calib)
         self._sections[2].set_status_hint("✓ 完成", SUCCESS)
         self._timeline.mark_completed(2)
         self._log(
@@ -4643,11 +4700,44 @@ class CalibrationPanel(QWidget):
             self._sync_pair_states()
         self._refresh_aux_readiness()
 
+    @staticmethod
+    def _aux_numbering_text(aux):
+        info = aux.calibration_info
+        summary = numbering_provenance_summary(info)
+        attested = len(summary['input_attested_source_ids'])
+        input_text = (f'输入编号：用户声明已核对 {attested} 组（仅输入声明）' if attested else
+                      '输入编号：未记录用户逐对声明')
+        if summary['final_numbering_status'] == 'not_recorded':
+            final_text = '算法最终编号：历史结果未记录，不推断为沿用输入编号'
+        else:
+            changed = summary['automatically_reordered_source_ids']
+            scope = ('记录不完整，已知' if summary['final_numbering_status'] == 'partial'
+                     else '候选，')
+            final_text = (f'算法最终对应：{scope}辅助相对输入自动重排 {len(changed)} 组；'
+                          '逐对排列见操作日志')
+        return input_text + '\n' + final_text + '；最终物理对应未验证'
+
+    def _aux_result_text(self, aux):
+        return '\n'.join(filter(None, (aux_metrics_text(aux), self._aux_numbering_text(aux))))
+
+    def _log_aux_numbering(self, aux):
+        text = self._aux_numbering_text(aux)
+        if not text:
+            return
+        self._log(aux.camera_id + ': ' + text.replace('\n', '；'))
+        summary = numbering_provenance_summary(aux.calibration_info)
+        for row in summary['frames']:
+            orders = row['input_corner_orders']
+            self._log(f'最终编号分层 {row["source_id"]}: 用户输入声明 RGB='
+                      f'{orders.get("rgb", "未记录")} / AUX={orders.get("aux", "未记录")}；'
+                      f'算法最终相对输入 AUX={row["algorithm_aux_order_relative_to_input"]}；'
+                      '历史输入声明保留，不表示用户确认最终对应；最终物理对应未验证')
+
     def _refresh_aux_capture_state(self):
         self._aux_guide._update_counts()
         self._refresh_aux_readiness()
         saved_aux = self._rig.aux_cameras.get(self._aux_camera_id()) if self._rig else None
-        self._lbl_aux_status.setText(aux_metrics_text(saved_aux)
+        self._lbl_aux_status.setText(self._aux_result_text(saved_aux)
             if saved_aux is not None and self._aux_intrinsics is not None else
             f"联合验证需逐对确认至少 6 组 · 引导基础目标 {len(build_multimodal_sequence())} 组；数量不代表精度")
         self._refresh_preview_pairs()

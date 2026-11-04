@@ -10,6 +10,8 @@ from typing import Tuple
 import cv2
 import numpy as np
 
+from .grid_order import canonicalize_detection
+
 
 class PatternType(str, Enum):
     CHESSBOARD = "chessboard"
@@ -129,7 +131,7 @@ class PlanarPatternDetector:
         if self.config.pattern_type == PatternType.CHESSBOARD:
             flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
             found, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
-            if found:
+            if found and corners is not None and corners.size == self.config.rows * self.config.cols * 2:
                 criteria = (
                     cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
                     30,
@@ -151,22 +153,27 @@ class PlanarPatternDetector:
             found, corners = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
 
         if not found or corners is None:
-            return PlanarDetectionResult(
+            return canonicalize_detection(PlanarDetectionResult(
                 valid=False,
                 object_points=np.empty((0, 3), dtype=np.float32),
                 image_points=np.empty((0, 2), dtype=np.float32),
                 image_size=image_size,
                 pattern_type=self.config.pattern_type,
-            )
+                detection_info={'method': 'classic_native', 'coordinate_space': 'original_pixels',
+                    'source_detector': ('cv2.findChessboardCorners' if self.config.pattern_type ==
+                                        PatternType.CHESSBOARD else 'cv2.findCirclesGrid')},
+            ), self.config)
 
-        return PlanarDetectionResult(
+        return canonicalize_detection(PlanarDetectionResult(
             valid=True,
             object_points=self._object_points.copy(),
             image_points=corners.reshape(-1, 2).astype(np.float32),
             image_size=image_size,
             pattern_type=self.config.pattern_type,
-            detection_info={'method': 'classic_native', 'coordinate_space': 'original_pixels'},
-        )
+            detection_info={'method': 'classic_native', 'coordinate_space': 'original_pixels',
+                'source_detector': ('cv2.findChessboardCorners' if self.config.pattern_type ==
+                                    PatternType.CHESSBOARD else 'cv2.findCirclesGrid')},
+        ), self.config)
 
     def detect_offline(self, image: np.ndarray, *, modality: str = 'rgb'):
         """Quality-first native detection, then bounded SB/thermal fallbacks.
@@ -195,7 +202,7 @@ class PlanarPatternDetector:
                 result = self.detect(image, adaptive_subpixel=True)
             else:
                 result = self._detect_sb(gray, scale, roi, inverted)
-            result.detection_info = dict(method=method, scale=scale, roi=roi,
+            result.detection_info.update(method=method, scale=scale, roi=roi, inverted=inverted,
                 coordinate_space='original_pixels', pixel_mapping='(p+0.5)/scale-0.5+offset')
             quality = assess_aux_frame(image, result, self.config, modality=modality)
             attempts.append({'method': method, 'valid': result.valid,
@@ -218,10 +225,16 @@ class PlanarPatternDetector:
         flags = cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
         found, corners = cv2.findChessboardCornersSB(
             work, (self.config.cols, self.config.rows), flags=flags)
+        found = bool(found and corners is not None)
         points = (self.map_scaled_points(corners, scale, (x, y)) if found else
                   np.empty((0, 2), np.float32))
-        return PlanarDetectionResult(bool(found), self._object_points.copy(), points,
-                                     gray.shape[1::-1], self.config.pattern_type)
+        method = 'sb' + ('_roi' if roi is not None else '') + ('_inverse' if inverted else '')
+        method += f'_{scale}x' if scale != 1 else ('_native' if roi is None and not inverted else '')
+        return canonicalize_detection(PlanarDetectionResult(
+            found, self._object_points.copy(), points, gray.shape[1::-1], self.config.pattern_type,
+            detection_info=dict(method=method, source_detector='cv2.findChessboardCornersSB',
+                scale=scale, roi=roi, inverted=inverted, coordinate_space='original_pixels',
+                pixel_mapping='(p+0.5)/scale-0.5+offset')), self.config)
 
     @staticmethod
     def map_scaled_points(points, scale, offset=(0, 0)):

@@ -107,13 +107,13 @@ def test_disagreement_stops_before_unproductive_optimizer(monkeypatch):
     monkeypatch.setattr(scipy.optimize, 'least_squares',
                         lambda *a, **k: pytest.fail('Wrong correspondence must stop before fitting'))
     with pytest.raises(ValueError, match='0000.*0004.*0007.*未自动翻转'):
-        joint_aux._fit(records, BOARD, rgb, 'pinhole_constrained')
+        joint_aux._fit(records, BOARD, rgb, 'pinhole_constrained', resolve_correspondence=False)
 
 
 def test_diagnostic_distinguishes_corner_numbering_from_image_pairing():
     rgb, _, _, records, _ = mixed_pairs()
     with pytest.raises(ValueError, match='角点编号方向待核对（不代表RGB/IR图像配错）'):
-        joint_aux._fit(records, BOARD, rgb, 'pinhole_constrained')
+        joint_aux._fit(records, BOARD, rgb, 'pinhole_constrained', resolve_correspondence=False)
 
 
 def test_explicit_reordering_recovers_full_holdout_pipeline():
@@ -174,6 +174,9 @@ def test_candidate_requires_explicit_confirmation_and_cannot_bypass_quality(app,
     dialog.binding.setChecked(True)
     assert not dialog.buttons.button(QDialogButtonBox.Save).isEnabled()
     dialog.set_checking(False)
+    assert not dialog.buttons.button(QDialogButtonBox.Save).isEnabled()  # Known conflict remains.
+    dialog.apply_candidate.click()
+    dialog.confirm.click()
     assert dialog.buttons.button(QDialogButtonBox.Save).isEnabled()
     dialog.reviews['0000']['image_accepted'] = False
     dialog._render()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -264,7 +265,8 @@ def _validated_detection(det, config) -> Optional[PlanarDetectionResult]:
     except (TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
         return None
     return PlanarDetectionResult(
-        True, obj.copy(), img.copy(), tuple(det.image_size), det.pattern_type
+        True, obj.copy(), img.copy(), tuple(det.image_size), det.pattern_type,
+        deepcopy(det.detection_info),
     )
 
 

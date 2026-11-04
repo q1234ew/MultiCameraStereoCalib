@@ -500,9 +500,21 @@ def test_actual_import_button_to_completion_and_manual_supplement(panel, monkeyp
     finish_aux_tasks(panel)
     # Import never substitutes single-image detection for physical correspondence.
     assert not panel._aux_pairs
-    from multicamera.calibration.offline_aux import confirm_offline_pair
-    panel._apply_aux_offline_review({key: confirm_offline_pair(review, 'identity', 'identity')
-                                    for key, review in panel._aux_offline_reviews.items()})
+    panel._intrinsics['left'] = CameraIntrinsics(
+        np.array([[250., 0., 128.], [0., 250., 96.], [0., 0., 1.]]), np.zeros(5), (256, 192))
+    panel._open_aux_offline_review()
+    dialog = panel._aux_offline_dialog
+    # Isolate capture/counting from numerical pose consensus on repeated fronto-parallel images.
+    # Actual correspondence worker and solver contracts have separate regressions.
+    dialog.set_correspondence_report(dict(status='ambiguous', frames=[], suspect_ids=[],
+        aux_model=panel._combo_aux_model.currentData(), board=panel._aux_board_config().to_dict(),
+        fixed_rgb_intrinsics=panel._intrinsics['left'].to_dict(),
+        source_ids=[str(row[0]) for row in panel._aux_offline_records]))
+    for index in range(len(dialog.records)):
+        dialog.list.setCurrentRow(index)
+        dialog.confirm.click()
+    dialog.binding.setChecked(True)
+    dialog.accept()
     finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 21
     assert panel._aux_guide.analysis.unique_count == 21

@@ -30,20 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 def _rigid_grid_orders(board):
+    from .grid_order import allowed_orders
     from .planar import PlanarPatternDetector
 
-    points = PlanarPatternDetector._make_object_points(board).astype(float)
-    grid = points.reshape(board.rows, board.cols, 3)
-    distances = np.linalg.norm(points[:, None] - points[None], axis=-1)
-    orders = {'identity': grid, 'reverse_rows': grid[::-1],
-              'reverse_cols': grid[:, ::-1], 'reverse_both': grid[::-1, ::-1]}
-    return [key for key, ordered in orders.items()
-            if np.allclose(distances, np.linalg.norm(ordered.reshape(-1, 3)[:, None] -
-                ordered.reshape(-1, 3)[None], axis=-1), atol=1e-8, rtol=1e-6)]
+    return allowed_orders(PlanarPatternDetector._make_object_points(board), board.rows, board.cols)
 
 
-def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics):
-    """Suggest grid symmetries from a rigid-rig consensus, never relabel observations."""
+def _pose_order_candidates(records, board, rgb_intrinsics, aux_intrinsics):
     from .offline_aux import reordered_detection
 
     def pose(det, intrinsics):
@@ -70,6 +63,12 @@ def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics):
                 rotation = rgb_rotation @ cv2.Rodrigues(aux_pose[0])[0].T
                 translation = rgb_pose[1].ravel() - rotation @ aux_pose[1].ravel()
                 candidates.append((str(key), order, rotation, translation))
+    return candidates
+
+
+def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics, *, rotation_only=False):
+    """Suggest grid symmetries from a rigid-rig consensus, never relabel observations."""
+    candidates = _pose_order_candidates(records, board, rgb_intrinsics, aux_intrinsics)
     report = dict(status='ambiguous', physical_correspondence_verified=False,
                   consensus_views=0, alternative_views=0, frames=[], suspect_ids=[],
                   checked_views=0, unresolved_ids=[str(row[0]) for row in records])
@@ -81,9 +80,10 @@ def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics):
     distances = np.linalg.norm(translations[:, None] - translations[None], axis=-1)
     tolerance = max(.005, board.square_size * .5)
     # Each grid symmetry differs by 180 degrees, so a view has at most one vote.
-    votes = np.sum((angles <= 8.) & (distances <= tolerance), axis=1)
+    votes = np.sum((angles <= 8.) & (True if rotation_only else distances <= tolerance), axis=1)
     best = int(np.argmax(votes))
-    separate = (angles[best] > 16.) | (distances[best] > 2 * tolerance)
+    separate = ((angles[best] > 16.) if rotation_only else
+                (angles[best] > 16.) | (distances[best] > 2 * tolerance))
     runner_up = int(np.max(votes[separate])) if np.any(separate) else 0
     report.update(consensus_views=int(votes[best]), alternative_views=runner_up)
     if votes[best] < max(3, np.ceil(.7 * len(records))) or (
@@ -93,10 +93,10 @@ def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics):
     for key, *_ in records:
         indices = [i for i, row in enumerate(candidates) if row[0] == str(key)]
         chosen = min(indices, key=lambda i: angles[best, i] / 8. +
-                     distances[best, i] / tolerance) if indices else None
+                     (0. if rotation_only else distances[best, i] / tolerance)) if indices else None
         current = next((i for i in indices if candidates[i][1] == 'identity'), None)
         if (chosen is None or current is None or angles[best, chosen] > 8. or
-                distances[best, chosen] > tolerance):
+                (not rotation_only and distances[best, chosen] > tolerance)):
             continue
         suspect = bool(angles[best, current] > 90.)
         report['frames'].append(dict(source_id=str(key),
@@ -112,6 +112,72 @@ def _correspondence_report(records, board, rgb_intrinsics, aux_intrinsics):
     elif report['unresolved_ids']:
         report['status'] = 'partial'
     return report
+
+
+def _ordered_records(records, board, orders):
+    from .offline_aux import reordered_detection
+
+    return [(key, rgb, reordered_detection(aux, board, orders[str(key)]))
+            for key, rgb, aux in records]
+
+
+def _rotation_hypotheses(records, board, rgb_intrinsics, aux_intrinsics):
+    """Bounded initial assignments only; rotation votes alone never authorize a result."""
+    candidates = _pose_order_candidates(records, board, rgb_intrinsics, aux_intrinsics)
+    if not candidates:
+        return []
+    rotations = np.asarray([row[2] for row in candidates]).reshape(-1, 9)
+    angles = np.degrees(np.arccos(np.clip((rotations @ rotations.T - 1.) / 2., -1., 1.)))
+    votes = np.sum(angles <= 8., axis=1)
+    hypotheses, seen = [], set()
+    for index in np.argsort(-votes, kind='stable'):
+        if votes[index] < max(3, np.ceil(.7 * len(records))):
+            continue
+        assignment = {}
+        for key, *_ in records:
+            choices = [i for i, row in enumerate(candidates) if row[0] == str(key)]
+            if not choices:
+                break
+            chosen = min(choices, key=lambda i: angles[index, i])
+            if angles[index, chosen] > 8.:
+                break
+            assignment[str(key)] = candidates[chosen][1]
+        identity = tuple(assignment.items())
+        if len(assignment) != len(records) or identity in seen:
+            continue
+        seen.add(identity)
+        hypotheses.append(assignment)
+        if len(hypotheses) == 4:
+            break
+    return hypotheses
+
+
+def _resolve_for_transform(records, board, rgb_intrinsics, aux_intrinsics, transform):
+    """Resolve discrete labels with a frozen rig; never fit held-out camera parameters."""
+    from .offline_aux import reordered_detection
+
+    aligned, frames = [], []
+    rotation, translation = transform[:3, :3], transform[:3, 3]
+    legal = _rigid_grid_orders(board)
+    for key, rgb, aux in records:
+        xyz = (_pose(rgb, rgb_intrinsics) - translation) @ rotation
+        if not np.isfinite(xyz).all() or np.min(xyz[:, 2]) <= 0:
+            raise ValueError(f'{key}: 跨模态对应预测深度无效')
+        predicted = project(xyz, aux_intrinsics)
+        candidates = []
+        for order in legal:
+            detection = reordered_detection(aux, board, order)
+            candidates.append((_rms(predicted - detection.image_points), order, detection))
+        candidates.sort(key=lambda row: row[0])
+        best, runner = candidates[:2]
+        if (not np.isfinite(best[0]) or not np.isfinite(runner[0])
+                or runner[0] - best[0] < 2. or runner[0] < 1.5 * max(best[0], 1e-9)):
+            raise ValueError(f'{key}: 跨模态编号候选差距不足，不能自动确定对应')
+        aligned.append((key, rgb, best[2]))
+        frames.append(dict(source_id=str(key), aux_order=best[1],
+                           best_aux_transfer_rms_px=best[0], runner_aux_transfer_rms_px=runner[0],
+                           physical_correspondence_verified=False))
+    return aligned, frames
 
 
 def inspect_aux_correspondences(records, board, rgb_intrinsics, model_key):
@@ -130,7 +196,20 @@ def inspect_aux_correspondences(records, board, rgb_intrinsics, model_key):
         _validate_intrinsics(rgb_intrinsics, rgb.image_size)
         validated.append((str(key), rgb, aux))
     report = _correspondence_report(validated, board, rgb_intrinsics, mono.calibrate(flags))
+    if report['status'] == 'ambiguous' or report['unresolved_ids']:
+        try:
+            refined, _, fit = _fit(validated, board, rgb_intrinsics, model_key)
+            report = _correspondence_report(validated, board, rgb_intrinsics, refined)
+            resolution = fit['numbering_resolution']
+            report['diagnostic_refinement'] = dict(
+                method=resolution['method'], candidate_limit=resolution['candidate_limit'],
+                candidate_count=len(resolution['attempts']), converged=fit['converged'],
+                source_ids=resolution['source_ids'], physical_correspondence_verified=False,
+                parameter_scope='diagnostic_only_not_reused_by_training_folds')
+        except (ValueError, cv2.error) as exc:
+            report['refinement_error'] = str(exc)
     report.update(aux_model=model_key, source_ids=[row[0] for row in validated],
+                  board=board.to_dict(), fixed_rgb_intrinsics=rgb_intrinsics.to_dict(),
                   annotation_scope='full_review_dataset')
     return report
 
@@ -176,7 +255,8 @@ def transfer_metrics(records, rgb_intrinsics, aux_intrinsics, transform):
             'aux_transfer_rms_px': _rms(aux_residuals), 'frames': frames}
 
 
-def _fit(records, board, rgb_intrinsics, model_key):
+def _fit_fixed_orders(records, board, rgb_intrinsics, model_key, *, seed=None,
+                      check_numbering=True):
     from scipy.optimize import least_squares
     from scipy.sparse import lil_matrix
     from scipy.spatial.transform import Rotation
@@ -187,9 +267,9 @@ def _fit(records, board, rgb_intrinsics, model_key):
     for _, rgb, aux in records:
         if not mono.add_detection(aux) or not cross.add_detection_pair(rgb, aux):
             raise ValueError('观测网格或分辨率不一致')
-    seed = mono.calibrate(flags)
+    seed = mono.calibrate(flags) if seed is None else deepcopy(seed)
     correspondence = _correspondence_report(records, board, rgb_intrinsics, seed)
-    if correspondence['status'] == 'inconsistent':
+    if check_numbering and correspondence['status'] == 'inconsistent':
         raise ValueError('角点编号方向待核对（不代表RGB/IR图像配错），图像对 ' +
             '、'.join(correspondence['suspect_ids']) +
             ' 的相对旋转偏差超过90°；请在离线逐对复核中检查对应候选、0点和X/Y方向，'
@@ -247,7 +327,8 @@ def _fit(records, board, rgb_intrinsics, model_key):
         raw = residual(result.x if finite else initial_x).reshape(len(records), 2, -1, 2)
         worst = sorted(((str(row[0]), _rms(errors[0]), _rms(errors[1]))
                         for row, errors in zip(records, raw)), key=lambda row: -max(row[1:]))[:5]
-        logger.error('Offline joint failure: worst RGB/AUX RMS px=%s', worst)
+        log = logger.error if check_numbering else logger.warning
+        log('Offline joint failure: worst RGB/AUX RMS px=%s', worst)
         raise ValueError('联合优化未收敛：' + str(result.message) +
             f'；nfev={result.nfev}，cost={result.cost:.6g}，optimality={result.optimality:.6g}' +
             '；请复核图像对 ' + '、'.join(row[0] for row in worst))
@@ -284,6 +365,85 @@ def _fit(records, board, rgb_intrinsics, model_key):
         'joint_training_aux_rms_px': _rms(raw[:, 1])}
 
 
+def _fit(records, board, rgb_intrinsics, model_key, *, resolve_correspondence=True):
+    """Fit only this training subset, including its own discrete label initialization."""
+    from .offline_aux import detection_fingerprint
+
+    if not resolve_correspondence:
+        return _fit_fixed_orders(records, board, rgb_intrinsics, model_key)
+    points = np.concatenate([_pose(rgb, rgb_intrinsics) for _, rgb, _ in records])
+    if np.linalg.matrix_rank(points - points.mean(axis=0), tol=board.square_size * 1e-4) < 3:
+        raise ValueError('跨模态编号共识不足：重复或共面观测不能唯一确定对应，请补充距离和倾角变化')
+    _, model, flags, _ = AUX_MODELS[model_key]
+    mono = AuxIntrinsicCalibrator(board, model, min_frames=3)
+    for _, _, aux in records:
+        if not mono.add_detection(aux):
+            raise ValueError('辅助观测网格或分辨率不一致')
+    seed = mono.calibrate(flags)
+    strict = _correspondence_report(records, board, rgb_intrinsics, seed)
+    complete = strict['status'] != 'ambiguous' and not strict['unresolved_ids']
+    if complete:
+        hypotheses = [{row['source_id']: row['aux_order'] for row in strict['frames']}]
+    else:
+        hypotheses = _rotation_hypotheses(records, board, rgb_intrinsics, seed)
+    if not hypotheses:
+        raise ValueError('跨模态编号共识不足，未获得覆盖全部观测的初始化；请复核图像和角点')
+    attempts, valid = [], []
+    for assignment in hypotheses:
+        attempt = dict(orders=assignment)
+        attempts.append(attempt)
+        try:
+            aligned = _ordered_records(records, board, assignment)
+            intr, transform, fit = _fit_fixed_orders(aligned, board, rgb_intrinsics, model_key,
+                                                    seed=seed, check_numbering=False)
+            post = _correspondence_report(records, board, rgb_intrinsics, intr)
+            post_orders = {row['source_id']: row['aux_order'] for row in post['frames']}
+            # Low-resolution planar PnP can have unstable normals. The frozen rig must
+            # support every label with a clear projection margin, not just a pose vote.
+            _, verified = _resolve_for_transform(records, board, rgb_intrinsics, intr, transform)
+            if {row['source_id']: row['aux_order'] for row in verified} != assignment:
+                raise ValueError('跨相机投影不支持当前编号解')
+            metrics = transfer_metrics(aligned, rgb_intrinsics, intr, transform)
+            score = max(metrics['rgb_transfer_rms_px'] / LIMITS['rgb_transfer_rms_px'],
+                        metrics['aux_transfer_rms_px'] / LIMITS['aux_transfer_rms_px'])
+            if not np.isfinite(score) or score > 1.:
+                raise ValueError('编号候选跨相机误差未通过既有像素门槛')
+            pose_disagreement = [key for key, order in assignment.items()
+                                 if post_orders.get(key) != order]
+            attempt.update(status='valid', score=float(score), nfev=fit['nfev'],
+                           pose_diagnostic_disagreement_ids=pose_disagreement)
+            valid.append((float(score), intr, transform, fit, post, verified))
+        except (ValueError, cv2.error) as exc:
+            attempt.update(status='rejected', reason=str(exc))
+    if not valid:
+        raise ValueError('跨模态对应求解失败：' + '；'.join(row['reason'] for row in attempts))
+    valid.sort(key=lambda row: row[0])
+    if len(valid) > 1 and (valid[1][0] - valid[0][0] < .25
+                           or valid[1][0] < 2. * max(valid[0][0], 1e-9)):
+        raise ValueError('跨模态编号存在多个近似等价解，未自动采用；请核对物理标记或补充不同观测')
+    _, intr, transform, fit, post, verified = valid[0]
+    post_orders = {row['source_id']: row['aux_order'] for row in post['frames']}
+    disagreement = [row['source_id'] for row in verified
+                    if post_orders.get(row['source_id']) != row['aux_order']]
+    fit['numbering_resolution'] = dict(
+        method='rigid_consensus' if complete else 'bounded_rotation_hypotheses_joint_refinement',
+        source_ids=[str(row[0]) for row in records], candidate_limit=4, attempts=attempts,
+        physical_correspondence_verified=False, final_pose_consensus=post,
+        pose_consensus_role='diagnostic_only_after_joint_fit',
+        pose_diagnostic_disagreement_ids=disagreement,
+        acceptance_basis='converged_healthy_rig_unique_projection_and_cross_camera_error',
+        frames=[dict(row, rgb_input_fingerprint=detection_fingerprint(rgb),
+                     aux_input_fingerprint=detection_fingerprint(aux),
+                     aux_solver_fingerprint=detection_fingerprint(
+                         _ordered_records([(key, rgb, aux)], board, {str(key): row['aux_order']})[0][2]))
+                for row, (key, rgb, aux) in zip(verified, records)])
+    if disagreement:
+        logger.info('Single-view PnP diagnostic differs for %s; frozen-rig projection margins '
+                    'and cross-camera pixel limits passed; held-out validation remains required',
+                    disagreement)
+    return intr, transform, fit
+
+
 def calibrate_offline_aux(records, board, rgb_intrinsics, model_key, log=lambda text: None):
     if model_key not in AUX_MODELS:
         raise ValueError('请选择独立的辅助相机模型')
@@ -312,6 +472,7 @@ def calibrate_offline_aux(records, board, rgb_intrinsics, model_key, log=lambda 
         limits=dict(LIMITS), source_ids=[key for key, _, _ in validated], folds=[],
         temporal_stability='not_verified_offline', synchronization='not_verified_offline',
         qualification='Internal cross-validation only; not independent physical accuracy.')
+    report['numbering_policy'] = 'automatic_legal_grid_correspondence_per_training_fold'
     fold_frames, baselines = [], []
     log(f'离线辅助模型：{model_key}；RGB内参固定；三折独立训练/留出验证')
     for fold in range(3):
@@ -321,7 +482,17 @@ def calibrate_offline_aux(records, board, rgb_intrinsics, model_key, log=lambda 
         log('训练编号：' + '、'.join(row[0] for row in training) +
             '；留出编号：' + '、'.join(row[0] for row in heldout))
         intr, transform, fit = _fit(training, board, rgb_intrinsics, model_key)
-        metrics = transfer_metrics(heldout, rgb_intrinsics, intr, transform)
+        inferred = fit.get('numbering_resolution')
+        if inferred:
+            changed = [row['source_id'] for row in inferred['frames'] if row['aux_order'] != 'identity']
+            log('训练折自动编号对应：' + ('辅助相对重排 ' + '、'.join(changed) if changed else
+                '当前规范编号已对应') + '；仅本折初始化，未旋转原图或确认物理0点')
+        aligned_heldout, heldout_orders = _resolve_for_transform(
+            heldout, board, rgb_intrinsics, intr, transform)
+        metrics = transfer_metrics(aligned_heldout, rgb_intrinsics, intr, transform)
+        metrics['numbering_resolution'] = dict(
+            method='frozen_training_model_discrete_assignment_only', frames=heldout_orders,
+            parameter_refit=False, physical_correspondence_verified=False)
         baselines.append(float(np.linalg.norm(transform[:3, 3])))
         report['folds'].append(dict(train_ids=[row[0] for row in training],
             heldout_ids=[row[0] for row in heldout], baseline_m=baselines[-1],
@@ -336,13 +507,20 @@ def calibrate_offline_aux(records, board, rgb_intrinsics, model_key, log=lambda 
                              f'上限 {LIMITS[metric]:g} px；请复核角点对应、图像和模型')
     log('留出检查完成，使用全部已确认观测进行最终联合细化')
     intr, transform, fit = _fit(validated, board, rgb_intrinsics, model_key)
+    inferred = fit.get('numbering_resolution')
+    if inferred:
+        for row in inferred['frames']:
+            log(f'最终自动对应 {row["source_id"]}: AUX={row["aux_order"]}；'
+                f'输入={row["aux_input_fingerprint"][:12]}；'
+                f'求解={row["aux_solver_fingerprint"][:12]}；待实物验证')
     baseline = float(np.linalg.norm(transform[:3, 3]))
     translation_deltas = [float(np.linalg.norm(np.asarray(fold['T_rgb_left_aux'])[:3, 3]
                                                - transform[:3, 3])) for fold in report['folds']]
     if baseline <= 1e-6 or max(translation_deltas) > max(
             LIMITS['baseline_fold_absolute_m'], baseline*LIMITS['baseline_fold_relative']):
         raise ValueError('跨折基线不稳定，请补充不同位置和倾角的观测并复核对应关系')
-    training_metrics = transfer_metrics(validated, rgb_intrinsics, intr, transform)
+    aligned_all, _ = _resolve_for_transform(validated, board, rgb_intrinsics, intr, transform)
+    training_metrics = transfer_metrics(aligned_all, rgb_intrinsics, intr, transform)
     report.update(heldout=holdout, fit=fit, training=training_metrics, baseline_m=baseline,
                   fold_translation_max_delta_m=max(translation_deltas))
     # Legacy scalar is explicitly AUX transfer error, never pooled RGB/IR pixels.

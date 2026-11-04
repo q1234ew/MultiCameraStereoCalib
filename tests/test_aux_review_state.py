@@ -88,6 +88,7 @@ def test_empty_or_busy_review_cannot_be_applied_even_via_accept(app, tmp_path):
     assert not button.isEnabled()
     dialog.accept()
     assert not accepted
+    dialog.apply_candidate.click()
     dialog.confirm.click()
     assert button.isEnabled()
     dialog.set_checking(True)

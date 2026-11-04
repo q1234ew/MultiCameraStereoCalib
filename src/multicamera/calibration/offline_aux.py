@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 
+import numpy as np
+
 from .aux_capture_quality import assess_aux_frame, quality_reason_text
 from .health import check_stereo_health
 from .models import CameraModel
@@ -15,6 +17,115 @@ from .models import CameraModel
 
 ORDER_OPTIONS = {'identity': '保持检测顺序', 'reverse_rows': '翻转行顺序',
                  'reverse_cols': '翻转列顺序', 'reverse_both': '反向编号（180°）'}
+
+
+def review_order_check(decisions, report, board):
+    """Compare selected relative numbering, not raw suspect flags or physical identity."""
+    from .joint_aux import _rigid_grid_orders
+
+    allowed = _rigid_grid_orders(board)
+    candidates = {str(row['source_id']): row.get('aux_order')
+                  for row in (report or {}).get('frames', [])}
+    reliable = (report or {}).get('status') in ('consistent', 'inconsistent', 'partial')
+    result = dict(conflict_ids=[], matched_ids=[], unchecked_ids=[], invalid_order_ids=[])
+    flips = {'identity': (False, False), 'reverse_rows': (True, False),
+             'reverse_cols': (False, True), 'reverse_both': (True, True)}
+    for key, decision in decisions.items():
+        orders = decision.get('corner_orders', {})
+        rgb, aux = orders.get('rgb'), orders.get('aux')
+        if rgb not in flips or aux not in flips:
+            raise ValueError(f'{key}: 未知角点排列，请重新逐对确认')
+        if rgb not in allowed or aux not in allowed:
+            result['invalid_order_ids'].append(str(key))
+            result['conflict_ids'].append(str(key))
+            continue
+        candidate = candidates.get(str(key)) if reliable else None
+        if candidate not in allowed:
+            result['unchecked_ids'].append(str(key))
+            continue
+        # Applying the same grid symmetry to both sensors preserves correspondence.
+        relative = tuple(a != b for a, b in zip(flips[rgb], flips[aux]))
+        state = 'matched_ids' if relative == flips[candidate] else 'conflict_ids'
+        result[state].append(str(key))
+    return result
+
+
+def detection_fingerprint(detection):
+    """Portable digest of the exact numbered solver observation, including geometry."""
+    digest = hashlib.sha256(str(tuple(detection.image_size)).encode('ascii'))
+    for points in (detection.object_points, detection.image_points):
+        array = np.asarray(points, dtype='<f8')
+        digest.update(str(array.shape).encode('ascii'))
+        digest.update(array.tobytes(order='C'))
+    return digest.hexdigest()
+
+
+def numbering_provenance_summary(calibration_info: dict) -> dict:
+    """Keep input attestations separate from the final algorithm's relative orders."""
+    reviews = calibration_info.get('offline_reviews', [])
+    reviews = {str(row['source_id']): row for row in reviews
+               if isinstance(row, dict) and 'source_id' in row} if isinstance(reviews, list) else {}
+    fit = calibration_info.get('fit', {})
+    resolution = fit.get('numbering_resolution', {}) if isinstance(fit, dict) else {}
+    rows = resolution.get('frames', []) if isinstance(resolution, dict) else []
+    frames = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or 'source_id' not in row:
+            continue
+        key = str(row['source_id'])
+        review = reviews.get(key, {})
+        orders = review.get('corner_orders', {})
+        order = row.get('aux_order')
+        if not isinstance(order, str) or order not in ORDER_OPTIONS:
+            order = 'not_recorded'
+        frames.append(dict(
+            source_id=key,
+            input_corner_orders=deepcopy(orders) if isinstance(orders, dict) else {},
+            input_review_declaration=review.get('physical_corner_order', 'not_recorded'),
+            algorithm_aux_order_relative_to_input=order,
+            input_rgb_fingerprint=row.get('rgb_input_fingerprint'),
+            input_aux_fingerprint=row.get('aux_input_fingerprint'),
+            final_aux_fingerprint=row.get('aux_solver_fingerprint')))
+    batches, invalid_batches = [], []
+    has_batch_metadata = False
+    for name, container in (('report', calibration_info), ('fit', fit),
+                            ('resolution', resolution)):
+        if not isinstance(container, dict) or 'source_ids' not in container:
+            continue
+        ids = container['source_ids']
+        if (not isinstance(ids, list) or not ids or
+                any(not isinstance(key, str) or not key for key in ids) or
+                len(ids) != len(set(ids))):
+            invalid_batches.append(name)
+            continue
+        batches.append(ids)
+        has_batch_metadata |= name in ('report', 'fit')
+    expected = list(dict.fromkeys(key for batch in batches for key in batch))
+    valid_ids = [row['source_id'] for row in frames
+                 if row['algorithm_aux_order_relative_to_input'] in ORDER_OPTIONS]
+    metadata_consistent = (has_batch_metadata and not invalid_batches
+                           and all(set(batch) == set(expected) for batch in batches))
+    complete = (metadata_consistent and len(valid_ids) == len(frames) == len(expected)
+                and len(valid_ids) == len(set(valid_ids)) and set(valid_ids) == set(expected)
+                and len(frames) == len(rows))
+    status = 'recorded' if complete else 'partial' if valid_ids else 'not_recorded'
+    return dict(
+        schema_version=1, input_review_scope='user_attestation_of_input_numbering_only',
+        final_correspondence_scope='algorithm_candidate_not_physical_verification',
+        physical_correspondence_verified=False,
+        input_attested_source_ids=[key for key, review in reviews.items()
+                                   if review.get('physical_corner_order') ==
+                                   'manually_confirmed_per_pair'],
+        final_numbering_status=status, expected_source_ids=expected,
+        batch_metadata_consistent=bool(metadata_consistent),
+        invalid_batch_metadata=invalid_batches,
+        missing_source_ids=[key for key in expected if key not in valid_ids],
+        unexpected_source_ids=[key for key in dict.fromkeys(valid_ids)
+                               if expected and key not in expected],
+        automatically_reordered_source_ids=[row['source_id'] for row in frames
+            if row['algorithm_aux_order_relative_to_input'] in ORDER_OPTIONS
+            and row['algorithm_aux_order_relative_to_input'] != 'identity'],
+        frames=frames)
 
 
 def reordered_detection(detection, board, order):

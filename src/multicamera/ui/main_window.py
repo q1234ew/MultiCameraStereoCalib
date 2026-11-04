@@ -1133,50 +1133,101 @@ class MainWindow(QMainWindow):
                                        '缺少项及下一步见会话文件检查日志')
             self._calib_panel.restore_session_images(auto_aux=inventory['auto_import'])
 
+    def _session_workspace_differences(self, session, plan):
+        """Inspect logical bindings without connecting devices or publishing a workspace."""
+        differences = []
+        manager = self._stream_manager
+        current = manager.stereo_pairs
+        recorded = {pair['name']: pair for pair in session.metadata.get('pairs', [])}
+        for pair in plan.pairs:
+            cfg = current.get(pair.name)
+            if cfg is None:
+                differences.append(f'相机组 {pair.name}：当前未配置；会话左 {pair.left.camera_id} / '
+                                   f'右 {pair.right.camera_id}')
+                continue
+            binding = recorded.get(pair.name, {})
+            for side, label in (('left', '左目'), ('right', '右目')):
+                live, saved = getattr(cfg, side), getattr(pair, side)
+                if live.camera_id != saved.camera_id:
+                    differences.append(f'{pair.name} {label} ID：当前 {live.camera_id}；'
+                                       f'会话 {saved.camera_id}')
+                if live.stream_type != saved.stream_type:
+                    differences.append(f'{pair.name} {label}视频类型：当前 {live.stream_type}；'
+                                       f'会话 {saved.stream_type}')
+                if not manager.is_virtual_pair(pair.name) and live.url != binding.get(side + '_url', ''):
+                    # Identify the transport mismatch without exposing addresses or credentials.
+                    differences.append(f'{pair.name} {label}视频地址不同（地址变化不等于已确认同一设备）')
+
+        def compare_fields(label, actual, expected, fields, *, exact=False):
+            for field, name in fields.items():
+                if actual.get(field) != expected.get(field):
+                    differences.append(f'{label} {name}：当前 {actual.get(field)}；会话 {expected.get(field)}')
+            if exact:
+                for field in sorted((actual.keys() | expected.keys()) - fields.keys()):
+                    if field not in actual or field not in expected or actual[field] != expected[field]:
+                        differences.append(f'{label} 扩展参数 {field} 不同')
+
+        if self._camera_model != plan.model:
+            differences.append(f'RGB 镜头模型：当前 {self._camera_model.value}；会话 {plan.model.value}')
+        compare_fields('RGB 标定板', self._board.to_dict(), plan.board.to_dict(), {
+            'cols': '列格数', 'rows': '行格数', 'square_length': '方格边长(m)',
+            'marker_length': '标记边长(m)', 'dict_type': '字典',
+        }, exact=True)
+        aux, saved_aux = manager.auxiliary_camera, plan.auxiliary
+        if aux is None and saved_aux is not None:
+            differences.append(f'辅助相机：当前未配置；会话 {saved_aux.camera_id}（{saved_aux.modality}）')
+        elif aux is not None and saved_aux is None:
+            differences.append(f'辅助相机：当前 {aux.camera_id}（{aux.modality}）；会话未配置')
+        elif aux is not None and saved_aux is not None:
+            compare_fields('辅助相机', aux.to_dict(), saved_aux.to_dict(), {
+                'camera_id': 'ID', 'modality': '模态',
+            })
+            compare_fields('辅助标定板', aux.pattern_board_config().to_dict(),
+                           saved_aux.pattern_board_config().to_dict(), {
+                'cols': '列点数', 'rows': '行点数', 'square_size': '点间距(m)',
+                'pattern_type': '板型', 'asymmetric': '非对称网格',
+            }, exact=True)
+            if aux.url and aux.url != (session.metadata.get('auxiliary_camera') or {}).get('url'):
+                differences.append('辅助相机视频地址不同（地址变化不等于已确认同一设备）')
+        for name, pair in plan.rig.pairs.items():
+            cfg = current.get(name)
+            for camera_id, intr, camera in (
+                    (pair.left_id, pair.left_intrinsics, cfg.left if cfg else None),
+                    (pair.right_id, pair.right_intrinsics, cfg.right if cfg else None)):
+                if camera is None or camera.camera_id != camera_id:
+                    continue
+                frame = manager.get_latest_frame(camera_id)
+                if frame is not None and frame[0].shape[1::-1] != intr.image_size:
+                    width, height = frame[0].shape[1::-1]
+                    differences.append(f'{camera_id} 实时图像尺寸：当前 {width}×{height}；'
+                                       f'会话内参 {intr.image_size[0]}×{intr.image_size[1]}')
+        if plan.legacy_offline:
+            differences.append('旧版离线结果未记录虚拟相机绑定；仅按 offline_L/R 恢复离线组，'
+                               '不映射到真实相机')
+        return differences
+
     def _load_session_result(self, session, plan, *, confirm_workspace=True, force_offline=False):
         from ..io.session_restore import prepare_session_result
         plan.verify_sources()
         prepared = prepare_session_result(session, plan.rig, plan.auxiliary) if plan.rig.pairs else None
-        manager = self._stream_manager
-        current = manager.stereo_pairs
-        bindings_match = all(pair.name in current and
-            (current[pair.name].left.camera_id, current[pair.name].right.camera_id) ==
-            (pair.left.camera_id, pair.right.camera_id) for pair in plan.pairs)
-        recorded = {pair['name']: pair for pair in session.metadata.get('pairs', [])}
-        if bindings_match:
-            for name in plan.rig.pairs:
-                cfg, binding = current[name], recorded.get(name, {})
-                if not manager.is_virtual_pair(name) and (
-                        (cfg.left.url, cfg.right.url) !=
-                        (binding.get('left_url', ''), binding.get('right_url', ''))):
-                    bindings_match = False
-        aux = manager.auxiliary_camera
-        aux_matches = ((aux is None and plan.auxiliary is None) or
-            (aux is not None and plan.auxiliary is not None and
-             (aux.camera_id, aux.modality, aux.pattern_board_config().to_dict()) ==
-             (plan.auxiliary.camera_id, plan.auxiliary.modality,
-              plan.auxiliary.pattern_board_config().to_dict())))
-        if aux_matches and aux is not None and aux.url:
-            aux_matches = aux.url == (session.metadata.get('auxiliary_camera') or {}).get('url')
-        offline = (force_offline or plan.legacy_offline or not bindings_match or not aux_matches or
-                   self._camera_model != plan.model or self._board.to_dict() != plan.board.to_dict())
-        if not offline:
-            for pair in plan.rig.pairs.values():
-                for camera_id, intr in ((pair.left_id, pair.left_intrinsics),
-                                       (pair.right_id, pair.right_intrinsics)):
-                    frame = manager.get_latest_frame(camera_id)
-                    if frame is not None and frame[0].shape[1::-1] != intr.image_size:
-                        offline = True
+        differences = self._session_workspace_differences(session, plan)
+        offline = force_offline or bool(differences)
         if offline and confirm_workspace:
             details = '\n'.join(f'{pair.name}: 左 {pair.left.camera_id} / 右 {pair.right.camera_id}'
                                 for pair in plan.pairs)
-            legacy = ('\n旧版离线结果未记录虚拟相机绑定；仅按 offline_L/R 恢复离线组，'
-                      '不映射到真实相机。' if plan.legacy_offline else '')
+            reasons = '\n'.join('• ' + item for item in differences) or '本次导入要求离线打开。'
+            continuation = ('继续 RGB + 声像仪 RGB 采集' if plan.auxiliary is not None and
+                            plan.auxiliary.modality == 'acoustic_rgb' else '继续 RGB + 红外采集')
             answer = QMessageBox.question(self, '按会话信息离线打开',
-                '当前相机、模型或标定板配置与会话不同。是否切换到该会话的离线工作区？\n'
-                f'{details}{legacy}\n\n将断开当前视频流，替换内存中的采图和结果，恢复会话板规格及模型；'
+                '是否按会话配置离线打开？具体隔离原因：\n'
+                f'{reasons}\n\n会话绑定：\n{details}\n\n'
+                '将断开当前视频流，替换内存中的采图和结果，恢复会话板规格及模型；'
                 '不自动连接历史地址，不把旧内参应用到当前设备，磁盘历史文件不变。\n'
-                '后续可导入配对原图；如需在线补拍，请重新配置并核对设备及镜头。',
+                '这是离线打开，不是在线续拍确认；相机组名或 ID 相同不能证明实物设备及镜头相同。\n'
+                f'RGB+IR/辅助在线续采请在加载后使用结果页“{continuation}”，'
+                '核对原左右设备、镜头/焦距/对焦及输出分辨率。\n'
+                'RGB 双目补拍同样须核对原设备及镜头；普通“相机配置”修改地址会按配置变更处理，'
+                '可能失效已恢复观测和结果。取消则保留当前工作区和视频流。',
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
                 text = '已取消加载会话，当前会话和相机配置未改变'
