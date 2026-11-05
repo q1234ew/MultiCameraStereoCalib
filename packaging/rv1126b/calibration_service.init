@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+APP="@APP@"
+BIN="$APP/calibration_service"
+PIDFILE=/var/run/multicamera-calibration.pid
+LOG=/var/log/multicamera-calibration.log
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE")
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$BIN" ] && kill -0 "$pid" 2>/dev/null
+}
+case "${1:-}" in
+    start)
+        if running; then echo "Already running"; exit 0; fi
+        if [ -f "$PIDFILE" ]; then
+            echo "Stale or foreign PID file; inspect $PIDFILE before restarting" >&2
+            exit 1
+        fi
+        [ -x "$BIN" ] && [ -f "$APP/service.yml" ]
+        /usr/bin/setsid "$BIN" "$APP/service.yml" >>"$LOG" 2>&1 </dev/null &
+        echo "$!" >"$PIDFILE"
+        sleep 2
+        if ! running; then
+            rm -f "$PIDFILE"
+            echo "Start failed; see $LOG" >&2
+            exit 1
+        fi
+        echo "Calibration service started (raw camera services untouched)"
+        ;;
+    stop)
+        if running; then
+            kill -TERM "$pid"
+            n=0
+            while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+            if kill -0 "$pid" 2>/dev/null; then echo "Process did not stop" >&2; exit 1; fi
+            rm -f "$PIDFILE"
+        elif [ -f "$PIDFILE" ]; then
+            echo "Refusing to act on stale/foreign PID file" >&2
+            exit 1
+        fi
+        ;;
+    status) running && echo "running" ;;
+    *) echo "Usage: $0 {start|stop|status}" >&2; exit 1 ;;
+esac

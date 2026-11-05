@@ -1,0 +1,32 @@
+<!-- multicamera-calibration-entry-v1 -->
+<script>
+(() => {
+  'use strict';
+  if (document.getElementById('multicamera-calibration-entry')) return;
+  const endpoint = new URL(window.location.href);
+  endpoint.port = '8090'; endpoint.pathname = '/panel'; endpoint.search = ''; endpoint.hash = '';
+  const section = document.createElement('div');
+  section.className = 'sidebar-section'; section.id = 'multicamera-calibration-entry';
+  const title = document.createElement('h3'); title.textContent = '标定与校正';
+  const open = document.createElement('button'); open.type = 'button'; open.className = 'source-btn';
+  open.textContent = '双目校正 / RGB+IR 验证';
+  const fallback = document.createElement('a'); fallback.href = endpoint.href;
+  fallback.target = '_blank'; fallback.rel = 'noopener'; fallback.textContent = '独立打开';
+  fallback.style.cssText = 'color:var(--accent,#8cbbff);font-size:12px';
+  section.append(title, open, fallback);
+  const sidebar = document.querySelector('.sidebar');
+  (sidebar || document.body).prepend(section);
+  open.onclick = () => {
+    const dialog = document.createElement('dialog');
+    dialog.style.cssText = 'width:min(1200px,96vw);height:90vh;max-height:96vh;margin:auto;padding:0;border:1px solid #465062;border-radius:6px;background:#0f1117;color:#e0e4ed;overflow:hidden';
+    const close = document.createElement('button'); close.type = 'button'; close.textContent = '关闭';
+    close.style.cssText = 'position:absolute;right:12px;top:8px;z-index:1;padding:6px 14px;background:#202632;color:#e0e4ed;border:1px solid #465062;border-radius:4px';
+    close.onclick = () => dialog.close();
+    const frame = document.createElement('iframe'); frame.title = '标定参数与校正'; frame.src = endpoint.href;
+    frame.style.cssText = 'border:0;width:100%;height:calc(100% - 48px);margin-top:48px';
+    dialog.append(close, frame); document.body.append(dialog);
+    dialog.onclose = () => { dialog.remove(); open.focus(); };
+    dialog.showModal(); close.focus();
+  };
+})();
+</script>

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "device_id": "device_2",
+  "mode": "rotation_only_metric_plane",
+  "source_calibration_sha256": "931e3db8919e57330ef1a8b44d2a98992fdb6516cb554004273c0a87e2d8edf0",
+  "candidate_calibration_sha256": "6c0582595c6f431099c399b8aaa4df6b661637fd2a218996b7b383a9ce420567",
+  "rotation": [
+    [
+      0.9999861411032691,
+      -0.002880206295077053,
+      0.004407041308006598
+    ],
+    [
+      0.0028870348407925867,
+      0.9999946407081817,
+      -0.0015438862466505808
+    ],
+    [
+      -0.004402570978499689,
+      0.0015565881318915459,
+      0.9999890971416473
+    ]
+  ],
+  "translation_mm": [
+    -50.935557249498444,
+    -0.0789795206820584,
+    0.8846459943573588
+  ],
+  "rotation_delta_deg": 0.23196369418259447,
+  "translation_fixed": true,
+  "metric_anchor": {
+    "tag_family": "36h11",
+    "tag_size_mm": 80,
+    "tag_id": 5,
+    "scene_constraint": "coplanar printed markers on box top",
+    "matched_plane_features": 75
+  },
+  "validation": {
+    "new_layout_tags_not_used_for_fit": [
+      1
+    ],
+    "resolution": [
+      640,
+      360
+    ],
+    "quality": "fast",
+    "device_2_tag1_depth_error_p90_m": 0.01591466573879825,
+    "device_2_tag5_depth_error_p90_m": 0.012508312344590156,
+    "measurement_accuracy_verified": false,
+    "fresh_960x540_fine_3_frames": {
+      "passed": true,
+      "samples": 27,
+      "depth_to_tag_ratio": 0.9934320173402343,
+      "depth_error_p90_m": 0.01088547219472469,
+      "plane_normal_error_deg": 0.8988500506203059,
+      "depth_median_m": 1.234,
+      "tag_expected_median_m": 1.2454270791413766
+    },
+    "fresh_fusion_job": "fe095185497345a18a1fa8bfc48cb828"
+  },
+  "status": "withdrawn",
+  "withdrawal_reason": "Local marker-depth improvement failed full-scene planarity; same-input floor P90 increased from 18.3mm to 74.3mm and patch-normal difference from 5.0deg to 17.8deg"
+}

@@ -1,0 +1,29 @@
+<script>
+// Raw video endpoints must not inherit the calibration service's page port.
+(() => {
+  'use strict';
+  const defaults = {left: @LEFT_PORT@, right: @RIGHT_PORT@, ir: 8081};
+  const left = Number(localStorage.getItem('port_stereo'));
+  const right = Number(localStorage.getItem('port_rgb_right'));
+  if (![8080, 8082].includes(left) || ![8080, 8082].includes(right) || left === right) {
+    localStorage.setItem('port_stereo', String(defaults.left));
+    localStorage.setItem('port_rgb_right', String(defaults.right));
+  }
+  if (Number(localStorage.getItem('port_ir')) !== defaults.ir) {
+    localStorage.setItem('port_ir', String(defaults.ir));
+  }
+  window.multicameraThermalStatus = message => {
+    const controls = document.getElementById('ir-controls');
+    const view = document.getElementById('view');
+    if (!controls || !view || !controls.classList.contains('is-visible')) return;
+    let status = document.getElementById('multicamera-thermal-status');
+    if (!status) {
+      status = document.createElement('p'); status.id = 'multicamera-thermal-status';
+      status.setAttribute('role', 'status');
+      status.style.cssText = 'position:absolute;bottom:16px;left:16px;max-width:calc(100% - 32px);padding:8px 12px;background:#1a1d27;border:1px solid #465062;border-radius:4px;color:var(--warn,#ffcb70);font-size:13px;z-index:3;pointer-events:none';
+      view.append(status);
+    }
+    status.textContent = message; status.hidden = !message;
+  };
+})();
+</script>

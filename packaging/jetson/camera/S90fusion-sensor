@@ -1,0 +1,77 @@
+#!/bin/sh
+
+APP_DIR="/opt/fusion-sensor"
+LAUNCHER="$APP_DIR/start_fusion.sh"
+PIDFILE="/var/run/fusion-sensor.pid"
+LOGFILE="/var/log/fusion-sensor.log"
+
+is_running() {
+    [ -f "$PIDFILE" ] || return 1
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    if is_running; then
+        echo "fusion-sensor already running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    rm -f "$PIDFILE"
+    [ -x "$LAUNCHER" ] || {
+        echo "missing executable: $LAUNCHER"
+        return 1
+    }
+    echo "Starting fusion-sensor..."
+    (
+        cd "$APP_DIR" || exit 1
+        exec /usr/bin/setsid /usr/bin/bash "$LAUNCHER"
+    ) >>"$LOGFILE" 2>&1 </dev/null &
+    pid=$!
+    echo "$pid" >"$PIDFILE"
+    sleep 3
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "fusion-sensor failed to start; see $LOGFILE"
+        rm -f "$PIDFILE"
+        return 1
+    fi
+    echo "fusion-sensor started (pid $pid)"
+}
+
+stop() {
+    if is_running; then
+        pid="$(cat "$PIDFILE")"
+        echo "Stopping fusion-sensor (pid $pid)..."
+        kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        count=0
+        while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$PIDFILE"
+    killall ustreamer.bin fusion-mdns-responder.bin 2>/dev/null || true
+    echo "fusion-sensor stopped"
+}
+
+status() {
+    if is_running; then
+        echo "fusion-sensor running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    echo "fusion-sensor stopped"
+    return 1
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FusionSensor 标定校正</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,"Segoe UI",sans-serif;color:#e0e4ed;background:#0f1117}
+*{box-sizing:border-box;letter-spacing:0}body{margin:0;padding:20px}header,.tools,.status{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header{justify-content:space-between;border-bottom:1px solid #303642;padding-bottom:14px}h1{font-size:20px;margin:0}h2{font-size:14px;margin:0}
+a{color:#8cbbff}button,select,input{font:inherit;min-height:36px;border:1px solid #465062;border-radius:4px;background:#202632;color:inherit;padding:6px 12px}
+button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #8cbbff;outline-offset:3px}
+.tools{margin:18px 0}.status{min-height:52px;padding:10px 0;border-bottom:1px solid #303642}.muted{color:#a0a9bb;font-size:13px}.warn{color:#ffcb70}.ok{color:#5de0a3}
+#sources{min-height:76px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;padding:12px 0}.source{padding:8px 0;overflow-wrap:anywhere}.source small{display:block;color:#a0a9bb;margin-top:4px}
+.views{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}figure{margin:0;min-width:0}figcaption{padding:10px 0;font-size:14px}
+.image{aspect-ratio:16/9;background:#171b23;display:grid;place-items:center;position:relative;border:1px solid #303642;border-radius:4px;overflow:hidden}.image img{width:100%;height:100%;object-fit:contain;position:absolute}.image span{padding:16px;color:#a0a9bb;text-align:center}
+#result{min-height:48px;margin:12px 0;overflow-wrap:anywhere}.depth{display:flex;align-items:center;gap:8px}input{width:100px}footer{margin-top:16px;font-size:13px;color:#a0a9bb;line-height:1.6}
+[hidden]{display:none!important}@media(max-width:650px){body{padding:12px}.views{grid-template-columns:1fr}#sources{grid-template-columns:1fr;gap:0}.tools{gap:8px}h1{font-size:18px}}
+</style>
+<header><h1>标定参数与校正</h1><a href="/api/calibration" download="calibration_mm.yml">下载标定参数</a></header>
+<div class="status"><strong id="identity">正在读取服务状态</strong><span class="warn">候选参数 · 未完成实物精度验证</span></div>
+<div class="tools"><button id="check" type="button">检查视频源</button><label>视图 <select id="mode"><option value="stereo">双目校正</option><option value="plane">RGB+IR 平面验证</option></select></label><label class="depth" id="depth-control" hidden>RGB 光轴深度 <input id="depth" type="number" value="1000" min="50" max="100000" step="50">mm</label><button id="refresh" type="button">更新画面</button></div>
+<div id="sources" aria-live="polite"><div class="muted">视频源尚未检查</div></div>
+<div class="views"><figure><figcaption id="left-title">RGB 左目 · 校正后</figcaption><div class="image"><span id="left-placeholder">尚无校正画面</span><img id="left" alt="RGB左目校正快照" hidden></div></figure><figure id="right-figure"><figcaption>RGB 右目 · 校正后</figcaption><div class="image"><span id="right-placeholder">尚无校正画面</span><img id="right" alt="RGB右目校正快照" hidden></div></figure></div>
+<p id="result" class="muted" role="status">原始视频流与相机参数保持不变</p>
+<footer id="qualification">校正快照为分别读取，不代表硬件同步；真实场景深度与点云由 Jetson 测试链路处理。</footer>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);let busy=false;const urls={};
+async function request(path){const res=await fetch(path,{cache:'no-store',signal:AbortSignal.timeout(15000)});if(!res.ok){let message='服务返回 '+res.status;try{message=(await res.json()).error||message}catch{}throw new Error(message)}return res}
+function clearImages(){for(const id of ['left','right']){if(urls[id])URL.revokeObjectURL(urls[id]);delete urls[id];$(id).hidden=true;$(id).removeAttribute('src');$(id+'-placeholder').textContent='尚无校正画面'}}
+async function inspect(){const data=await(await request('/api/sources')).json();$('sources').replaceChildren(...data.sources.map(source=>{const row=document.createElement('div');row.className='source';const title=document.createElement('strong');title.className=source.snapshot_valid?'ok':'warn';title.textContent=({left:'RGB 左目',right:'RGB 右目',ir:'红外'})[source.camera]+' · '+(source.snapshot_valid?'原图可用':'不可用');const note=document.createElement('small');note.textContent='端口 '+source.port+(source.snapshot_valid?' · 尺寸匹配':' · '+source.reason);row.append(title,note);return row}))}
+async function action(work){if(busy)return;busy=true;for(const id of ['check','refresh','mode','depth'])$(id).disabled=true;try{await work()}catch(e){$('result').textContent='未完成：'+e.message;$('result').className='warn'}finally{busy=false;for(const id of ['check','refresh','mode','depth'])$(id).disabled=false}}
+async function image(id,path){const response=await request(path);const url=URL.createObjectURL(await response.blob());if(urls[id])URL.revokeObjectURL(urls[id]);urls[id]=url;$(id).src=url;$(id).hidden=false;return response}
+$('check').onclick=()=>action(async()=>{await inspect();$('result').textContent='视频源检查完成；未向相机写入配置';$('result').className='muted'});
+$('mode').onchange=()=>{clearImages();const plane=$('mode').value==='plane';$('depth-control').hidden=!plane;$('right-figure').hidden=plane;$('left-title').textContent=plane?'RGB+IR · 指定深度平面':'RGB 左目 · 校正后';$('left').alt=plane?'RGB与IR指定深度平面验证图':'RGB左目校正快照';$('qualification').textContent=plane?'仅在指定 RGB 光轴深度平面上投影；不是场景深度融合，不校正遮挡，也不代表温度测量。':'校正快照为分别读取，不代表硬件同步；真实场景深度与点云由 Jetson 测试链路处理。';$('result').textContent='视图已切换，尚未更新画面'};
+$('refresh').onclick=()=>action(async()=>{clearImages();$('result').textContent='正在读取原图并计算';if($('mode').value==='plane'){if(!$('depth').checkValidity())throw new Error('请输入 50–100000 mm 深度');const response=await image('left','/api/fusion.jpg?depth_mm='+encodeURIComponent($('depth').value));$('result').textContent='平面验证快照 · RGB 光轴深度 '+$('depth').value+' mm · 两路接收间隔 '+response.headers.get('X-Source-Receive-Gap-Ms')+' ms · 非硬件同步'}else{try{await image('left','/api/rectified.jpg?camera=left');await image('right','/api/rectified.jpg?camera=right')}catch(e){clearImages();throw e}$('result').textContent='左右校正快照已更新 · 两路分别读取，非同步图像对'}$('result').className='muted'});
+action(async()=>{const data=await(await request('/health')).json();$('identity').textContent=data.device_id+' · 参数已加载';await inspect()});
+</script>
+</html>

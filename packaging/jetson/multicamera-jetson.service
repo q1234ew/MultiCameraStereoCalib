@@ -1,0 +1,23 @@
+[Unit]
+Description=MultiCamera Jetson candidate status framework (no live capture)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/opt/multicamera-jetson
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/multicamera-jetson/.venv/bin/python -m scripts.jetson.service --config /opt/multicamera-jetson/packaging/jetson/devices.json --bundle-root /opt/multicamera-jetson/bundles
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+UMask=0077
+MemoryMax=768M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

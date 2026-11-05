@@ -1,0 +1,30 @@
+[Unit]
+Description=MultiCamera Orin preview with enforced system memory control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+WorkingDirectory=/home/nvidia/multicamera-jetson
+Environment=HOME=/home/nvidia
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/home/nvidia/multicamera-jetson/.venv/bin/python -m scripts.jetson.preview --listen 192.168.31.10 --port 8092 --bundle-root /home/nvidia/multicamera-jetson/bundles
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+UMask=0077
+TasksMax=128
+MemoryAccounting=true
+# MemoryLimit covers the active cgroup-v1 controller on this Orin.
+MemoryLimit=10G
+MemoryMax=10G
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

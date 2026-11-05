@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orin 统一预览 · MultiCamera</title><link rel="stylesheet" href="/styles.css"><script src="/cloud.js" defer></script><script src="/app.js" defer></script><script src="/settings.js" defer></script><script src="/fusion.js" defer></script><script src="/photos.js" defer></script></head>
+<body>
+<header><div><h1>MultiCamera <span>/ Orin</span> 统一预览</h1><p>三台设备 · 原始画面与双目深度</p></div><nav aria-label="预览控制"><button id="fusion-open">多设备融合</button><button id="settings-open">设置与状态</button><button id="pause">暂停预览</button><button id="refresh" class="primary">刷新</button></nav></header>
+<div class="mode-bar" role="group" aria-label="画面模式"><button id="raw-mode" aria-pressed="true">原始画面</button><button id="stereo-mode" aria-pressed="false">双目校正 · 深度 · 点云</button><label class="resolution-label" for="depth-resolution">深度分辨率 <select id="depth-resolution"><option value="320x180">320×180 · 快速</option><option value="480x270" selected>480×270 · 标准</option><option value="640x360">640×360 · 精细</option><option value="960x540">960×540 · 高分辨率</option></select></label><label class="resolution-label" for="depth-quality">模型档位 <select id="depth-quality"><option value="fast">快速 · 8 次迭代</option><option value="standard">标准 · 16 次迭代</option><option value="fine">精细 · 32 次迭代</option></select></label><p>FoundationStereo · 深度 0.2–10 m · 暖色近 / 冷色远 / 黑色无效</p></div>
+<main id="devices" aria-label="设备画面"><p id="loading" role="status">正在连接设备…</p></main>
+<footer>点击任意画面可放大查看（保持原始比例显示）<span>独立快照 · 未硬件同步 · 深度精度待验收</span></footer>
+<dialog id="fusion-dialog" aria-labelledby="fusion-title">
+<div class="dialog-head"><h2 id="fusion-title">双目深度 · 多设备融合</h2><button id="fusion-close">关闭</button></div>
+<p>相机与场景保持静止。先用各设备共同可见的同一个 AprilTag 建立外参，再采集 FoundationStereo 深度并融合。世界坐标 X/Y 沿共同码边缘，Z 垂直码面。独立快照未硬件同步；一致性检查通过不代表测量精度验收。</p>
+<form id="fusion-form">
+<fieldset id="fusion-inputs"><legend>参与设备与参数</legend><div id="fusion-devices" class="fusion-devices"><label><input type="checkbox" name="fusion-device" value="device_1" checked>设备 1</label><label><input type="checkbox" name="fusion-device" value="device_2" checked>设备 2</label><label><input type="checkbox" name="fusion-device" value="device_3">设备 3</label></div>
+<div class="controls-grid">
+<label>码黑色外边框实测边长（mm）<input id="fusion-tag-size" type="number" min="10" max="1000" step="any" value="80" required></label>
+<label>AprilTag 36h11 编号（-1 自动）<input id="fusion-tag-id" type="number" min="-1" max="586" step="1" value="-1" required></label>
+<label>外参采样次数<input id="fusion-samples" type="number" min="3" max="8" step="1" value="3" required></label>
+<label>每台融合帧数<input id="fusion-frames" type="number" min="1" max="5" step="1" value="3" required></label>
+<label>融合最大深度（m）<input id="fusion-max-depth" type="number" min="0.5" max="10" step="any" value="4" required></label>
+</div><p id="fusion-depth-settings"></p>
+<div class="fusion-actions"><button type="submit" name="action" value="calibrate">采集并标定外参</button><button type="submit" name="action" value="fuse" class="primary" id="fusion-start">采集深度并融合</button></div>
+</fieldset></form>
+<p id="fusion-calibration" role="status">正在读取外参状态…</p>
+<p id="fusion-message" role="status" aria-live="polite"></p><button id="fusion-refresh">刷新任务状态</button>
+<div id="fusion-downloads" class="fusion-actions"></div>
+<section id="fusion-output" hidden><h3>公共坐标系融合点云</h3><p id="fusion-summary"></p><canvas id="fusion-cloud" class="cloud-canvas"></canvas><button id="fusion-reset" class="cloud-reset">复位视角</button></section>
+</dialog>
+<dialog id="viewer" aria-labelledby="viewer-title"><div class="dialog-head"><h2 id="viewer-title"></h2><button id="close">关闭</button></div><img id="large" alt="放大画面"></dialog>
+<dialog id="settings-dialog" aria-labelledby="settings-title">
+<div class="dialog-head"><h2 id="settings-title">相机设置与系统状态</h2><button id="settings-close">关闭设置</button></div>
+<div class="settings-tabs" role="tablist" aria-label="设置分类"><button role="tab" aria-selected="true" aria-controls="status-pane" id="status-tab">设备与状态</button><button role="tab" aria-selected="false" aria-controls="camera-pane" id="camera-tab">相机参数</button><button role="tab" aria-selected="false" aria-controls="preview-pane" id="preview-tab">预览设置</button></div>
+<section id="status-pane" role="tabpanel" aria-labelledby="status-tab"><button id="status-refresh">刷新状态</button><p id="system-state" role="status">正在读取…</p><div id="device-states"></div></section>
+<section id="camera-pane" role="tabpanel" aria-labelledby="camera-tab" hidden><div class="camera-selects"><label>设备<select id="camera-device"><option value="device_1">设备 1</option><option value="device_2">设备 2</option><option value="device_3">设备 3</option></select></label><label>通道<select id="camera-role"><option value="left">RGB 左目</option><option value="right">RGB 右目</option><option value="ir">红外</option></select></label><button id="camera-read">重新读取</button></div><p>参数仅在点击“应用相机参数”后写入当前设备与通道；自动模式下，相应手动参数不可编辑。</p><form id="camera-form"><div id="camera-controls" class="controls-grid"></div><button type="submit" id="camera-apply" class="primary">应用相机参数</button></form><p id="camera-message" role="status"></p></section>
+<section id="preview-pane" role="tabpanel" aria-labelledby="preview-tab" hidden><div class="controls-grid"><label>深度分辨率<select id="settings-depth"><option value="320x180">320×180 · 快速</option><option value="480x270">480×270 · 标准</option><option value="640x360">640×360 · 精细</option><option value="960x540">960×540 · 高分辨率</option></select></label><label>模型档位<select id="settings-quality"><option value="fast">快速 · 8 次迭代</option><option value="standard">标准 · 16 次迭代</option><option value="fine">精细 · 32 次迭代</option></select></label><label>原始画面刷新间隔<select id="settings-interval"><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="3000">3 s</option></select></label><label>点云显示上限<select id="settings-points"><option value="1500">1500 点</option><option value="3000">3000 点</option><option value="6000" selected>6000 点</option></select></label></div><hr><h3>截图预览 · AprilTag 识别</h3><div class="camera-selects"><label>设备<select id="photo-device"><option value="device_1">设备 1</option><option value="device_2">设备 2</option><option value="device_3">设备 3</option></select></label><label>镜头<select id="photo-role"><option value="left">RGB 左目</option><option value="right">RGB 右目</option></select></label><label>截图分辨率<select id="photo-resolution"><option value="preview">当前预览 · 1280×720</option><option value="native1080">原生拍照 · 1920×1080</option></select></label><button id="photo-capture">拍照并识别码</button></div><p>1080p 拍照会短暂停止该设备的三路视频，完成后自动恢复。截图仅用于码识别；外参仍基于当前已标定的 720p 图像。</p><p id="photo-message" role="status"></p><img id="photo-image" alt="截图预览与 AprilTag 检测框" hidden><a id="photo-download" hidden>下载原始截图</a><p>预览设置保存在当前浏览器。分辨率影响 FoundationStereo 计算与点云反投影；原始标定分辨率保持不变。</p></section>
+</dialog>
+
+</body></html>

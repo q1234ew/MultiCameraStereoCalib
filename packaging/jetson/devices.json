@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "listen": "127.0.0.1",
+  "port": 8091,
+  "max_skew_ms": 40,
+  "max_age_ms": 500,
+  "devices": [
+    {
+      "id": "device_1",
+      "host": "192.168.31.159",
+      "expected_mac": "86:6b:17:d4:ec:32",
+      "source_session": "calib_20261031_172015",
+      "physical_binding_verified": false,
+      "binding_note": "calibration-consistent ordering verified by 3 real ORB epipolar checks; physical lens label unverified",
+      "raw_ports": {
+        "left": 8082,
+        "right": 8080,
+        "ir": 8081
+      },
+      "calibration_path": "/opt/fusion-sensor/calibration-candidates/device_1/0.6.1-compat.20261105.2/calibration_mm.yml",
+      "calibration_sha256": "592b4068f686b1ad40b5e8c042402f2bdc767e77af7fe9288a9b69bc427f0443",
+      "translation_unit": "mm",
+      "resolution": {
+        "left": [
+          1280,
+          720
+        ],
+        "right": [
+          1280,
+          720
+        ],
+        "ir": [
+          256,
+          192
+        ]
+      }
+    },
+    {
+      "id": "device_2",
+      "host": "192.168.31.244",
+      "expected_mac": "aa:ce:a2:64:d6:41",
+      "source_session": "calib_20261104_174237",
+      "physical_binding_verified": false,
+      "binding_note": "historical left=8082 right=8080; MUST verify physical binding; local rotation correction withdrawn after global planarity failure; original geometry restored, complete calibration audit pending",
+      "raw_ports": {
+        "left": 8082,
+        "right": 8080,
+        "ir": 8081
+      },
+      "calibration_path": "/opt/fusion-sensor/calibration-candidates/device_2/0.6.1-compat.20261105.2/calibration_mm.yml",
+      "calibration_sha256": "931e3db8919e57330ef1a8b44d2a98992fdb6516cb554004273c0a87e2d8edf0",
+      "translation_unit": "mm",
+      "resolution": {
+        "left": [
+          1280,
+          720
+        ],
+        "right": [
+          1280,
+          720
+        ],
+        "ir": [
+          256,
+          192
+        ]
+      }
+    },
+    {
+      "id": "device_3",
+      "host": "192.168.31.55",
+      "expected_mac": "92:6f:fb:29:99:c4",
+      "source_session": "calib_20261102_141028",
+      "physical_binding_verified": false,
+      "binding_note": "matches deployed 8090 source roles; pending physical lens validation",
+      "raw_ports": {
+        "left": 8080,
+        "right": 8082,
+        "ir": 8081
+      },
+      "calibration_path": "/opt/fusion-sensor/calibration-candidates/device_3/0.6.1-compat.20261105.2/calibration_mm.yml",
+      "calibration_sha256": "a5d6d4a1390acf3db54f27dc9c712852f04d4d172dbe29ea445d34bac741438f",
+      "translation_unit": "mm",
+      "resolution": {
+        "left": [
+          1280,
+          720
+        ],
+        "right": [
+          1280,
+          720
+        ],
+        "ir": [
+          256,
+          192
+        ]
+      }
+    }
+  ]
+}

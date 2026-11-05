@@ -1,0 +1,20 @@
+[Unit]
+Description=MultiCamera Orin preview, FoundationStereo and camera controls
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/multicamera-jetson
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=%h/multicamera-jetson/.venv/bin/python -m scripts.jetson.preview --listen 192.168.31.10 --port 8092 --bundle-root %h/multicamera-jetson/bundles
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+UMask=0077
+TasksMax=128
+MemoryMax=10G
+
+[Install]
+WantedBy=default.target

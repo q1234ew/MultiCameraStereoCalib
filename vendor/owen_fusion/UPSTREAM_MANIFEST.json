@@ -1,0 +1,13 @@
+{
+  "source_host": "owen",
+  "source_root": "/home/aidev/Desktop/Dev/gaussians",
+  "files": {
+    "make_tsdf_mesh.py": "b8f695004ac0ca217ce5a0376174e0c93da40bbc0613fca2a54cd3af6f19f246",
+    "LICENSE": "96a4f89293c0df19880da9b0e35f67589f5885ea61b224ef16bb2bd599a8a44d",
+    "estimate_camera_extrinsics_from_landmarks.py": "da40fb54e88482f46716eb2519c689d693e437123bde54a3f08e48b686813028",
+    "make_multicamera_pointcloud.py": "44acc50992528a09f15b04cd06b6f365d9aa8454a490777f8da12de33ab42e18",
+    "evaluate_calibration_quality.py": "86c3abec55f391b3d3656b4b39eb1ca0d2e6ad419a8f45aa3f102d90e6d71587",
+    "estimate_board_extrinsics_from_video.py": "87aa5ae312162b4d1f8bc4f82e8dc5bda2e4d99e4439c97b7b0a579c6e1db773",
+    "run_multicam_fusion.py": "9e9ac51eb7b118f379666b07efe0d6c1ece775c34659900b1bdd5f6c9f58ce2d"
+  }
+}
