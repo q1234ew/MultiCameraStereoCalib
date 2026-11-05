@@ -166,7 +166,7 @@ def test_browsing_second_reference_preserves_saved_and_rejected_counts(
     assert '参考动作 2/17' in widget._large_guide.accessibleName()
     assert widget._pending_action.text() == '下个参考动作'
     assert guide.counts.text() == counts
-    assert '原图已保存 1 组' in counts
+    assert '会话已保存 1 组（历史 0 · 本次新增 1）' in counts
     assert '验收通过 0 组 · 引导采用 0 组' in counts
     assert panel._aux_cap_progress.value() == 0
     panel._btn_aux_quality_details.click()

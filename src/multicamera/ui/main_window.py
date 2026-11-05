@@ -634,7 +634,7 @@ class MainWindow(QMainWindow):
         self._act_config.triggered.connect(self._on_config)
         self._act_config_tb.triggered.connect(self._on_config)
         self._act_new_session.triggered.connect(self._on_new_session)
-        self._act_load_session.triggered.connect(self._on_load_session)
+        self._act_load_session.triggered.connect(self._on_open_session)
         self._act_load_calibration.triggered.connect(self._on_load_calibration_file)
         self._act_export.triggered.connect(self._on_export)
         self._act_exit.triggered.connect(self.close)
@@ -664,6 +664,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.calibration_reset.connect(self._on_calib_reset)
         self._calib_panel.pointcloud_ready.connect(self._on_pointcloud)
         self._calib_panel.frame_captured.connect(self._stream_view.notify_capture)
+        self._calib_panel.aux_original_checked.connect(self._stream_view.show_aux_original_receipt)
         self._calib_panel.sequence_updated.connect(
             self._stream_view.set_capture_sequence
         )
@@ -672,7 +673,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.aux_images_imported.connect(self._stream_view.show_multimodal_images)
         self._calib_panel.preview_mode_changed.connect(self._on_preview_mode_changed)
         self._calib_panel.configure_aux_requested.connect(lambda: self._on_config(True))
-        self._calib_panel.load_rgb_session_requested.connect(self._on_load_session)
+        self._calib_panel.load_rgb_session_requested.connect(self._on_open_session)
         self._calib_panel.load_rgb_file_requested.connect(self._on_load_calibration_file)
         self._calib_panel.continue_aux_capture_requested.connect(self._on_continue_aux_capture)
         self._calib_panel.configure_stereo_requested.connect(lambda: self._on_config(False))
@@ -1084,7 +1085,7 @@ class MainWindow(QMainWindow):
         self._calib_panel.append_log(f'新建会话成功：{session.name}；点击采集后才保存原图')
 
     @Slot()
-    def _on_load_session(self):
+    def _on_load_session(self, *, choose_mode=False):
         if self._background_tasks_block("加载会话"):
             return
         dir_path = QFileDialog.getExistingDirectory(
@@ -1100,13 +1101,21 @@ class MainWindow(QMainWindow):
                 inventory = inspect_session_files(session)
                 self._calib_panel.append_log(inventory['text'])
                 rig = session.load_rig()
+                open_mode = None
+                if choose_mode:
+                    from ..io.session_restore import prepare_session_restore
+                    plan = prepare_session_restore(session, allow_uncomputed=rig is None)
+                    open_mode = self._choose_session_open_mode(session, plan, inventory)
+                    if open_mode is None:
+                        return
                 if rig is None:
-                    if self._rig is not None or self._calib_panel._active_step == 2:
+                    if not choose_mode and (self._rig is not None or self._calib_panel._active_step == 2):
                         raise ValueError('会话缺少 RGB 标定结果，不能用于融合；已保留当前有效状态')
                     if session.metadata.get('board') and session.metadata.get('pairs'):
                         from ..io.session_restore import prepare_session_restore
                         plan = prepare_session_restore(session, allow_uncomputed=True)
-                        if not self._load_session_result(session, plan):
+                        if not self._load_session_result(session, plan,
+                                confirm_workspace=not choose_mode, force_offline=choose_mode):
                             return
                     else:
                         raise ValueError('会话缺少标定板或相机组配置，无法恢复工作区')
@@ -1114,7 +1123,8 @@ class MainWindow(QMainWindow):
                 else:
                     from ..io.session_restore import prepare_session_restore
                     plan = prepare_session_restore(session)
-                    if not self._load_session_result(session, plan):
+                    if not self._load_session_result(session, plan,
+                            confirm_workspace=not choose_mode, force_offline=choose_mode):
                         return
             except Exception as exc:
                 text = f"加载会话失败，已保留当前会话：{exc}"
@@ -1132,6 +1142,46 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage(f'加载会话：{session.name}；融合原图 {inventory["aux_pairs"]} 组；'
                                        '缺少项及下一步见会话文件检查日志')
             self._calib_panel.restore_session_images(auto_aux=inventory['auto_import'])
+            if open_mode == 'online':
+                self._schedule_session_continuation(session)
+
+    @Slot()
+    def _on_open_session(self):
+        self._on_load_session(choose_mode=True)
+
+    def _choose_session_open_mode(self, session, plan, inventory):
+        from .widgets.session_open_dialog import SessionOpenDialog
+        dialog = SessionOpenDialog(session.name, inventory['text'],
+            self._session_workspace_differences(session, plan),
+            can_continue=bool(plan.rig.pairs) and not plan.legacy_offline, parent=self)
+        return dialog.mode if dialog.exec() == QDialog.Accepted else None
+
+    def _schedule_session_continuation(self, session):
+        previous = getattr(self, '_session_continuation_timer', None)
+        if previous is not None:
+            previous.stop()
+            previous.deleteLater()
+        timer = QTimer(self)
+        self._session_continuation_timer = timer
+        timer.setInterval(100)
+
+        def resume():
+            if self._current_session is not session:
+                timer.stop()
+                self._session_continuation_timer = None
+                timer.deleteLater()
+                return
+            panel = self._calib_panel
+            if (panel._session_restore_queue or panel._session_restore_aux or
+                    panel._stereo_import_worker or panel._aux_import_worker):
+                return
+            timer.stop()
+            self._session_continuation_timer = None
+            timer.deleteLater()
+            self._on_continue_aux_capture()
+
+        timer.timeout.connect(resume)
+        timer.start()
 
     def _session_workspace_differences(self, session, plan):
         """Inspect logical bindings without connecting devices or publishing a workspace."""
@@ -1524,6 +1574,7 @@ class MainWindow(QMainWindow):
             return
 
         self._connection_expected = set(camera_urls.keys())
+        self._calib_panel.set_live_sources_active(True)
         self._connection_connected.clear()
         self._connection_failures_shown.clear()
         self._stream_view.show_connecting(camera_urls, preserve_trackers=preserve_trackers)
@@ -1540,6 +1591,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_stop_streams(self):
         logger.info("User requested stop streams")
+        self._calib_panel.set_live_sources_active(False)
         self._stream_manager.stop_all()
         self._stream_view.clear_all()
         self._act_start_streams.setEnabled(True)
@@ -1731,6 +1783,11 @@ class MainWindow(QMainWindow):
             logger.warning(text)
             event.ignore()
             return
+        timer = getattr(self, '_session_continuation_timer', None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._session_continuation_timer = None
         self._stream_manager.stop_all()
         for dialog in self._aux_panel_dialogs.values():
             dialog.hide()

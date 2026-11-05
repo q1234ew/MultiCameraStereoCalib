@@ -211,6 +211,15 @@ class _HeaderLabel(QLabel):
         self.setText(self._full_text)
 
 
+class _TileInfoLabel(StableTextLabel):
+    def visible_text(self):
+        if '\n' not in self.text():
+            return super().visible_text()
+        width = max(1, self.contentsRect().width() - 8)
+        return '\n'.join(self.fontMetrics().elidedText(line, Qt.ElideRight, width)
+                         for line in self.text().split('\n')[:2])
+
+
 class CameraView(QFrame):
     """Single camera preview tile with modern styling."""
 
@@ -221,6 +230,8 @@ class CameraView(QFrame):
         super().__init__(parent)
         self.camera_id = camera_id
         self.corner_count = None
+        self._original_receipt = None
+        self._info_text = '等待连接...'
         self._display_name = camera_id
         self._expanded = False
         self.setCursor(Qt.PointingHandCursor)
@@ -280,7 +291,7 @@ class CameraView(QFrame):
         self._image_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(self._image_label)
 
-        self._info = StableTextLabel("等待连接...", lines=2)
+        self._info = _TileInfoLabel("等待连接...", lines=2)
         self._info_color = TEXT_DIM
         self._info.setTextFormat(Qt.PlainText)
         self._info.setMinimumHeight(24)
@@ -334,6 +345,7 @@ class CameraView(QFrame):
         """Drop cached image data so stale camera frames cannot remain visible."""
         self._last_frame = None
         self.corner_count = None
+        self._original_receipt = None
         self._last_label_size = None
         self._last_pixmap = None
         self._image_label.clear()
@@ -367,12 +379,29 @@ class CameraView(QFrame):
         self._render_cached_frame()
 
     def update_info(self, text: str):
+        self._info_text = text
+        tooltip = text
+        if self._original_receipt is not None:
+            receipt = self._original_receipt
+            state = str(receipt['state'])
+            if state in {'可采纳', '验收通过'}:
+                state = '验收通过'
+            elif state in {'待复核', '验收待复核'}:
+                state = '待复核'
+            summary = (f"最近原图 {receipt['key']} {receipt['points']}/{receipt['total']} "
+                       f"{state}")
+            text = text.replace('\n', ' ') + '\n' + summary
+            tooltip = text + f"（方法 {receipt['method']}）"
         self._info.setText(text)
-        self._info.setToolTip(text)
+        self._info.setToolTip(tooltip)
         color = DANGER if "无法连接" in text or "失败" in text else TEXT_DIM
         if color != self._info_color:
             self._info_color = color
             self._info.setStyleSheet(f"font-size:12px; color:{color}; padding:2px; background:transparent;")
+
+    def set_original_receipt(self, payload: Optional[dict]):
+        self._original_receipt = dict(payload) if payload is not None else None
+        self.update_info(self._info_text)
 
     def set_connected(self, connected: bool):
         if connected:
@@ -513,6 +542,7 @@ class MultiStreamView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def update_board(self, board: CharucoBoard):
+        self._clear_original_receipts()
         self._board = board
         self._detector = CharucoDetector(board)
         self._trackers.clear()
@@ -583,12 +613,28 @@ class MultiStreamView(QWidget):
     def displayed_corner_counts(self):
         return {cid: view.corner_count for cid, view in self._views.items()}
 
+    @Slot(str, dict)
+    def show_aux_original_receipt(self, camera_id: str, payload: dict):
+        """Saved-original evidence is independent of the current preview detection."""
+        if self._review_images is not None or not self._accept_camera(camera_id):
+            return
+        if not all(field in payload for field in ('key', 'points', 'total', 'state', 'method')):
+            return
+        view = self._views.get(camera_id)
+        if view is not None:
+            view.set_original_receipt(payload)
+
+    def _clear_original_receipts(self):
+        for view in self._views.values():
+            view.set_original_receipt(None)
+
     @property
     def review_detection_origin(self):
         return self._review_detection_origin
 
     def show_review_images(self, key: str, images: Dict[str, np.ndarray], *, detections=None,
                            detection_origin='预览重检', corner_total=None, save_state=''):
+        self._clear_original_receipts()
         self._expanded_id = None
         self._review_images = {cid: frame for cid, frame in images.items() if self._accept_camera(cid)}
         self._review_key = key
@@ -661,6 +707,7 @@ class MultiStreamView(QWidget):
         if not enabled and not was_multimodal and not force_refresh:
             return
         if changed:
+            self._clear_original_receipts()
             self._cancel_review()
             if was_multimodal != enabled:
                 self._mode_trackers[was_multimodal] = self._trackers
@@ -797,6 +844,7 @@ class MultiStreamView(QWidget):
             self._show_static_images(images)
 
     def _show_static_images(self, images: Dict[str, np.ndarray]):
+        self._clear_original_receipts()
         visible_ids = set(images.keys()) - self._hidden_cameras
         visible_ids = {cid for cid in visible_ids if self._accept_camera(cid)}
         if self._multimodal_mode:
@@ -828,7 +876,11 @@ class MultiStreamView(QWidget):
 
             view.update_frame(display)
             suffix = f" | 预览角点 {result.num_corners}/{self._preview_corner_count}"
-            view.update_info(f"{w}x{h} | 离线图像{suffix}")
+            if self._multimodal_mode:
+                view.update_info(f'预览检测 {result.num_corners}/{self._preview_corner_count}'
+                                 f' | {w}x{h} | 离线图像')
+            else:
+                view.update_info(f"{w}x{h} | 离线图像{suffix}")
         if self._multimodal_mode:
             # Keep both roles visible even when only one offline image is available.
             for cid in self._multimodal_ids():
@@ -911,6 +963,7 @@ class MultiStreamView(QWidget):
             self._preview_frames.pop(camera_id, None)
 
     def reset_trackers(self):
+        self._clear_original_receipts()
         self._trackers.clear()
         self._mode_trackers.clear()
 
@@ -989,7 +1042,12 @@ class MultiStreamView(QWidget):
         suffix = f' | {source} {result.num_corners}/{self._preview_corner_count}'
         if not fresh:
             suffix += f' · {age * 1000:.0f}ms前（非本帧）'
-        view.update_info(f"{w}x{h} | {fps:.1f} fps{suffix}")
+        if self._multimodal_mode:
+            source_label = '本帧' if fresh else f'{age * 1000:.0f}ms前（非本帧）'
+            view.update_info(f'预览检测 {result.num_corners}/{self._preview_corner_count}'
+                             f' · {source_label} | {w}x{h} | {fps:.1f} fps')
+        else:
+            view.update_info(f"{w}x{h} | {fps:.1f} fps{suffix}")
 
     def _expire_preview_detections(self):
         if self._review_images is not None or not self.isVisible():

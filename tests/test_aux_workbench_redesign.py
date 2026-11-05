@@ -108,11 +108,11 @@ def test_actual_capture_waits_for_check_and_save_then_updates_next_step(
     assert panel._aux_capture_worker is not None
     assert '尚未确认保存' in guide.action.text()
     assert '暂勿重复采集' in guide.next_step.text()
-    assert '原图已保存 0 组' in guide.counts.text()
+    assert '会话已保存 0 组' in guide.counts.text()
     finish_aux_tasks(panel)
     assert panel._aux_saved_count == 1
     assert '等待本次' not in guide.next_step.text()
-    assert '原图已保存 1 组' in guide.counts.text()
+    assert '会话已保存 1 组' in guide.counts.text()
     assert '验收通过 0 组' in guide.counts.text()
 
 

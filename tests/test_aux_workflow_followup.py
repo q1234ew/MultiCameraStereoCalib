@@ -125,7 +125,7 @@ def test_real_offline_worker_preserves_source_not_session_copy(panel, tmp_path):
     worker.run()
     assert not failures
     assert len(panel._aux_pairs) == 3
-    assert '离线 3 组保留在源目录' in panel._lbl_raw_save.text()
+    assert '外部源目录 3 组（未复制）' in panel._lbl_raw_save.text()
     assert str(folder) in panel._lbl_raw_save.toolTip()
     assert panel._session.metadata.get('multimodal_frame_count', 0) == 0
     assert not list((panel._session.session_dir / 'multimodal').glob('*.png'))
@@ -135,7 +135,7 @@ def test_real_offline_worker_preserves_source_not_session_copy(panel, tmp_path):
 def test_import_without_session_never_claims_missing_source_photos(panel, tmp_path):
     panel._session = None
     import_pairs(panel, folder=str(tmp_path))
-    assert '离线 3 组保留在源目录' in panel._lbl_raw_save.text()
+    assert '外部源目录 3 组（未复制）' in panel._lbl_raw_save.text()
     assert '未落盘' not in panel._lbl_raw_save.text()
     assert panel._session is None
 
@@ -146,7 +146,7 @@ def test_capture_before_rgb_intrinsics_saves_raw_but_cannot_calibrate(panel, mon
     finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 1
     assert panel._aux_saved_count == 1
-    assert '实时原图已落盘 1 组' in panel._lbl_raw_save.text()
+    assert '会话已保存 1 组（历史 0 · 本次新增 1）' in panel._lbl_raw_save.text()
     assert '请先加载已完成的双目会话' in panel._aux_calibration_problem()
     assert not panel._btn_calib_aux.isEnabled()
     session = CalibrationSession.load(panel._session.session_dir)
@@ -212,12 +212,12 @@ def test_offline_then_live_counts_only_live_files_as_saved(panel, tmp_path, monk
     panel._on_capture_aux()
     finish_aux_tasks(panel)
     assert len(panel._aux_pairs) == 4
-    assert '离线 3 组' in panel._lbl_raw_save.text()
-    assert '实时原图已落盘 1 组' in panel._lbl_raw_save.text()
+    assert '外部源目录 3 组（未复制）' in panel._lbl_raw_save.text()
+    assert '会话已保存 1 组（历史 0 · 本次新增 1）' in panel._lbl_raw_save.text()
     assert panel._session.metadata['multimodal_frame_count'] == 1
     assert panel._aux_capture_sequence.done_count == 0  # Counts do not certify guided poses.
     import_pairs(panel, 2)
-    assert panel._aux_saved_count == 0
+    assert panel._aux_saved_count == 1  # Import does not erase existing session files.
     assert '实时原图已落盘' not in panel._lbl_raw_save.text()
     assert panel._session.metadata['multimodal_frame_count'] == 1  # Old photos are untouched.
 

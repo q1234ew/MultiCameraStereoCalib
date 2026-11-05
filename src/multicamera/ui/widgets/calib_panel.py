@@ -468,6 +468,7 @@ class CalibrationPanel(QWidget):
     calibration_reset = Signal()
     pointcloud_ready = Signal(object)
     frame_captured = Signal(str, object)
+    aux_original_checked = Signal(str, object)
     sequence_updated = Signal(object)
     images_imported = Signal(dict)  # {camera_id: np.ndarray}
     aux_images_imported = Signal(dict)
@@ -556,6 +557,9 @@ class CalibrationPanel(QWidget):
         self._aux_intrinsics: Optional[CameraIntrinsics] = None
         self._aux_capture_count = 0
         self._aux_saved_count = 0
+        self._aux_new_saved_indices = set()
+        self._aux_live_capture_active = False
+        self._aux_live_guidance_pairs = []
         self._aux_imported_count = 0
         self._aux_source_folder = None
         self._aux_offline_records = []
@@ -618,6 +622,8 @@ class CalibrationPanel(QWidget):
             and self._model_report_key == self._model_snapshot_key(assessment_name)
         )
         if session is not self._session:
+            self._aux_new_saved_indices.clear()
+            self._aux_live_guidance_pairs.clear()
             if self._failed_save_jobs:
                 raise RuntimeError('仍有原图保存失败，请重试保存或撤销对应采集后再切换会话')
             if self._session is not None and self.has_active_background_tasks():
@@ -709,6 +715,36 @@ class CalibrationPanel(QWidget):
             self._aux_guide.show_receipt_message(
                 f'会话已保存 {state["saved_pairs"]} 组融合原图\n可继续补拍；历史原图需逐对复核后纳入联合标定')
         self._refresh_aux_readiness()
+
+    @property
+    def aux_offline_review_mode(self):
+        return bool(self._aux_offline_records) and not self._aux_live_capture_active
+
+    @property
+    def aux_guidance_pairs(self):
+        # Historical admission does not verify a live guided pose.
+        return (self._aux_live_guidance_pairs if self._aux_live_capture_active
+                and self._aux_offline_records else self._aux_pairs)
+
+    def set_live_sources_active(self, active):
+        if self._aux_live_capture_active == bool(active):
+            return
+        self._aux_live_capture_active = bool(active)
+        self._aux_guide.invalidate_live()
+        self._aux_guide.data_changed()
+        self._apply_workflow_layout()
+        self._refresh_aux_readiness()
+
+    def aux_storage_text(self):
+        total = self._aux_saved_count
+        added = min(total, len(self._aux_new_saved_indices))
+        text = f'会话已保存 {total} 组（历史 {total-added} · 本次新增 {added}）'
+        source = self._aux_source_folder
+        session_folder = self._session.session_dir / 'multimodal' if self._session else None
+        if self._aux_imported_count and (source is None or session_folder is None
+                or Path(source).resolve() != session_folder.resolve()):
+            text += f' · 外部源目录 {self._aux_imported_count} 组（未复制）'
+        return text
 
     @property
     def has_failed_saves(self) -> bool:
@@ -2201,7 +2237,7 @@ class CalibrationPanel(QWidget):
         for widget in (self._aux_task_labels['capture'], self._aux_task_values['capture']):
             widget.setVisible(not (auxiliary and capture))
         self._footer_info.setVisible(capture)
-        self._aux_seq_widget.setVisible(auxiliary and capture and not self._aux_offline_records)
+        self._aux_seq_widget.setVisible(auxiliary and capture and not self.aux_offline_review_mode)
         self._aux_guide.setVisible(auxiliary and capture)
         self._aux_guide.details.setVisible(auxiliary and capture)
         self._check_aux_order.setVisible(auxiliary and not capture and not result)
@@ -2551,16 +2587,13 @@ class CalibrationPanel(QWidget):
             self._lbl_raw_save.setToolTip(str(self._offline_source_folder or '导入目录；原文件不修改'))
             self._lbl_raw_save.setStyleSheet(f"font-size:12px; color:{TEXT_DIM}; background:transparent;")
         if self._active_step == 2 and (self._aux_images or self._aux_imported_count):
-            parts = []
             paths = []
             if self._aux_imported_count:
-                parts.append(f'离线 {self._aux_imported_count} 组保留在源目录')
                 paths.append(str(self._aux_source_folder or '导入源目录；未复制到会话'))
             if self._aux_saved_count:
-                parts.append(f'实时原图已落盘 {self._aux_saved_count} 组')
                 if self._session is not None:
                     paths.append(str(self._session.session_dir / self._session.MULTIMODAL_DIR))
-            self._lbl_raw_save.setText(' · '.join(parts) or '原图仅在内存中，未确认落盘')
+            self._lbl_raw_save.setText(self.aux_storage_text())
             self._lbl_raw_save.setToolTip('\n'.join(paths))
         self._refresh_workflow_guidance()
 
@@ -4165,7 +4198,8 @@ class CalibrationPanel(QWidget):
                 self._aux_guide.show_receipt_message(f'{idx} · 原图保存失败\n未计入验收和引导，请重新采图')
                 self._refresh_aux_readiness()
                 return
-            self._aux_saved_count += 1
+            self._aux_saved_count = self._session.multimodal_resume_state()['saved_pairs']
+            self._aux_new_saved_indices.add(disk_index)
             try:
                 self._session.save_multimodal_review(disk_index, review)
             except Exception as exc:
@@ -4173,6 +4207,14 @@ class CalibrationPanel(QWidget):
                 reasons.append('验收记录写入失败，原图保留但未计入：' + str(exc).splitlines()[0])
                 review.update(state='待复核', reasons=reasons)
         self._aux_images.append((rgb_frame.copy(), aux_frame.copy()))
+        if admitted:
+            self._aux_live_guidance_pairs.append((idx, deepcopy(rgb_det), deepcopy(aux_det)))
+        if self._session is not None:
+            for cid, det in zip((rgb_left_id, pending['aux_id']), (rgb_det, aux_det)):
+                self.aux_original_checked.emit(cid, dict(key=idx, points=det.num_points,
+                    total=board_cfg.cols * board_cfg.rows,
+                    state='验收通过' if admitted else '待复核',
+                    method=det.detection_info.get('method', '未记录')))
         self._aux_quality_records.append(review)
         if admitted:
             with QSignalBlocker(self._check_aux_order):
@@ -4284,6 +4326,7 @@ class CalibrationPanel(QWidget):
         self._aux_images.clear()
         self._aux_reviews.clear()
         self._aux_quality_records.clear()
+        self._aux_live_guidance_pairs.clear()
         self._aux_capture_count = 0
         self._aux_saved_count = 0
         self._aux_imported_count = len(img_pairs)
@@ -4333,8 +4376,9 @@ class CalibrationPanel(QWidget):
             self.aux_images_imported.emit({rgb_left_id: rgb, aux_id: aux})
         self._log(f"多模态导入完成：验收通过 {valid}/{len(img_pairs)} 组；引导采用待分析")
         self._log('离线原图保留在源目录，未复制到会话；导入不自动确认引导姿态')
-        if getattr(worker, 'auto_restore', False):
+        if self._session is not None:
             self.restore_saved_aux_progress()
+        if getattr(worker, 'auto_restore', False):
             self._log('已自动读取会话融合原图；历史结果保留，逐对对应尚未确认，不自动纳入联合求解')
         if self._aux_offline_records:
             self._check_aux_order.setEnabled(False)
@@ -4971,7 +5015,7 @@ class CalibrationPanel(QWidget):
             'calibration': ('等待白平衡' if self._white_balance_guard.busy else '处理中' if busy else '已就绪' if not problem else '先加载双目结果' if not intrinsics_ready else '数据待就绪',
                             SUCCESS if not problem and not busy else WARNING),
         }
-        if self._aux_offline_records:
+        if self.aux_offline_review_mode:
             summary['capture'] = ('离线图像 · 同步未验证', TEXT_DIM)
         elif review_saved and intrinsics_ready and not busy:
             summary['calibration'] = ('待逐对复核', WARNING)
@@ -4981,7 +5025,7 @@ class CalibrationPanel(QWidget):
             summary['calibration'] = ('已有融合结果 · 待实物验证', WARNING)
             calibration_status = '已读取保存的融合结果；重新求解仍需逐对复核。' + calibration_status
         self._lbl_aux_readiness.setText(f"{capture_status}\n{calibration_status}")
-        self._aux_task_labels['capture'].setText('数据来源' if self._aux_offline_records else '视频配对')
+        self._aux_task_labels['capture'].setText('数据来源' if self.aux_offline_review_mode else '视频配对')
         for key, (text, color) in summary.items():
             value = self._aux_task_values[key]
             if value.text() != text:
@@ -5238,6 +5282,9 @@ class CalibrationPanel(QWidget):
         self._aux_offline_reviews = {}
         self._aux_offline_confirmations = {}
         self._rgb_result_provenance = {}
+        self._aux_new_saved_indices.clear()
+        self._aux_live_guidance_pairs.clear()
+        self._aux_live_capture_active = False
         self._historical_aux_results = {}
         self._check_aux_order.setEnabled(True)
         self._aux_observation_board = None

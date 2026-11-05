@@ -388,7 +388,7 @@ class AuxCaptureGuide(QWidget):
         if (self._key != key and self._progress_requested != key
                 and self._progress_worker is None):
             progress = AuxGuidanceProgressWorker(key, deepcopy(self.panel._aux_board_config()),
-                deepcopy(self.panel._aux_pairs), deepcopy(tuple(
+                deepcopy(self.panel.aux_guidance_pairs), deepcopy(tuple(
                     supplied if supplied is not None else previous
                     for supplied, previous in zip(intrinsics, self._refined_intrinsics))))
             self._progress_worker, self._progress_requested = progress, key
@@ -396,7 +396,7 @@ class AuxCaptureGuide(QWidget):
             self._progress_pool.start(progress)
         if self._refined_key != key and self._worker is None:
             worker = AuxGuidanceWorker(key, deepcopy(self.panel._aux_board_config()),
-                self.panel._camera_model, deepcopy(self.panel._aux_pairs),
+                self.panel._camera_model, deepcopy(self.panel.aux_guidance_pairs),
                 deepcopy(intrinsics))
             self._worker, self._requested = worker, key
             self._analysis_error = ''
@@ -458,7 +458,7 @@ class AuxCaptureGuide(QWidget):
 
     def _announce_progress(self, analysis):
         record = self._receipt_record
-        if record is None or self.panel._aux_offline_records:
+        if record is None or self.panel.aux_offline_review_mode:
             return
         decision = analysis.sample_decisions.get(record['key'])
         if decision not in ('included', 'duplicate'):
@@ -478,7 +478,7 @@ class AuxCaptureGuide(QWidget):
         self.panel._log(f'{record["key"]}: {reason}；{adopted}；{next_step}')
 
     def render(self):
-        if self.panel._aux_offline_records:
+        if self.panel.aux_offline_review_mode:
             self._set_phase_color(ACCENT)
             self.phase.setText(f'离线候选复核 · 已确认 {len(self.panel._aux_pairs)} 组')
             self.action.setText('逐对确认原图质量与物理角点对应；历史稳定性和同步不由离线复核证明')
@@ -656,7 +656,7 @@ class AuxCaptureGuide(QWidget):
             unique = pose_count = '分析失败'
         unique_text = f'{unique} 组' if isinstance(unique, int) else unique
         label = '离线确认' if self.panel._aux_offline_records else '验收通过'
-        self.counts.setText(f'原图已保存 {self.panel._aux_saved_count} 组 · 源目录 {self.panel._aux_imported_count} 组\n'
+        self.counts.setText(self.panel.aux_storage_text() + '\n' +
                             f'{label} {len(self.panel._aux_pairs)} 组 · 引导采用 {unique_text}')
         self.counts.setToolTip(
             self.counts.text() + f'\n双路检测有效 {detected} 组 · 双路姿态可解 {pose_count} 组\n'
@@ -718,7 +718,7 @@ class AuxCaptureGuide(QWidget):
             stable = not self.stability_reasons(detections)
             statuses['stability'] = ('连续检测稳定' if stable else '保持静止，等待稳定',
                                      SUCCESS if stable else WARNING)
-        if panel._aux_offline_records:
+        if panel.aux_offline_review_mode:
             statuses = {'board': ('离线原图检测', TEXT_DIM),
                         'quality': (f'逐对确认 {len(panel._aux_pairs)} 组', TEXT_DIM),
                         'stability': ('离线未验证', WARNING), 'pairing': ('离线未验证同步', WARNING)}
@@ -741,7 +741,7 @@ class AuxCaptureGuide(QWidget):
             planned = self.analysis.target
             target = CaptureTarget(planned.row, planned.col, TILTS[planned.tilt],
                                    scale=planned.scale)
-        if self.panel._aux_offline_records:
+        if self.panel.aux_offline_review_mode:
             goal = '离线原图 · 不计为实时引导姿态完成'
         elif self.reviewing:
             goal = '目标：回看原图，实时目标暂停'
@@ -773,7 +773,7 @@ class AuxCaptureGuide(QWidget):
         if panel._aux_live_gate.waiting:
             return ('已请求采集；保持整板可见并静止，双路稳定后自动取本次原图；可取消',
                     panel._aux_live_gate.reason or '双路稳定，正在取图')
-        if panel._aux_offline_records and not panel._aux_operation_busy():
+        if panel.aux_offline_review_mode and not panel._aux_operation_busy():
             problem = panel._aux_calibration_problem()
             if panel._rgb_left_camera_id() not in panel._intrinsics:
                 return '加载匹配的 RGB 标定结果，或先完成 RGB 双目标定', None

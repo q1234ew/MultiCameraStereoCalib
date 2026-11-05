@@ -234,3 +234,19 @@ def test_test_workers_are_excluded_from_both_packaged_variants():
     for variant in (exclusions.body, exclusions.orelse):
         names = ast.literal_eval(variant)
         assert all(name in names for name in ('pytest', 'xdist', 'execnet'))
+
+
+def test_workflow_publisher_receives_identity_notes_and_all_verified_assets():
+    workflow = (ROOT / '.github/workflows/build-windows.yml').read_text(encoding='utf-8')
+    publish = workflow.split('- name: Publish Windows Release')[1]
+    assert 'scripts/publish_windows_release.py' in publish
+    assert '"--commit", $env:GITHUB_SHA, "--run-id", $env:GITHUB_RUN_ID' in publish
+    assert '"--repo", $env:GH_REPO, "--tag", $tag' in publish
+    assert '"--title", $title, "--notes-file", $notesPath, "--attempts", "4"' in publish
+    assert 'if ($prerelease) { $publishArgs += "--prerelease" }' in publish
+    assert '$publishArgs += @("--assets") + $assetPaths' in publish
+    assert '$releaseUrl = python @publishArgs' in publish
+    assert 'if ($LASTEXITCODE -ne 0) { throw "Could not safely publish Windows Release" }' in publish
+    assert publish.index('Get-FileHash') < publish.index('scripts/publish_windows_release.py')
+    assert 'gh release view' not in publish and 'gh release upload' not in publish
+    assert '--clobber' not in publish
