@@ -13,6 +13,7 @@ from ..board.detector import CharucoDetector, DetectionResult
 from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel
 from .observations import prepare_observation, similar_composition
+from .solver_settings import PINHOLE_CALIBRATION_CRITERIA
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,7 @@ class IntrinsicCalibrator:
             None,
             None,
             flags=flags,
+            criteria=PINHOLE_CALIBRATION_CRITERIA,
         )
         logger.info("Pinhole intrinsic RMS: %.4f", rms)
 

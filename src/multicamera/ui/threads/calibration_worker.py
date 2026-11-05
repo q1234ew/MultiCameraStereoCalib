@@ -150,6 +150,10 @@ class PairCalibrationWorker(QThread):
                     f"同 ID 校正残差：{rectification['axis']}，{rectification['point_count']} 点，"
                     f"RMS={rectification['rms_px']} px（训练集，非独立验证）"
                 )
+            if hasattr(self, 'review_info'):
+                info['review'] = deepcopy(self.review_info)
+                info['review']['image_coverage'] = [cal.compute_image_coverage() if cal else None
+                                                    for cal in (left_cal, right_cal)]
             pair_calib = StereoPairCalibration(
                 pair_name=self.pair_name,
                 left_id=self.left_id,

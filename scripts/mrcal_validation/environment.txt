@@ -1,0 +1,15 @@
+# Exact isolated validation environment, macOS ARM64 / CPython 3.12.7.
+gnuplotlib==0.47
+iniconfig==2.3.1
+mrcal==2.5.2.post1
+numpy==2.5.4
+numpysane==0.45
+opencv-python-headless==4.13.0.92
+packaging==26.3
+pluggy==1.7.0
+pyfltk==1.4.5.0
+Pygments==2.21.0
+pytest==9.1.1
+PyYAML==6.0.3
+scipy==1.18.1
+shapely==2.2.0

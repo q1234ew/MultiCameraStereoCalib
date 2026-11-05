@@ -184,6 +184,28 @@ class CalibrationSession:
         folder.mkdir(parents=True, exist_ok=True)
         self._atomic_json(folder / f'quality_{frame_idx:04d}.json', review)
 
+    def load_improvement(self, scope: str) -> dict | None:
+        """Read decisions without changing admission evidence or source images."""
+        path = self.session_dir / 'review' / f'{self._review_scope(scope)}.json'
+        if not path.exists():
+            return None
+        from ..calibration.review import validate_state
+        return validate_state(json.loads(path.read_text(encoding='utf-8')))
+
+    def save_improvement(self, scope: str, state: dict) -> None:
+        from ..calibration.review import validate_state
+        validate_state(state)
+        folder = self.session_dir / 'review'
+        with self._io_lock:
+            folder.mkdir(exist_ok=True)
+            self._atomic_json(folder / f'{self._review_scope(scope)}.json', state)
+
+    @staticmethod
+    def _review_scope(scope: str) -> str:
+        if len(scope) != 64 or any(ch not in '0123456789abcdef' for ch in scope):
+            raise ValueError('无效图像复核范围')
+        return scope
+
     def delete_saved_pair_frame(self, pair_name: str, frame_idx: int) -> bool:
         """删除某组指定索引的左右 PNG；并依据磁盘重新计算 ``frame_count``。"""
         pair_dir = self.session_dir / self.IMAGES_DIR / pair_name

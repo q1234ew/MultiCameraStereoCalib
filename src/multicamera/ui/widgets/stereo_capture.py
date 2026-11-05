@@ -266,10 +266,20 @@ class StereoCaptureWorkspace(QWidget):
                tuple((id(c), c.data_revision if c else 0) for c in cals),
                tuple(self.panel._live_preview_indices.get(name, [])), intr_key,
                tuple(sorted(self.panel._guidance_failed_saves)))
+        try:
+            excluded = self.panel._review_excluded(name)
+        except (ValueError, OSError) as exc:
+            self._guidance_error = '图像参与记录不可用：' + str(exc)
+            return None, None
+        key += (tuple(sorted(excluded)),)
         return key, (name, ids, cals)
 
     def _request_guidance(self):
-        key, context = self._guidance_context()
+        try:
+            key, context = self._guidance_context()
+        except (ValueError, OSError) as exc:
+            self._guidance_error = '图像参与记录不可用：' + str(exc)
+            return None
         if key is None:
             return None
         if (self._guidance_worker is not None or self._requested_key == key
@@ -278,8 +288,11 @@ class StereoCaptureWorkspace(QWidget):
             return key
         name, ids, cals = context
         observations = {cid: [] for cid in ids}
+        excluded = self.panel._review_excluded(name)
         failed = self.panel._guidance_failed_saves
         for li, ri, source in self.panel._live_preview_indices.get(name, []):
+            if str(source) in excluded:
+                continue
             if (id(self.panel._session), name, str(source)) in failed:
                 continue
             if any(cal is None or i >= cal.num_frames for cal, i in zip(cals, (li, ri))):
@@ -318,7 +331,12 @@ class StereoCaptureWorkspace(QWidget):
         self.refresh()
 
     def _target(self):
-        key, _ = self._guidance_context()
+        if self.panel._review_task is not None:
+            return self.panel._review_task['target']
+        try:
+            key, _ = self._guidance_context()
+        except (ValueError, OSError):
+            return None
         if self.adaptive and key is not None and self._distance_override:
             return self._adaptive_sequence.current
         if self.adaptive and key is not None and self._analysis_key == key and self._analysis:
@@ -357,8 +375,17 @@ class StereoCaptureWorkspace(QWidget):
             target.scale, [dict(sample, pose=pose) for sample, pose in zip(samples, poses)])
         return ready, text
 
+    def _positions_aligned(self, samples, target):
+        task = self.panel._review_task
+        centers = task.get('reference_centers') if task and task['target'] is target else None
+        centers = centers or [(target.norm_cx, target.norm_cy)] * len(samples)
+        return len(samples) == len(centers) and all(
+            center is not None and np.linalg.norm(sample['center'] - center) < .16
+            for sample, center in zip(samples, centers))
+
     def _adaptive_aligned(self, pairs, samples, target):
-        feasible = (self._distance_available(self._distance_override) if self._distance_override else
+        feasible = (True if self.panel._review_task else
+                    self._distance_available(self._distance_override) if self._distance_override else
                     self._analysis is None or self._analysis.recommendation.feasible)
         if not feasible:
             return False, '无可用构图，请调整分辨率或标定板'
@@ -367,8 +394,7 @@ class StereoCaptureWorkspace(QWidget):
         distance_ready, distance_message = self._distance_status(pairs, samples, target)
         if not distance_ready:
             return False, distance_message
-        if not all(np.linalg.norm(s['center'] - (target.norm_cx, target.norm_cy)) < .16
-                   for s in samples):
+        if not self._positions_aligned(samples, target):
             return False, '位置待对齐'
         poses = [self._pose_measurement(camera.camera_id, sample)
                  for pair, offset in zip(pairs, range(0, len(samples), 2))
@@ -495,7 +521,10 @@ class StereoCaptureWorkspace(QWidget):
         cals = [self.panel._intr_cals.get(c.camera_id) for c in (pair.left, pair.right)]
         if any(c is None for c in cals):
             return None
+        excluded = self.panel._review_excluded(pair.name)
         for li, ri, source in reversed(self.panel._live_preview_indices.get(pair.name, [])):
+            if str(source) in excluded:
+                continue
             if (id(self.panel._session), pair.name, str(source)) in self.panel._guidance_failed_saves:
                 continue
             if any(i >= cal.num_frames for i, cal in zip((li, ri), cals)):
@@ -512,6 +541,8 @@ class StereoCaptureWorkspace(QWidget):
                     pair, [s['detection'] for s in samples[2 * offset:2 * offset + 2]])) is not None]
 
     def auto_ready(self):
+        if self.panel._review_task is not None:
+            return False
         if (self.panel._pending_save_tokens or self.panel._failed_save_jobs or self.panel._save_workers
                 or self.panel._save_queue or self.panel._model_worker or self.panel._calib_worker
                 or self.panel._stereo_import_worker or self.panel._aux_dataset_busy()):
@@ -541,6 +572,37 @@ class StereoCaptureWorkspace(QWidget):
             and all(self.panel._sm.get_sync_pair(name) is not None
                     for name in self.panel._selected_pairs())
         )
+
+    def validate_review_capture(self, name, left, right, det_left, det_right):
+        task = self.panel._review_task
+        if not task or task['name'] != name or task['candidate']:
+            return False, '补拍任务已变化或已有新图待确认'
+        if task['scope'] != self.panel._review_scope(name):
+            return False, '相机或标定板配置已变化'
+        pair = self.panel._sm.stereo_pairs[name]
+        samples = [self._detection_sample(det, image) for det, image in
+                   ((det_left, left), (det_right, right))]
+        if not all(sample['valid'] and sample.get('sharp') for sample in samples):
+            return False, '双路原图角点或清晰度不足'
+        if self.panel._sm.get_sync_pair(name) is None:
+            return False, '未满足软件时间配对'
+        target = task['target']
+        if not self._positions_aligned(samples, target):
+            return False, '原图位置偏离补拍区域'
+        distance_ready, message = self._distance_status([pair], samples, target)
+        if not distance_ready:
+            return False, message
+        poses = [self._pose_measurement(camera.camera_id, sample)
+                 for camera, sample in zip((pair.left, pair.right), samples)]
+        if all(pose is not None for pose in poses):
+            references = task.get('reference_poses')
+            if references and all(reference is not None for reference in references):
+                matches = all(abs(pose[key] - reference[key]) <= 12
+                              for pose, reference in zip(poses, references)
+                              for key in ('yaw', 'pitch'))
+                return matches, '倾角接近旧图' if matches else '请调整到旧图的左右倾和上下倾范围'
+            return self._adaptive_aligned([pair], samples, target)
+        return True, '位置与板面占比接近目标；倾角需人工确认'
 
     def validate_capture(self, name, left, right, det_left, det_right):
         """Recheck already-detected raw images before any observation or save mutation."""
@@ -645,7 +707,8 @@ class StereoCaptureWorkspace(QWidget):
         if (self.panel._model_worker or self.panel._calib_worker or self.panel._stereo_import_worker
                 or self.panel._aux_dataset_busy()):
             return 'preparation', '保持当前位置，等待当前任务完成', 'hold'
-        feasible = (self._distance_available(self._distance_override) if self._distance_override else
+        feasible = (True if self.panel._review_task else
+                    self._distance_available(self._distance_override) if self._distance_override else
                     self._analysis.recommendation.feasible)
         if not feasible:
             return 'blocked', '当前距离构图不可用，请检查分辨率和标定板', 'hold'
@@ -834,8 +897,39 @@ class StereoCaptureWorkspace(QWidget):
             self.status.setText(f'已加载 {loaded} 对\n\n' + self.panel._lbl_capture_count.text())
             self.status.setStyleSheet(f'color:{TEXT_DIM};')
             self.advice.hide()
+        task = self.panel._review_task
+        self.pair.setEnabled(task is None)
+        self.guide_mode.setEnabled(not offline and task is None)
+        if task and not self.view.review_key:
+            target = task['target']
+            self.distance_tools.hide()
+            self.panel._seq_widget.hide()
+            self.view.set_capture_sequence(CaptureSequence([target]))
+            self.instruction.setText('定向补拍 · ' + target.label)
+            source = '替换 ' + task['source'] if task['source'] else '补充构图'
+            self.reason.setText(source + ' · ' + DISTANCE_LABELS[target.scale]
+                                + (' · 新图已采集，等待保存并确认' if task['candidate'] else ''))
+            references = task.get('reference_poses')
+            if references and all(reference is not None for reference in references):
+                reference = references[0]
+                self.pose_status.setText(
+                    f'旧左图参考：左右倾 {reference["yaw"]:+.1f}° / '
+                    f'上下倾 {reference["pitch"]:+.1f}°')
+                self.pose_status.setToolTip('原图验收分别比较左右旧图倾角，允许每个方向相差12°；不代表精度合格')
+            else:
+                self.pose_status.setText('倾角：需人工核对；仅自动检查位置和板面占比')
+            self.advice.setText('旧图保持原状态；新图原图验收并保存后，再确认参与。')
+            self.advice.show()
+            self.schematic.set_target(target, active=True, instruction=self.instruction.text())
         cameras = (("左目", pairs[0].left), ("右目", pairs[0].right)) if pairs else []
         cals = [(label, self.panel._intr_cals.get(camera.camera_id)) for label, camera in cameras]
+        if len(self.panel._selected_pairs()) == 1:
+            name = next(iter(self.panel._selected_pairs()))
+            try:
+                effective = self.panel._effective_pair_calibrators(name)
+                cals = [(label, cal) for (label, _), cal in zip(cals, effective[:2])]
+            except (ValueError, OSError):
+                cals = [(label, None) for label, _ in cals]
         coverage_key = tuple((label, id(cal), cal.data_revision if cal else 0)
                              for label, cal in cals)
         if coverage_key != self._coverage_key:

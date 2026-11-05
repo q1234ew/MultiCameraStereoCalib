@@ -14,6 +14,7 @@ from ..board.detector import CharucoDetector, DetectionResult
 from ..perf import perf_timer
 from .models import CameraIntrinsics, CameraModel, StereoCalibResult
 from .observations import prepare_observation
+from .solver_settings import PINHOLE_CALIBRATION_CRITERIA
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +204,10 @@ class StereoCalibrator:
             np.array(right.dist_coeffs, dtype=np.float64, copy=True),
             self._image_size,
             flags=flags,
+            criteria=PINHOLE_CALIBRATION_CRITERIA,
         )
-        logger.info("Pinhole stereo RMS: %.4f", rms)
+        logger.info("Pinhole stereo RMS: %.4f flags=%d criteria=%s",
+                    rms, flags, PINHOLE_CALIBRATION_CRITERIA)
 
         result = StereoCalibResult(
             R=R, T=T, E=E, F=F, rms_error=rms, model=CameraModel.PINHOLE

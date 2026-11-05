@@ -1,0 +1,6 @@
+# Separate offline environment; do not add these to application dependencies.
+mrcal==2.5.2.post1
+opencv-python-headless==4.13.0.92
+numpy==2.5.4
+scipy==1.18.1
+pytest==9.1.1
