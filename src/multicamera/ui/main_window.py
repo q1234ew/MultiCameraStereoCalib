@@ -223,6 +223,7 @@ class MainWindow(QMainWindow):
         workspace.addWidget(self._capture_bottom)
         self._calib_panel._capture_readiness = self._stereo_capture.auto_ready
         self._calib_panel._capture_validator = self._stereo_capture.validate_capture
+        self._calib_panel._review_capture_validator = self._stereo_capture.validate_review_capture
         self._capture_layout_active = False
         self._capture_section_layout = self._calib_panel._sections[0].parentWidget().layout()
         self._capture_section_index = self._capture_section_layout.indexOf(self._calib_panel._sections[0])
