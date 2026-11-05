@@ -452,11 +452,16 @@ def test_timeout_is_uncertain_network_failure_and_missing_gh_is_fatal(monkeypatc
         release.GhApi().request('GET', 'endpoint')
 
 
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+@pytest.mark.parametrize('bom', ['', '\ufeff'])
 def test_cli_success_outputs_only_verified_url_and_handles_bom_notes(case, tmp_path, monkeypatch,
-                                                                  capsys):
+                                                                  capsys, newline, bom):
     publisher, api, _, options = case
     notes = tmp_path / 'notes.md'
-    notes.write_text('\ufeffRelease notes\r\n', encoding='utf-8')
+    raw_notes = (bom + 'Release notes' + newline).encode('utf-8')
+    # Write exact fixture bytes: Windows text mode would expand CRLF into CRCRLF.
+    notes.write_bytes(raw_notes)
+    assert notes.read_bytes() == raw_notes
     monkeypatch.setattr(release, 'GhApi', lambda timeout: api)
     args = ['--repo', 'owner/project', '--tag', publisher.tag, '--commit', COMMIT,
             '--title', publisher.title, '--notes-file', str(notes), '--run-id', '38',
