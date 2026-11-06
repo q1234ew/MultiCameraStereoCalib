@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import platform
-import resource
 import secrets
 import time
 from pathlib import Path
@@ -13,6 +12,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 from aiohttp import ClientError, web
+
+try:
+    import resource
+except ImportError:  # Windows can validate the service without Linux resource telemetry.
+    resource = None
 
 RGB_KEYS = {'brightness', 'contrast', 'saturation', 'gain', 'white_balance_automatic',
             'white_balance_temperature', 'sharpness', 'auto_exposure',
@@ -184,6 +188,7 @@ class CameraSettings:
             'orin':{'hostname':platform.node(),'machine':platform.machine(),
                     'python':platform.python_version(),'opencv':cv2.__version__,
                     'uptime_s':round(time.monotonic()-self.started),
-                    'preview_max_rss_kb':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss},
+                    'preview_max_rss_kb':(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                                          if resource is not None else None)},
             'model':gpu,'devices':await asyncio.gather(
                 *(self.device_status(d) for d in self.config['devices']))}

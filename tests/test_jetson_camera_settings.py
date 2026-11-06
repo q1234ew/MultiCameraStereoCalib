@@ -1,6 +1,7 @@
 """Camera write allowlist, CSRF checks and read-back contracts, without hardware writes."""
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -8,8 +9,19 @@ from aiohttp.test_utils import TestClient, TestServer
 from scripts.jetson.camera_settings import CameraSettings, validate_ir, validate_rgb
 from scripts.jetson.core import load_config
 from scripts.jetson.preview import make_preview_app
+from scripts.jetson import camera_settings
 
 ROOT=Path(__file__).resolve().parents[1]
+
+
+def test_status_without_resource_telemetry(monkeypatch, tmp_path):
+    monkeypatch.setattr(camera_settings, 'resource', None)
+    stereo = SimpleNamespace(predictor=SimpleNamespace(process=None, identity=None), tasks={})
+    settings = CameraSettings({'devices': []}, None, stereo, tmp_path)
+    result = asyncio.run(settings.status_data())
+    assert result['orin']['preview_max_rss_kb'] is None
+    assert result['model']['state'] == 'not_loaded'
+
 
 
 def controls():

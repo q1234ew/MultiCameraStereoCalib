@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tarfile
@@ -65,7 +66,16 @@ def test_service_package_is_isolated_and_hash_complete(candidate, elf, tmp_path)
         packager.prepare(candidate, elf, out, 'service.20261105.1')
 
 
-def test_dashboard_patch_preserves_original_and_has_rollback(candidate, elf, tmp_path):
+@pytest.mark.parametrize('template_newline', [b'\n', b'\r\n'])
+def test_dashboard_patch_preserves_original_and_has_rollback(
+        candidate, elf, tmp_path, monkeypatch, template_newline):
+    template_root = tmp_path / 'templates'
+    template_dir = template_root / 'packaging/rv1126b'
+    shutil.copytree(ROOT / 'packaging/rv1126b', template_dir)
+    for name in ('dashboard-entry.html', 'dashboard-bootstrap.html'):
+        content = (ROOT / 'packaging/rv1126b' / name).read_bytes().replace(b'\r\n', b'\n')
+        (template_dir / name).write_bytes(content.replace(b'\n', template_newline))
+    monkeypatch.setattr(packager, 'ROOT', template_root)
     original = tmp_path / 'index.html'
     data = b'<!doctype html>\r\n<html><head></head><body><main>Existing dashboard</main></body></html>'
     original.write_bytes(data)
@@ -73,8 +83,8 @@ def test_dashboard_patch_preserves_original_and_has_rollback(candidate, elf, tmp
     packager.prepare(candidate, elf, out, 'service.1', dashboard_original=original)
     assert original.read_bytes() == (out / 'dashboard-original.html').read_bytes() == data
     patched = (out / 'dashboard.html').read_bytes()
-    entry = (ROOT / 'packaging/rv1126b/dashboard-entry.html').read_bytes()
-    bootstrap = (ROOT / 'packaging/rv1126b/dashboard-bootstrap.html').read_bytes()
+    entry = (template_dir / 'dashboard-entry.html').read_bytes()
+    bootstrap = (template_dir / 'dashboard-bootstrap.html').read_bytes()
     bootstrap = bootstrap.replace(b'@LEFT_PORT@', b'8080').replace(b'@RIGHT_PORT@', b'8082')
     assert patched.replace(entry + b'\n', b'').replace(bootstrap + b'\n', b'') == data
     assert hashlib.sha256(data).hexdigest() in (out / 'rollback.sh').read_text()

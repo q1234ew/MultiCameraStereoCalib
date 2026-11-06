@@ -8,7 +8,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import cv2
 import numpy as np
@@ -49,7 +49,9 @@ def load_config(path: Path) -> dict:
             raise ValueError("Candidate translations must be millimeters")
         if not re.fullmatch(r"[0-9a-f]{64}", device["calibration_sha256"]):
             raise ValueError("Calibration SHA256 required")
-        if not Path(device["calibration_path"]).is_absolute():
+        # Deployment paths use Linux syntax even when validated on a Windows host.
+        calibration_path = device["calibration_path"]
+        if not (Path(calibration_path).is_absolute() or PurePosixPath(calibration_path).is_absolute()):
             raise ValueError("Absolute calibration path required")
         if set(device["raw_ports"]) != {"left", "right", "ir"}:
             raise ValueError("Three raw roles required")

@@ -254,6 +254,7 @@ jobs:
             "Fixes: transactional session switching, metadata snapshot consistency, auxiliary parameter isolation, and explicit RGB+IR corner-order review with convergence and holdout validation retained.",
             "Calibration updates: reversible detector grid numbering, per-training-fold automatic cross-modal correspondence, weak single-view PnP diagnostics without false vetoes, and separate input-attestation/final-order evidence.",
             "Workflow updates: explicit offline/online session opening, restored live guidance after historical reload, separate historical/new capture counts, and independent preview/original-image detection receipts. Release publication retries transient failures without replacing published assets.",
+            "Windows validation fixes: Jetson Linux-path validation on Windows, optional resource telemetry, and byte-preserving LF/CRLF dashboard templates. Includes the integrated main calibration image review, replacement and recalibration workflow.",
             "Changes: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/docs/CHANGELOG.md",
             "Known limitations: self-tests do not establish hardware calibration accuracy or replace physical camera/UI checks on the target Windows device.",
             "RGB+auxiliary joint results are candidates pending physical validation; per-pair input declarations do not physically verify the algorithm's final correspondence. Recorded-stream replay does not verify real-device white balance or synchronization.",

@@ -34,6 +34,7 @@ def test_candidate_configuration():
     ("physical_binding_verified", "true"), ("source_session", "unknown"),
     ("raw_ports", {"left": 8090, "right": 8080, "ir": 8081}),
     ("resolution", {"left": [1280, 720]}),
+    ("calibration_path", "relative/calibration.yml"),
 ])
 def test_reject_invalid_binding(tmp_path, field, value):
     config = json.loads(CONFIG.read_text())

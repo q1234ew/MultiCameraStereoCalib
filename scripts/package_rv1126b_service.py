@@ -70,9 +70,9 @@ def patch_dashboard(text: str, left_port: int, right_port: int) -> str:
     parser.close()
     if len(parser.heads) != 1 or len(parser.bodies) != 1:
         raise ValueError('Dashboard head/body is missing or ambiguous')
-    bootstrap = (ROOT / 'packaging/rv1126b/dashboard-bootstrap.html').read_text(encoding='utf-8')
+    bootstrap = (ROOT / 'packaging/rv1126b/dashboard-bootstrap.html').read_bytes().decode('utf-8')
     bootstrap = bootstrap.replace('@LEFT_PORT@', str(left_port)).replace('@RIGHT_PORT@', str(right_port))
-    entry = (ROOT / 'packaging/rv1126b/dashboard-entry.html').read_text(encoding='utf-8')
+    entry = (ROOT / 'packaging/rv1126b/dashboard-entry.html').read_bytes().decode('utf-8')
     for offset, snippet in sorted([(parser.heads[0], bootstrap), (parser.bodies[0], entry)], reverse=True):
         text = text[:offset] + snippet + '\n' + text[offset:]
     return text
