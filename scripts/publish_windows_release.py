@@ -240,7 +240,18 @@ class Publisher:
                 return self._owned(existing)
             failure = None
             try:
-                self.api.request('POST', f'{self.base}/releases', payload=payload)
+                created = self._owned(self.api.request('POST', f'{self.base}/releases',
+                                                       payload=payload))
+                # A successful create supplies the authoritative ID. List/tag reads can
+                # lag behind it; never issue another create after a successful response.
+                for read_attempt in range(1, self.attempts + 1):
+                    visible = self._get(f'{self.base}/releases/{created["id"]}', missing_ok=True)
+                    if visible is not None:
+                        visible = self._owned(visible)
+                        if visible['id'] != created['id'] or not visible['draft']:
+                            raise PublishError('Created draft identity or publication state changed')
+                        return visible
+                    self._pause(read_attempt, PublishError('Created draft is not yet readable'))
             except ApiError as exc:
                 if exc.status in (409, 422):
                     existing = self._find()

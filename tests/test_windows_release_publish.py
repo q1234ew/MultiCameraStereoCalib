@@ -696,6 +696,32 @@ def test_committed_create_with_one_invisible_read_is_found_before_next_post(case
     assert fake.count('create') == 1 and sleeps == [2]
 
 
+def test_successful_create_uses_returned_id_when_inventory_lags(case):
+    publisher, fake, sleeps, _ = case
+    original = fake._perform
+    def hidden_inventory(stage, payload, asset, query):
+        if stage == 'list_releases':
+            return []
+        return original(stage, payload, asset, query)
+    fake._perform = hidden_inventory
+    publisher.run()
+    assert fake.count('create') == 1 and fake.count('publish') == 1 and not sleeps
+
+
+@pytest.mark.parametrize('reads, succeeds', [(1, True), (4, False)])
+def test_created_id_read_lag_never_repeats_create(case, reads, succeeds):
+    publisher, fake, sleeps, _ = case
+    fake.faults['read_release'] = [('before', error(404))] * reads
+    if succeeds:
+        publisher.run()
+        assert fake.count('publish') == 1
+    else:
+        with pytest.raises(release.PublishError, match='Retry budget exhausted'):
+            publisher.run()
+        assert fake.count('upload') == fake.count('publish') == 0
+    assert fake.count('create') == 1 and sleeps
+
+
 @pytest.mark.parametrize('status', [409, 422])
 def test_committed_create_with_longer_read_lag_reconciles_conflict_without_another_retry(case,
                                                                                     status):
