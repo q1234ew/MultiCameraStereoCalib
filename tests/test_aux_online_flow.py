@@ -150,9 +150,39 @@ def test_stale_sampler_result_uses_source_time_not_completion_time(online):
     detections, qualities = guide._preview_detections, guide.last_qualities
     guide.invalidate_live()
     started = guide._clock()
-    guide._preview_ready((guide.context_key(), started, (time.time()-3, time.time()-3)),
+    guide._preview_ready((guide.context_key(), started, (time.time()-4, time.time()-4)),
                          (detections, qualities), '')
     assert not guide._samples and not guide.last_qualities
+
+
+def test_three_slow_fresh_prechecks_reach_independent_original_acceptance(
+        online, monkeypatch, finish_aux_tasks):
+    panel, image = online, board_image()
+    guide = panel._aux_guide
+    clock, wall = [100.], [1000.]
+    guide._clock = lambda: clock[0]
+    panel._aux_live_gate._clock = lambda: clock[0]
+    monkeypatch.setattr(time, 'time', lambda: wall[0])
+    guide.invalidate_live()
+    det = PlanarPatternDetector(panel._aux_board_config()).detect(image, adaptive_subpixel=True)
+    qualities = [assess_aux_frame(image, det, panel._aux_board_config(), modality=m)
+                 for m in ('rgb', 'ir')]
+    frames(panel, image)
+    panel._on_capture_aux()
+    for i, started in enumerate((100., 102.5, 105.)):
+        clock[0] = started + 2.2
+        wall[0] = 1000. + clock[0] - 100.
+        frames(panel, image)
+        source_time = 1000. + started - 100.
+        guide._preview_ready((guide.context_key(), started, (source_time, source_time)),
+                             ((det, det), qualities), '')
+        panel._aux_live_gate.poll()
+        if i < 2:
+            assert panel._aux_live_gate.waiting and panel._aux_saved_count == 0
+    assert not panel._aux_live_gate.waiting and panel._aux_capture_worker is not None
+    finish_aux_tasks(panel)
+    assert panel._aux_saved_count == len(panel._aux_pairs) == 1
+    assert panel._aux_quality_records[-1]['stability']['verified']
 
 
 def test_raw_frame_change_after_ready_is_not_silently_accepted(online, finish_aux_tasks):

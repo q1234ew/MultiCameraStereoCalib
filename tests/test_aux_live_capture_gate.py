@@ -349,7 +349,7 @@ def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     guide = panel._aux_guide
     result = detection_result(panel, image)
     stamp = time.time() - (4 if kind == 'stale_source' else .1)
-    delivered = 102. if kind == 'slow' else 100.1
+    delivered = 103.5 if kind == 'slow' else 100.1
     if kind == 'invalidated':
         panel.test_clock[0] = 100.05
         panel._aux_guide.invalidate_live()
@@ -359,10 +359,23 @@ def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     assert panel._aux_guide.capture_problem()
     assert panel._aux_saved_count == 0 and not panel._aux_pairs
     if kind == 'slow':
-        assert '预检耗时2.0秒' in guide.capture_problem()
+        assert '预检耗时3.5秒' in guide.capture_problem()
     elif kind == 'stale_source':
         assert '源帧已过期' in guide.capture_problem()
     assert '请让整板同时可见' not in guide.capture_problem()
+
+
+@pytest.mark.parametrize('age, accepted', [(2.2, True), (3., True), (3.001, False)])
+def test_temporary_precheck_age_accepts_measured_latency_but_stays_bounded(
+        live_panel, monkeypatch, age, accepted):
+    panel = live_panel
+    result = detection_result(panel, board_image())
+    monkeypatch.setattr(time, 'time', lambda: 1000. + age)
+    feed_preview(panel, result, 100., 1000., delivered_at=100.+age)
+    assert bool(panel._aux_guide.last_qualities) is accepted
+    assert bool(panel._aux_guide._samples) is accepted
+    assert panel._aux_guide.capture_problem()  # One detection cannot prove stability.
+    assert panel._aux_saved_count == 0
 
 
 def test_sampler_is_not_queued_behind_global_background_work(live_panel, app):

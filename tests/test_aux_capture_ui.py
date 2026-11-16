@@ -383,9 +383,9 @@ def test_preview_ready_and_raw_stability_share_full_acceptance(panel, case):
     if case == 'missing':
         guide._preview_detections = []
     if case == 'stale':
-        guide._clock = lambda: 12.
+        guide._clock = lambda: 14.
     if case == 'quality_stale':
-        guide._preview_result_at = 8.
+        guide._preview_result_at = 6.
     guide.render()
     assert ('可以采集' in guide.action.text()) == (case == 'stable')
     assert bool(guide.stability_reasons(guide._preview_detections)) == (

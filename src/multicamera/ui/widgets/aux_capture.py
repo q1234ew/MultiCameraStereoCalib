@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 class AuxCaptureGuide(QWidget):
-    MAX_AGE = 1.5
+    # Temporary tolerance for measured 2.2 s Windows prechecks. The live source
+    # frame gate remains 1 s and the captured original is independently checked.
+    MAX_AGE = 3.
     RECEIPT_HOLD_SECONDS = 5.
     INSTRUCTION_MIN_SECONDS = 2.
     INSTRUCTION_CONFIRM_SECONDS = .8
