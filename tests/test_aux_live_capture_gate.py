@@ -504,8 +504,24 @@ def test_late_preparation_completion_cannot_restart_changed_context(live_panel, 
     panel._white_balance_guard.ensure.assert_not_called()
 
 
+@pytest.mark.parametrize('region_recovery', [False, True])
 def test_actual_capture_saves_newest_original_once_after_stable_evidence(
-        live_panel, monkeypatch, finish_aux_tasks):
+        live_panel, monkeypatch, finish_aux_tasks, region_recovery):
+    if region_recovery:
+        from multicamera.calibration.planar import PlanarDetectionResult, PlanarPatternDetector
+
+        def missing(image):
+            return PlanarDetectionResult(False, np.empty((0, 3)), np.empty((0, 2)),
+                                         image.shape[1::-1], live_panel._aux_board_config().pattern_type)
+
+        original_sb = PlanarPatternDetector._detect_sb
+
+        def region_only(self, gray, scale, roi, inverted):
+            return (missing(gray) if roi is None else
+                    original_sb(self, gray, scale, roi, inverted))
+
+        monkeypatch.setattr(PlanarPatternDetector, 'detect', lambda self, image, **kw: missing(image))
+        monkeypatch.setattr(PlanarPatternDetector, '_detect_sb', region_only)
     panel, image = live_panel, board_image()
     result = detection_result(panel, image)
     base = time.time() - 1.

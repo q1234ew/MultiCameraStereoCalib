@@ -176,7 +176,7 @@ class PlanarPatternDetector:
         ), self.config)
 
     def detect_offline(self, image: np.ndarray, *, modality: str = 'rgb'):
-        """Quality-first native detection, then bounded SB/thermal fallbacks.
+        """Quality-first native detection, then bounded board-region fallbacks.
 
         Selection never uses calibration RMS. Quality is always measured on the
         original image; enlargement adds no new physical observations.
@@ -190,8 +190,11 @@ class PlanarPatternDetector:
         variants = native + [('classic_native', 1, None, False)] if modality == 'ir' else [
             ('classic_native', 1, None, False), *native]
         if modality == 'ir':
-            variants.append(('sb_2x', 2, None, False))
             roi = self._thermal_roi(gray)
+            if roi is not None:
+                variants.extend([('sb_roi_native', 1, roi, False),
+                                 ('sb_roi_inverse_native', 1, roi, True)])
+            variants.append(('sb_2x', 2, None, False))
             if roi is not None:
                 variants.extend([('sb_roi_2x', 2, roi, False),
                                  ('sb_roi_inverse_2x', 2, roi, True)])
@@ -212,6 +215,21 @@ class PlanarPatternDetector:
             if quality.accepted:
                 result.detection_info['attempts'] = attempts
                 return result
+        # Locate afresh on this image; never reuse a region from a different frame.
+        # These proposals only restrict search. Detection and admission still use
+        # native pixels, the full board, and quality measured on the original.
+        if modality == 'rgb':
+            for roi in self._rgb_board_rois(gray):
+                result = self._detect_sb(gray, 1, roi, False)
+                result.detection_info.update(method='sb_rgb_roi_native')
+                quality = assess_aux_frame(image, result, self.config, modality=modality)
+                attempts.append({'method': 'sb_rgb_roi_native', 'roi': roi,
+                                 'valid': result.valid, 'image_accepted': quality.accepted})
+                if fallback is None or (result.valid and not fallback.valid):
+                    fallback = result
+                if quality.accepted:
+                    result.detection_info['attempts'] = attempts
+                    return result
         fallback.detection_info['attempts'] = attempts
         return fallback
 
@@ -253,6 +271,72 @@ class PlanarPatternDetector:
         x, y, w, h = max(boxes, key=lambda box: box[2] * box[3])
         x0, y0 = max(0, x - 12), max(0, y - 12)
         return x0, y0, min(gray.shape[1], x+w+12)-x0, min(gray.shape[0], y+h+12)-y0
+
+    def _rgb_board_rois(self, gray: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Bounded proposals from nearby square-like cells, not corner observations.
+
+        A reduced image is used only to locate candidate regions. SB receives
+        crops of the untouched original, and maps corners back to that image.
+        Distractor regions cannot bypass the independent full-grid quality gate.
+        """
+        height, width = gray.shape
+        scale = min(1., 960. / max(height, width))
+        work = (cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                if scale < 1 else gray)
+        if min(work.shape) < 32:
+            return []
+        mask = cv2.adaptiveThreshold(work, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 31, 5)
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cells = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if not 16 <= area <= work.size * .12:
+                continue
+            quad = cv2.approxPolyDP(contour, .04 * cv2.arcLength(contour, True), True)
+            if len(quad) != 4 or not cv2.isContourConvex(quad):
+                continue
+            x, y, w, h = cv2.boundingRect(quad)
+            if min(w, h) >= 4 and max(w, h) <= 4 * min(w, h) and area > .5 * w * h:
+                cells.append((x, y, w, h))
+        # Bound grouping cost even for heavily textured backgrounds.
+        cells = sorted(cells, key=lambda b: b[2] * b[3], reverse=True)[:256]
+        if not cells:
+            return []
+        boxes = np.asarray(cells, dtype=float)
+        centres = boxes[:, :2] + boxes[:, 2:] / 2
+        sizes = np.sqrt(boxes[:, 2] * boxes[:, 3])
+        distances = np.linalg.norm(centres[:, None] - centres[None, :], axis=2)
+        ratios = sizes[:, None] / sizes[None, :]
+        neighbours = ((distances <= 1.5 * (sizes[:, None] + sizes[None, :])) &
+                      (ratios >= .25) & (ratios <= 4))
+        unseen = set(range(len(cells)))
+        groups = []
+        while unseen:
+            pending = [min(unseen)]
+            group = []
+            while pending:
+                index = pending.pop()
+                if index not in unseen:
+                    continue
+                unseen.remove(index)
+                group.append(index)
+                pending.extend(i for i in np.flatnonzero(neighbours[index]) if i in unseen)
+            if len(group) >= max(4, min(12, self.config.rows * self.config.cols // 4)):
+                groups.append(group)
+        rois = []
+        for group in sorted(groups, key=len, reverse=True)[:3]:
+            selected = boxes[group]
+            padding = 1.25 * float(np.median(sizes[group]))
+            low = np.floor((selected[:, :2].min(axis=0) - padding) / scale).astype(int)
+            high = np.ceil((selected[:, :2] + selected[:, 2:]).max(axis=0) / scale
+                           + padding / scale).astype(int)
+            x0, y0 = max(0, int(low[0])), max(0, int(low[1]))
+            x1, y1 = min(width, int(high[0])), min(height, int(high[1]))
+            roi = (x0, y0, x1 - x0, y1 - y0)
+            if roi != (0, 0, width, height) and roi not in rois:
+                rois.append(roi)
+        return rois
 
     @staticmethod
     def _make_object_points(config: PatternBoardConfig) -> np.ndarray:
