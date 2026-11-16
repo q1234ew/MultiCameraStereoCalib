@@ -1,6 +1,7 @@
 """Raw planar detection, quality and snapshot analysis outside the UI thread."""
 
 from dataclasses import replace
+import time
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
@@ -24,14 +25,23 @@ class AuxCaptureWorker(QRunnable):
         self.key, self.images, self.board = key, images, board
         self.intrinsics, self.modality = intrinsics, modality
         self.enhanced = enhanced
+        self.created_at = time.monotonic()
+        self.diagnostics = {}
 
     def run(self):
+        started = time.monotonic()
+        self.diagnostics['queue_ms'] = (started - self.created_at) * 1000
         try:
             detector = PlanarPatternDetector(self.board)
-            detections = [detector.detect_offline(image,
-                modality='ir' if i == 1 and self.modality == 'ir' else 'rgb')
-                if self.enhanced else detector.detect(image)
-                for i, image in enumerate(self.images)]
+            detections = []
+            for i, image in enumerate(self.images):
+                detection_started = time.monotonic()
+                det = (detector.detect_offline(image,
+                    modality='ir' if i == 1 and self.modality == 'ir' else 'rgb')
+                    if self.enhanced else detector.detect(image))
+                detections.append(det)
+                self.diagnostics[f'detection_{i}_ms'] = (
+                    time.monotonic() - detection_started) * 1000
             quality = []
             adapter = board_adapter(self.board)
             for i, (image, det, intr) in enumerate(zip(self.images, detections, self.intrinsics)):
@@ -48,8 +58,10 @@ class AuxCaptureWorker(QRunnable):
                         and check_intrinsics(intr)['status'] == 'ok'):
                     pose = measure_pose(adapter, observation(det), intr)
                 quality.append(replace(result, metrics=metrics, pose=pose))
+            self.diagnostics['processing_ms'] = (time.monotonic() - started) * 1000
             self.signals.completed.emit(self.key, (detections, quality), '')
         except Exception as exc:
+            self.diagnostics['processing_ms'] = (time.monotonic() - started) * 1000
             self.signals.completed.emit(self.key, None, str(exc))
 
 

@@ -165,7 +165,7 @@ def test_fresh_preview_checks_are_separate_from_capture_admission(panel, monkeyp
     assert '不是本次采图验收' in guide.check_values['quality'].toolTip()
     assert before == (panel._btn_capture_aux.isEnabled(), panel._btn_calib_aux.isEnabled(),
                       panel._aux_saved_count, len(panel._aux_pairs), panel._aux_cap_progress.value())
-    monkeypatch.setattr(guide, '_clock', lambda: guide._preview_result_at + 5)
+    monkeypatch.setattr(guide, '_clock', lambda: guide._preview_result_at + guide.MAX_AGE + 1)
     guide.refresh_workbench()
     assert guide.check_values['quality'].text() == '等待检测'
     assert '等待双路连续稳定检测' in guide.next_step.text()

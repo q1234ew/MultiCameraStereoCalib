@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from copy import deepcopy
 from dataclasses import replace
 
@@ -24,10 +25,13 @@ from .stable_text import StableTextLabel
 
 TILTS = {'front': BoardTilt.FRONT, 'left': BoardTilt.TILT_LEFT, 'right': BoardTilt.TILT_RIGHT,
          'up': BoardTilt.TILT_UP, 'down': BoardTilt.TILT_DOWN}
+logger = logging.getLogger(__name__)
 
 
 class AuxCaptureGuide(QWidget):
-    MAX_AGE = 1.5
+    # Temporary tolerance for measured 2.2 s Windows prechecks. The live source
+    # frame gate remains 1 s and the captured original is independently checked.
+    MAX_AGE = 5.
     RECEIPT_HOLD_SECONDS = 5.
     INSTRUCTION_MIN_SECONDS = 2.
     INSTRUCTION_CONFIRM_SECONDS = .8
@@ -45,7 +49,11 @@ class AuxCaptureGuide(QWidget):
         self._progress_requested = None
         self._progress_pool = QThreadPool(self)
         self._progress_pool.setMaxThreadCount(1)
+        # Live evidence must not queue behind full calibration/guidance jobs.
+        self._preview_pool = QThreadPool(self)
+        self._preview_pool.setMaxThreadCount(1)
         self._preview_worker = None
+        self._preview_issue = ''
         self._preview_started = 0.
         self._preview_result_at = 0.
         self._preview_invalidated_at = 0.
@@ -149,12 +157,20 @@ class AuxCaptureGuide(QWidget):
         self._sample_timestamps.clear()
         self.last_qualities = []
         self._preview_detections = []
+        self._preview_issue = ''
         self._preview_invalidated_at = self._clock()
 
     def capture_problem(self):
         if (len(self.last_qualities) != 2 or len(self._preview_detections) != 2
                 or not 0 <= self._clock() - self._preview_result_at <= self.MAX_AGE):
-            return '等待双路原图预检，请让整板同时可见'
+            if self._preview_issue:
+                return self._preview_issue
+            if self._preview_worker is not None:
+                elapsed = max(0., self._clock() - self._preview_started)
+                diagnostics = getattr(self._preview_worker, 'diagnostics', {})
+                state = '检测中' if 'queue_ms' in diagnostics else '等待开始检查'
+                return f'双路原图预检{state}（已等待{elapsed:.1f}秒），请保持板面静止'
+            return '等待双路原图预检结果，请保持板面静止'
         reasons = [f'{name}：{quality_reason_text(reason)}'
                    for name, quality in zip(self.camera_labels, self.last_qualities)
                    for reason in quality.reasons]
@@ -173,6 +189,7 @@ class AuxCaptureGuide(QWidget):
         self._sample_timestamps.clear()
         self.last_qualities = []
         self._preview_detections = []
+        self._preview_issue = ''
         self._preview_invalidated_at = self._clock()
         self.panel._refresh_aux_readiness()
         if not active and self.analysis is not None and self._key == self.context_key():
@@ -197,6 +214,7 @@ class AuxCaptureGuide(QWidget):
         self._sample_timestamps.clear()
         self.last_qualities = []
         self._preview_detections = []
+        self._preview_issue = ''
         self._manual = False
         self._analysis_error = ''
         self._receipt_record = None
@@ -240,6 +258,7 @@ class AuxCaptureGuide(QWidget):
         self._preview_invalidated_at = self._clock()
         self.last_qualities = []
         self._preview_detections = []
+        self._preview_issue = ''
         if self.analysis is not None and not self._manual:
             self.render()
 
@@ -307,10 +326,11 @@ class AuxCaptureGuide(QWidget):
             self.intrinsics(), panel._aux_modality(), enhanced=True)
         self._preview_worker = worker
         worker.signals.completed.connect(self._preview_ready)
-        QThreadPool.globalInstance().start(worker)
+        self._preview_pool.start(worker)
 
     @Slot(object, object, str)
     def _preview_ready(self, key, result, error):
+        worker = self._preview_worker
         self._preview_worker = None
         if (key[0] != self.context_key()
                 or self.panel._active_step != 2
@@ -318,6 +338,14 @@ class AuxCaptureGuide(QWidget):
             return
         if (error or self._clock() - key[1] > self.MAX_AGE
                 or key[1] < self._preview_invalidated_at):
+            elapsed = max(0., self._clock() - key[1])
+            self._preview_issue = (
+                '双路原图预检失败：' + error if error else
+                f'双路原图预检耗时{elapsed:.1f}秒，结果已过期，正在重试'
+                if elapsed > self.MAX_AGE else '双路原图预检已失效，正在重新检查')
+            logger.warning('Aux preview rejected: reason=%s elapsed_ms=%.1f diagnostics=%s',
+                           self._preview_issue, elapsed * 1000,
+                           getattr(worker, 'diagnostics', {}))
             self.last_qualities = []
             self._preview_detections = []
             if not self._manual:
@@ -326,7 +354,12 @@ class AuxCaptureGuide(QWidget):
         if len(key) > 2 and any(not 0 <= time.time() - stamp <= self.MAX_AGE
                                 for stamp in key[2]):
             self.invalidate_live()
+            self._preview_issue = '双路原图预检使用的源帧已过期，等待新帧重试'
+            logger.warning('Aux preview source expired: ages_ms=%s diagnostics=%s',
+                           [round((time.time() - stamp) * 1000, 1) for stamp in key[2]],
+                           getattr(worker, 'diagnostics', {}))
             return
+        self._preview_issue = ''
         detections, self.last_qualities = result
         self._preview_detections = detections
         self._preview_result_at = key[1]
@@ -383,6 +416,7 @@ class AuxCaptureGuide(QWidget):
             self._sample_timestamps.clear()
             self.last_qualities = []
             self._preview_detections = []
+            self._preview_issue = ''
         intrinsics = (self.panel._intrinsics.get(self.panel._rgb_left_camera_id()),
                       self.panel._aux_intrinsics)
         if (self._key != key and self._progress_requested != key
