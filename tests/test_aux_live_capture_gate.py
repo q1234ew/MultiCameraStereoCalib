@@ -1,13 +1,14 @@
 """One-shot live capture gating and independent source-frame evidence contracts."""
 
 import time
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import cv2
 import numpy as np
 import pytest
-from PySide6.QtCore import QObject, QThreadPool
+from PySide6.QtCore import QObject, QRunnable, QThreadPool
 
 from multicamera.board.charuco_board import CharucoBoard, CharucoBoardConfig
 from multicamera.io.session import CalibrationSession
@@ -15,7 +16,6 @@ from multicamera.streaming.stream_manager import (
     AuxiliaryCameraConfig, CameraConfig, FrameEntry, StereoPairConfig, StreamManager,
 )
 from multicamera.ui.threads.aux_capture_worker import AuxCaptureWorker
-from multicamera.ui.widgets import aux_capture
 from multicamera.ui.widgets import calib_panel
 from multicamera.ui.widgets.aux_live_capture import AuxLiveCaptureGate
 from multicamera.ui.widgets.calib_panel import CalibrationPanel
@@ -346,6 +346,7 @@ def test_one_sensor_reusing_source_stamp_does_not_pass_dual_stability(live_panel
 @pytest.mark.parametrize('kind', ['slow', 'stale_source', 'invalidated'])
 def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     panel, image = live_panel, board_image()
+    guide = panel._aux_guide
     result = detection_result(panel, image)
     stamp = time.time() - (4 if kind == 'stale_source' else .1)
     delivered = 102. if kind == 'slow' else 100.1
@@ -357,13 +358,69 @@ def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     assert not panel._aux_guide._samples
     assert panel._aux_guide.capture_problem()
     assert panel._aux_saved_count == 0 and not panel._aux_pairs
+    if kind == 'slow':
+        assert '预检耗时2.0秒' in guide.capture_problem()
+    elif kind == 'stale_source':
+        assert '源帧已过期' in guide.capture_problem()
+    assert '请让整板同时可见' not in guide.capture_problem()
+
+
+def test_sampler_is_not_queued_behind_global_background_work(live_panel, app):
+    panel = live_panel
+    pool = QThreadPool.globalInstance()
+    old_limit = pool.maxThreadCount()
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingWork(QRunnable):
+        def run(self):
+            started.set()
+            release.wait(10)
+
+    try:
+        pool.setMaxThreadCount(1)
+        pool.start(BlockingWork())
+        assert started.wait(2)
+        set_frames(panel, board_image(), time.time())
+        guide = panel._aux_guide
+        guide._preview_started = 98.
+        guide._request_preview()
+        worker = guide._preview_worker
+        assert worker is not None
+        deadline = time.monotonic() + 3
+        while guide._preview_worker is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.005)
+        assert guide._preview_worker is None
+        assert worker.diagnostics['queue_ms'] >= 0
+        assert worker.diagnostics['detection_0_ms'] >= 0
+        assert worker.diagnostics['detection_1_ms'] >= 0
+        assert not release.is_set()
+        assert panel._aux_saved_count == 0
+    finally:
+        release.set()
+        pool.setMaxThreadCount(old_limit)
+        assert pool.waitForDone(15000)
+
+
+def test_sampler_error_and_queue_state_have_distinct_feedback(live_panel):
+    guide = live_panel._aux_guide
+    guide._preview_worker = SimpleNamespace(diagnostics={})
+    guide._preview_started = 99.
+    assert '等待开始检查' in guide.capture_problem()
+    guide._preview_worker.diagnostics['queue_ms'] = 10.
+    assert '检测中' in guide.capture_problem()
+    guide._preview_ready((guide.context_key(), 100.), None, 'detector failed')
+    assert '预检失败：detector failed' in guide.capture_problem()
+    assert live_panel._aux_saved_count == 0
+    guide.invalidate_live()
+    assert 'detector failed' not in guide.capture_problem()
 
 
 def test_sampler_has_one_inflight_request_and_uses_enhanced_detector(live_panel, monkeypatch):
     panel, image = live_panel, board_image()
     set_frames(panel, image, time.time() - .01)
     pool = SimpleNamespace(start=Mock())
-    monkeypatch.setattr(aux_capture, 'QThreadPool', SimpleNamespace(globalInstance=lambda: pool))
+    monkeypatch.setattr(panel._aux_guide, '_preview_pool', pool)
     panel._aux_guide._preview_started = 98.
     panel._aux_guide._request_preview()
     worker = panel._aux_guide._preview_worker
