@@ -1,0 +1,157 @@
+--- a/ustreamer-ir/src/libs/frame.h
++++ b/ustreamer-ir/src/libs/frame.h
+@@ -28,6 +28,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
++#include <time.h>
+ 
+ #include <linux/videodev2.h>
+ 
+@@ -50,6 +51,11 @@
+ 	bool online;
+ 	bool key;
+ 
++	uint64_t capture_timestamp_ns;
++	uint64_t capture_epoch_ns;
++	uint32_t capture_sequence;
++	uint32_t capture_flags;
++
+ 	long double	grab_ts;
+ 	long double	encode_begin_ts;
+ 	long double	encode_end_ts;
+@@ -68,8 +74,20 @@
+ 		_dest->encode_end_ts = _src->encode_end_ts; \
+ 	}
+ 
++/* V4L2 timestamps use CLOCK_MONOTONIC, while legacy uStreamer timings
++ * use CLOCK_MONOTONIC_RAW. Keep the legacy timing contract unchanged. */
++static inline uint64_t frame_capture_now_ns(void) {
++	struct timespec ts;
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
++	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
+ static inline void frame_copy_meta(const frame_s *src, frame_s *dest) {
+ 	FRAME_COPY_META(src, dest);
++	dest->capture_timestamp_ns = src->capture_timestamp_ns;
++	dest->capture_epoch_ns = src->capture_epoch_ns;
++	dest->capture_sequence = src->capture_sequence;
++	dest->capture_flags = src->capture_flags;
+ }
+ 
+ #define FRAME_COMPARE_META_USED_NOTS(_a, _b) ( \
+--- a/ustreamer-ir/src/libs/frame.c
++++ b/ustreamer-ir/src/libs/frame.c
+@@ -59,7 +59,7 @@
+ 
+ void frame_copy(const frame_s *src, frame_s *dest) {
+ 	frame_set_data(dest, src->data, src->used);
+-	FRAME_COPY_META(src, dest);
++	frame_copy_meta(src, dest);
+ }
+ 
+ bool frame_compare(const frame_s *a, const frame_s *b) {
+--- a/ustreamer-ir/src/libs/memsink.c
++++ b/ustreamer-ir/src/libs/memsink.c
+@@ -183,6 +183,9 @@
+ 			sink->last_id = sink->mem->id;
+ 			frame_set_data(frame, sink->mem->data, sink->mem->used);
+ 			FRAME_COPY_META(sink->mem, frame);
++			// Shared-memory protocol has no native capture metadata: fail closed.
++			frame->capture_timestamp_ns = frame->capture_epoch_ns = 0;
++			frame->capture_sequence = frame->capture_flags = 0;
+ 			retval = 0;
+ 		}
+ 		sink->mem->last_client_ts = get_now_monotonic();
+--- a/ustreamer-ir/src/ustreamer/device.h
++++ b/ustreamer-ir/src/ustreamer/device.h
+@@ -95,6 +95,7 @@
+ 	size_t		raw_size;
+ 	unsigned	n_bufs;
+ 	hw_buffer_s	*hw_bufs;
++	uint64_t capture_epoch_ns;
+ 	bool		capturing;
+ 	bool		persistent_timeout_reported;
+ } device_runtime_s;
+--- a/ustreamer-ir/src/ustreamer/device.c
++++ b/ustreamer-ir/src/ustreamer/device.c
+@@ -295,6 +295,7 @@
+ 			}
+ 		}
+ 
++		if (enable) RUN(capture_epoch_ns) = frame_capture_now_ns();
+ 		RUN(capturing) = enable;
+ 		LOG_INFO("Capturing %s", (enable ? "started" : "stopped"));
+ 	}
+@@ -405,6 +406,12 @@
+ 	HW(raw.online) = true;
+ 	memcpy(&HW(buf_info), &buf_info, sizeof(struct v4l2_buffer));
+ 	HW(raw.grab_ts) = get_now_monotonic();
++	HW(raw.capture_timestamp_ns) = (buf_info.timestamp.tv_sec >= 0 && buf_info.timestamp.tv_usec >= 0
++		&& buf_info.timestamp.tv_usec < 1000000)
++		? (uint64_t)buf_info.timestamp.tv_sec * 1000000000ULL + (uint64_t)buf_info.timestamp.tv_usec * 1000ULL : 0;
++	HW(raw.capture_epoch_ns) = RUN(capture_epoch_ns);
++	HW(raw.capture_sequence) = buf_info.sequence;
++	HW(raw.capture_flags) = buf_info.flags;
+ 
+ #	undef HW
+ 	*hw = &RUN(hw_bufs[buf_info.index]);
+--- a/ustreamer-ir/src/ustreamer/http/server.c
++++ b/ustreamer-ir/src/ustreamer/http/server.c
+@@ -23,6 +23,18 @@
+ #include "server.h"
+ 
+ #include <math.h>
++#include <inttypes.h>
++
++static pthread_once_t _capture_boot_once = PTHREAD_ONCE_INIT;
++static char _capture_boot_id[40];
++static void _capture_boot_init(void) {
++	FILE *file = fopen("/proc/sys/kernel/random/boot_id", "r");
++	if (file != NULL) {
++		if (fgets(_capture_boot_id, sizeof(_capture_boot_id), file) != NULL)
++			_capture_boot_id[strcspn(_capture_boot_id, "\r\n")] = 0;
++		fclose(file);
++	}
++}
+ 
+ 
+ static int _http_preprocess_request(struct evhttp_request *request, server_s *server);
+@@ -525,7 +537,9 @@
+ 		"X-UStreamer-Width, X-UStreamer-Height, X-UStreamer-Grab-Timestamp, "
+ 		"X-UStreamer-Encode-Begin-Timestamp, X-UStreamer-Encode-End-Timestamp, "
+ 		"X-UStreamer-Expose-Begin-Timestamp, X-UStreamer-Expose-Cmp-Timestamp, "
+-		"X-UStreamer-Expose-End-Timestamp, X-UStreamer-Send-Timestamp");
++		"X-UStreamer-Expose-End-Timestamp, X-UStreamer-Send-Timestamp, "
++		"X-Capture-Protocol, X-Capture-Build, X-Capture-Boot-Id, X-Capture-Clock, X-Capture-Stage, "
++		"X-Capture-Monotonic-Ns, X-Capture-Stream-Ns, X-Capture-Sequence, X-Capture-V4L2-Flags, X-Capture-Send-Monotonic-Ns");
+ 	ADD_HEADER("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, pre-check=0, post-check=0, max-age=0");
+ 	ADD_HEADER("Pragma", "no-cache");
+ 	ADD_HEADER("Expires", "Mon, 3 Jan 2000 12:34:56 GMT");
+@@ -554,6 +568,25 @@
+ 	ADD_TIME_HEADER("X-UStreamer-Expose-Begin-Timestamp",	EX(expose_begin_ts));
+ 	ADD_TIME_HEADER("X-UStreamer-Expose-Cmp-Timestamp",		EX(expose_cmp_ts));
+ 	ADD_TIME_HEADER("X-UStreamer-Expose-End-Timestamp",		EX(expose_end_ts));
++	if (EX(frame->online) && EX(frame->capture_timestamp_ns) > 0) {
++		pthread_once(&_capture_boot_once, _capture_boot_init);
++		ADD_HEADER("X-Capture-Protocol", "v4l2-monotonic-v1");
++		ADD_HEADER("X-Capture-Build", "mc-clock-2-42fb525e");
++		ADD_HEADER("X-Capture-Boot-Id", _capture_boot_id);
++		ADD_HEADER("X-Capture-Clock", ((EX(frame->capture_flags) & V4L2_BUF_FLAG_TIMESTAMP_MASK)
++			== V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) ? "monotonic" : "unknown");
++		unsigned source = EX(frame->capture_flags) & V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
++		ADD_HEADER("X-Capture-Stage", source == V4L2_BUF_FLAG_TSTAMP_SRC_SOE ? "driver-soe"
++			: (source == V4L2_BUF_FLAG_TSTAMP_SRC_EOF ? "driver-eof" : "unknown"));
++		snprintf(header_buf, sizeof(header_buf), "%" PRIu64, EX(frame->capture_timestamp_ns));
++		ADD_HEADER("X-Capture-Monotonic-Ns", header_buf);
++		snprintf(header_buf, sizeof(header_buf), "%" PRIu64, EX(frame->capture_epoch_ns));
++		ADD_HEADER("X-Capture-Stream-Ns", header_buf);
++		ADD_UNSIGNED_HEADER("X-Capture-Sequence", EX(frame->capture_sequence));
++		ADD_UNSIGNED_HEADER("X-Capture-V4L2-Flags", EX(frame->capture_flags));
++		snprintf(header_buf, sizeof(header_buf), "%" PRIu64, frame_capture_now_ns());
++		ADD_HEADER("X-Capture-Send-Monotonic-Ns", header_buf);
++	}
+ 	ADD_TIME_HEADER("X-UStreamer-Send-Timestamp",			get_now_monotonic());
+ 
+ #	undef ADD_UNSUGNED_HEADER

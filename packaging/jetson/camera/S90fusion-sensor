@@ -1,77 +1,60 @@
 #!/bin/sh
-
-APP_DIR="/opt/fusion-sensor"
-LAUNCHER="$APP_DIR/start_fusion.sh"
-PIDFILE="/var/run/fusion-sensor.pid"
-LOGFILE="/var/log/fusion-sensor.log"
+# Non-blocking SysV boot entry; the supervisor handles network readiness and retries.
+APP_DIR=${FUSION_APP_DIR:-/opt/fusion-sensor}
+RUN_DIR=${FUSION_RUN_DIR:-/var/run}
+SUPERVISOR="$APP_DIR/fusion-supervisor.sh"
+PIDFILE="$RUN_DIR/fusion-sensor.pid"
+LOGFILE=${FUSION_LOGFILE:-/var/log/fusion-sensor.log}
 
 is_running() {
-    [ -f "$PIDFILE" ] || return 1
-    pid="$(cat "$PIDFILE" 2>/dev/null)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    [ -r "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null || return 1
+    # A stale PID file must never signal an unrelated process.
+    tr '\000' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -Fxq "$SUPERVISOR"
 }
-
 start() {
-    if is_running; then
-        echo "fusion-sensor already running (pid $(cat "$PIDFILE"))"
-        return 0
-    fi
-    rm -f "$PIDFILE"
-    [ -x "$LAUNCHER" ] || {
-        echo "missing executable: $LAUNCHER"
-        return 1
+    if is_running; then echo "fusion-sensor already supervised (pid $pid)"; return 0; fi
+    [ -x "$SUPERVISOR" ] && [ -x "$APP_DIR/start_fusion.sh" ] || {
+        echo 'missing capture launcher or supervisor'; return 1;
     }
-    echo "Starting fusion-sensor..."
-    (
-        cd "$APP_DIR" || exit 1
-        exec /usr/bin/setsid /usr/bin/bash "$LAUNCHER"
-    ) >>"$LOGFILE" 2>&1 </dev/null &
-    pid=$!
-    echo "$pid" >"$PIDFILE"
-    sleep 3
-    if ! kill -0 "$pid" 2>/dev/null; then
-        echo "fusion-sensor failed to start; see $LOGFILE"
-        rm -f "$PIDFILE"
+    mkdir -p "$RUN_DIR"
+    setsid bash "$SUPERVISOR" >>"$LOGFILE" 2>&1 </dev/null &
+    sleep 1
+    if is_running; then
+        echo "fusion-sensor supervisor started (pid $pid); readiness is asynchronous"
+    else
+        echo "fusion-sensor supervisor failed; see $LOGFILE"
         return 1
     fi
-    echo "fusion-sensor started (pid $pid)"
 }
-
 stop() {
     if is_running; then
-        pid="$(cat "$PIDFILE")"
-        echo "Stopping fusion-sensor (pid $pid)..."
-        kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
         count=0
-        while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 10 ]; do
-            sleep 1
-            count=$((count + 1))
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        while is_running && [ "$count" -lt 12 ]; do sleep 1; count=$((count + 1)); done
+        if is_running; then
+            echo 'supervisor stop timed out; leaving PID/lock for inspection'
+            return 1
         fi
     fi
-    rm -f "$PIDFILE"
-    killall ustreamer.bin fusion-mdns-responder.bin 2>/dev/null || true
-    echo "fusion-sensor stopped"
+    echo 'fusion-sensor stopped'
 }
-
 status() {
     if is_running; then
-        echo "fusion-sensor running (pid $(cat "$PIDFILE"))"
-        return 0
+        current=$(cat "$RUN_DIR/fusion-sensor.state" 2>/dev/null || echo starting)
+        echo "fusion-sensor supervised (pid $pid), state=$current"
+        [ "$current" = healthy ]
+    else
+        echo 'fusion-sensor stopped'
+        return 1
     fi
-    echo "fusion-sensor stopped"
-    return 1
 }
-
 case "${1:-}" in
     start) start ;;
     stop) stop ;;
-    restart) stop; start ;;
+    restart) stop && start ;;
     status) status ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status}"
-        exit 1
-        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

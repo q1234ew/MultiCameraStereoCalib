@@ -198,9 +198,71 @@ def test_result_rejects_withdrawn_calibration_hash(tmp_path):
         app = web.Application()
         app.router.add_get('/result/{job}', controller.result)
         async with TestClient(TestServer(app)) as client:
-            assert (await client.get('/result/'+ident)).status == 200
+            first = await client.get('/result/'+ident)
+            assert first.status == 200
+            assert first.headers['X-Fusion-Preview-Cache'] == 'miss'
+            second = await client.get('/result/'+ident)
+            assert second.headers['X-Fusion-Preview-Cache'] == 'hit'
+            assert await first.json() == await second.json()
             cameras['device_2']['calibration_sha256'] = '0'*64
             path.write_text(json.dumps(extrinsics))
             response = await client.get('/result/'+ident)
             assert response.status == 409 and '失效' in await response.text()
+    asyncio.run(check())
+
+
+def test_status_advertises_only_existing_fusion_artifacts(tmp_path):
+    import json
+
+    async def check():
+        controller = FusionController({}, None, None, tmp_path, tmp_path)
+        controller.job = {'id': 'a' * 32, 'action': 'fuse', 'state': 'failed'}
+        folder = tmp_path / controller.job['id']
+        folder.mkdir()
+        (folder / 'job.json').write_text(json.dumps(controller.job))
+        app = web.Application()
+        app.router.add_get('/status', controller.status)
+        app.router.add_get('/files/{job}/{name}', controller.artifact)
+        async with TestClient(TestServer(app)) as client:
+            status = await (await client.get('/status')).json()
+            assert status['job']['available_artifacts'] == ['task.json']
+            response = await client.get('/files/' + controller.job['id'] + '/task.json')
+            assert response.status == 200
+            assert (await response.json())['state'] == 'failed'
+            assert (await client.get('/files/' + controller.job['id'] + '/mesh.ply')).status == 404
+    asyncio.run(check())
+
+
+def test_fusion_capture_failure_reports_device_and_completed_progress(tmp_path):
+    async def check():
+        config = load_config(ROOT / 'packaging/jetson/devices.json')
+        devices = config['devices'][:2]
+        calls = []
+
+        async def compute(ident, *args):
+            calls.append(ident)
+            if len(calls) == 2:
+                raise web.HTTPBadGateway()
+            return dict(device_id=ident, valid_fraction=.9, median_depth_m=1., inference_ms=1.,
+                        receive_skew_ms=0., received_at_unix_ms=1, point_frame=ident + ':C_L_rect')
+
+        stereo = SimpleNamespace(_compute=compute, batch_active=False)
+        controller = FusionController(config, stereo, None, tmp_path, tmp_path)
+        active = {'quality_passed': True, 'source': 'foundation_stereo_rectified',
+                  'translation_unit': 'm', 'cameras': {d['id']: {
+                      'calibration_sha256': d['calibration_sha256'],
+                      'point_frame': d['id'] + ':C_L_rect',
+                      'T_world_camera': np.eye(4).tolist()} for d in devices}}
+        controller.active = lambda: active
+        controller.job = {'id': 'b' * 32, 'state': 'running'}
+        params = dict(devices=[d['id'] for d in devices], frames=1, resolution='480x270',
+                      quality='fast')
+        await controller.run('fuse', params)
+        assert controller.job['state'] == 'failed'
+        assert controller.job['error_code'] == 'capture_unavailable'
+        assert controller.job['current_device'] == 'device_2'
+        assert 'device_2' in controller.job['message'] and '检查设备连接' in controller.job['message']
+        assert controller.job['progress'] == {'done': 1, 'total': 2}
+        assert not stereo.batch_active
+        assert controller.active() == active  # Failure never replaces working extrinsics.
     asyncio.run(check())

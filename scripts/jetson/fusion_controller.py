@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections import OrderedDict
 import json
 import math
 import os
@@ -15,12 +17,26 @@ from pathlib import Path
 
 from aiohttp import web
 
+from .fusion_cache import CaptureCache
 from .fusion_geometry import validate_active
+from .fusion_preview import load_cloud_preview
 from .fusion_workflow import write_json
 from .stereo_preview import QUALITY_PRESETS, RESOLUTIONS
 
 
 class FusionController:
+    ARTIFACTS = {
+        "pointcloud.ply": "result/pointcloud/multi_orbbec_world_rgb_pointcloud.ply",
+        "pointcloud.html": "result/pointcloud/multi_orbbec_world_rgb_pointcloud.html",
+        "mesh.ply": "result/tsdf/tsdf_mesh_clean.ply",
+        "mesh.html": "result/tsdf/tsdf_mesh_clean.html",
+        "calibration.json": "calibration/calibration_report.json",
+        "workflow.log": "workflow.log",
+        "alignment.json": "result/alignment_report.json",
+        "report.json": "result/fusion_result.json",
+        "task.json": "job.json",
+    }
+
     def __init__(self, config, stereo, settings, bundle_root, root=None):
         self.config, self.stereo, self.settings = config, stereo, settings
         self.bundle_root = Path(bundle_root or "bundles").resolve()
@@ -29,6 +45,9 @@ class FusionController:
         self.task = None
         self.process = None
         self.job = None
+        self.capture_cache = CaptureCache(self.root)
+        self.cache_epoch = uuid.uuid4().hex
+        self.preview_cache = OrderedDict()
         # Keep the latest reviewable result available after service restarts.
         records = [p for p in self.root.glob("*/job.json")
                    if re.fullmatch("[0-9a-f]{32}", p.parent.name)]
@@ -50,6 +69,32 @@ class FusionController:
             except (OSError, ValueError, TypeError):
                 self.job = None
 
+    def cache_context(self, ids, extrinsics=None):
+        devices = [d for d in self.config.get("devices", []) if d["id"] in ids]
+        if len(devices) != len(ids):
+            raise ValueError("Unknown cached device")
+        bundles = {}
+        for device in devices:
+            path = self.bundle_root / device['id'] / 'calibration_mm.yml'
+            bundles[device['id']] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+        return CaptureCache.digest({
+            'runtime': self.cache_epoch, 'devices': devices, 'bundles': bundles,
+            'revisions': {i: getattr(self.stereo, 'revisions', {}).get(i, 0) for i in ids},
+            'model': getattr(getattr(self.stereo, 'predictor', None), 'identity', None),
+            'extrinsics': self.active() if extrinsics is None else extrinsics,
+        })
+
+    async def clear_cache(self, request):
+        if (request.headers.get('Origin') != f'{request.scheme}://{request.host}'
+                or not secrets.compare_digest(request.headers.get('X-Camera-CSRF', ''),
+                                               self.settings.csrf)):
+            raise web.HTTPForbidden(text='请从统一界面清除缓存')
+        if self.task and not self.task.done():
+            raise web.HTTPConflict(text='任务正在使用缓存，请完成后再清除')
+        self.capture_cache.clear()
+        self.preview_cache.clear()
+        return web.json_response({'cleared': True, 'history_preserved': True})
+
     def active(self):
         try:
             data = json.loads((self.root / "active_calibration.json").read_text())
@@ -69,9 +114,16 @@ class FusionController:
         active = self.active()
         return web.json_response(
             {
-                "job": self.job,
+                "job": None if self.job is None else {
+                    **self.job,
+                    "available_artifacts": [name for name, relative in self.ARTIFACTS.items()
+                                            if (self.root / self.job["id"] / relative).is_file()],
+                },
                 "busy": bool(self.task and not self.task.done()),
                 "installed": self.python.exists(),
+                "cache": {"captures": self.capture_cache.summaries(self.cache_context),
+                          "ttl_s": self.capture_cache.TTL_S,
+                          "preview_entries": len(self.preview_cache)},
                 "active_calibration": None
                 if not active
                 else {
@@ -114,6 +166,9 @@ class FusionController:
                 "resolution",
                 "quality",
                 "max_depth_m",
+                "capture_cache_id",
+                "build_mesh",
+                "tolerance_profile",
             }
             if not isinstance(data, dict) or not set(data) <= allowed:
                 raise ValueError("无效任务参数")
@@ -147,6 +202,16 @@ class FusionController:
             far = data.get("max_depth_m", 4)
             if type(far) not in (int, float) or not math.isfinite(far) or not 0.5 <= far <= 10:
                 raise ValueError("融合最大深度范围0.5–10m")
+            cached_id = data.get("capture_cache_id")
+            if cached_id is not None and (not isinstance(cached_id, str)
+                    or not re.fullmatch('[0-9a-f]{32}', cached_id)):
+                raise ValueError('无效深度缓存编号')
+            tolerance = data.get('tolerance_profile', 'strict')
+            if not isinstance(tolerance, str) or tolerance not in ('strict', 'preview'):
+                raise ValueError('无效融合容差档位')
+            build_mesh = data.get('build_mesh', True)
+            if type(build_mesh) is not bool:
+                raise ValueError('网格选项必须为布尔值')
             if action == "fuse":
                 active = self.active()
                 if active is None:
@@ -161,6 +226,9 @@ class FusionController:
                 "resolution": resolution,
                 "quality": quality,
                 "max_depth_m": far,
+                "capture_cache_id": cached_id,
+                "build_mesh": build_mesh,
+                "tolerance_profile": tolerance,
             }
         except (ValueError, TypeError, KeyError) as exc:
             raise web.HTTPBadRequest(text=str(exc)) from exc
@@ -173,6 +241,7 @@ class FusionController:
             "action": action,
             "state": "running",
             "message": "任务已启动",
+            "stage": "preparing",
             "parameters": params,
             "created_at_unix_ms": round(time.time() * 1000),
         }
@@ -216,9 +285,12 @@ class FusionController:
 
     async def run(self, action, params):
         folder = self.root / self.job["id"]
+        task_started = time.monotonic()
+        self.job["timings_ms"] = {}
         try:
             write_json(folder / "devices.json", self.config)
             if action == "calibrate":
+                self.job["stage"] = "calibration"
                 self.job["message"] = "正在采集左右目并检测共同AprilTag，请保持相机和码静止"
                 self.save_job()
                 code = await self.command(
@@ -264,33 +336,60 @@ class FusionController:
                 total = len(devices) * params["frames"]
                 count = 0
                 self.job["capture_metrics"] = []
+                self.job["stage"] = "capture"
+                self.job["progress"] = {"done": 0, "total": total}
                 self.stereo.batch_active = True
-                try:
-                    for index in range(params["frames"]):
-                        for device in devices:
-                            self.job["message"] = (
-                                f"采集真实双目深度 {count + 1}/{total} · {device['id']}"
-                            )
-                            self.save_job()
-                            result = await self.stereo._compute(
-                                device["id"],
-                                RESOLUTIONS[params["resolution"]],
-                                params["quality"],
-                                folder / "captures" / device["id"],
-                                index,
-                            )
-                            if result is None:
-                                raise ValueError("采集期间相机参数发生变化，请重新启动任务")
-                            self.job["capture_metrics"].append({
-                                k: result[k] for k in ("device_id", "valid_fraction",
-                                    "median_depth_m", "inference_ms", "receive_skew_ms",
-                                    "received_at_unix_ms", "point_frame")
-                            })
-                            count += 1
-                finally:
-                    self.stereo.batch_active = True
-                self.job["message"] = "正在执行时域过滤、公共坐标点云合并与CPU TSDF融合"
+                capture_started = time.monotonic()
+                if params.get('capture_cache_id'):
+                    context = self.cache_context(params['devices'])
+                    metrics, provenance = await asyncio.to_thread(
+                        self.capture_cache.restore, params['capture_cache_id'], params,
+                        context, folder / 'captures')
+                    self.job['capture_metrics'] = metrics
+                    self.job['capture_cache'] = dict(provenance, hit=True,
+                        note='历史静态场景输入；不是本次新采集，仍执行一致性检查')
+                    self.job['progress'] = {'done': total, 'total': total}
+                else:
+                    try:
+                        for index in range(params["frames"]):
+                            for device in devices:
+                                self.job["current_device"] = device["id"]
+                                self.job["message"] = (
+                                    f"采集真实双目深度 {count + 1}/{total} · {device['id']}"
+                                )
+                                self.save_job()
+                                result = await self.stereo._compute(
+                                    device["id"],
+                                    RESOLUTIONS[params["resolution"]],
+                                    params["quality"],
+                                    folder / "captures" / device["id"],
+                                    index,
+                                )
+                                if result is None:
+                                    raise ValueError("采集期间相机参数发生变化，请重新启动任务")
+                                self.job["capture_metrics"].append({
+                                    k: result[k] for k in ("device_id", "valid_fraction",
+                                        "median_depth_m", "inference_ms", "receive_skew_ms",
+                                        "received_at_unix_ms", "point_frame")
+                                })
+                                count += 1
+                                self.job["progress"] = {"done": count, "total": total}
+                                self.save_job()
+                    finally:
+                        self.stereo.batch_active = True
+                    try:
+                        await asyncio.to_thread(self.capture_cache.publish, folder, params,
+                                               self.cache_context(params['devices'], active),
+                                               self.job['capture_metrics'])
+                    except (OSError, ValueError, KeyError) as exc:
+                        self.job['cache_warning'] = str(exc)
+                    self.job['capture_cache'] = {'hit': False}
+                self.job['timings_ms']['capture'] = round((time.monotonic() - capture_started) * 1000, 1)
+                self.job["stage"] = "fusion"
+                self.job["message"] = ("正在执行时域过滤、公共坐标点云合并"
+                                       + ("与CPU TSDF融合" if params.get("build_mesh", True) else "（仅生成点云）"))
                 self.save_job()
+                fusion_started = time.monotonic()
                 code = await self.command(
                     [
                         "fuse",
@@ -304,9 +403,12 @@ class FusionController:
                         str(params["max_depth_m"]),
                         "--out",
                         str(folder / "result"),
+                        *([] if params.get("build_mesh", True) else ["--pointcloud-only"]),
+                        "--tolerance-profile", params.get("tolerance_profile", "strict"),
                     ],
                     folder,
                 )
+                self.job["timings_ms"]["fusion"] = round((time.monotonic() - fusion_started) * 1000, 1)
                 if code != 0:
                     check_path = folder / "result/alignment_report.json"
                     if check_path.exists():
@@ -319,7 +421,9 @@ class FusionController:
                 output = json.loads((folder / "result/fusion_result.json").read_text())
                 self.job.update(
                     state="completed",
-                    message=f"融合完成 · {output['point_count']} 点",
+                    message=(("预览融合完成 · 严格检查未通过 · "
+                              if not output["alignment_report"].get("strict_passed", True)
+                              else "融合完成 · ") + f"{output['point_count']} 点"),
                     point_count=output["point_count"],
                     alignment_report=output["alignment_report"],
                     world_frame=output["world_frame"],
@@ -328,9 +432,17 @@ class FusionController:
             self.job.update(state="cancelled", message="服务停止，任务已取消")
             raise
         except Exception as exc:
-            self.job.update(state="failed", message=str(exc))
+            message = str(exc)
+            if self.job.get("stage") == "capture" and isinstance(
+                    exc, (web.HTTPBadGateway, web.HTTPServiceUnavailable, ConnectionError,
+                          asyncio.TimeoutError)):
+                ident = self.job.get("current_device", "当前设备")
+                message = f"{ident} 双目采集失败：视频接口暂不可用。请检查设备连接后重试。"
+                self.job["error_code"] = "capture_unavailable"
+            self.job.update(state="failed", message=message)
         finally:
             self.stereo.batch_active = False
+            self.job["timings_ms"]["total"] = round((time.monotonic() - task_started) * 1000, 1)
             self.job["finished_at_unix_ms"] = round(time.time() * 1000)
             self.save_job()
 
@@ -350,43 +462,58 @@ class FusionController:
             validate_active(extrinsics, devices)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise web.HTTPConflict(text="该结果使用的标定已失效，请重新标定后融合") from exc
+        signature = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in
+                          [path, path.parent.parent / 'extrinsics.json',
+                           path.parent / 'alignment_report.json',
+                           path.parent / 'pointcloud/summary.json',
+                           path.parent / 'pointcloud/multi_orbbec_world_rgb_pointcloud.ply']
+                          if p.exists())
         data = json.loads(path.read_text())
         check_path = path.parent / "alignment_report.json"
         if check_path.exists() and not json.loads(check_path.read_text())["passed"]:
             raise web.HTTPConflict(text="当前结果未通过深度尺度一致性检查")
-        return web.json_response(
-            {
-                k: data[k]
-                for k in (
-                    "points",
-                    "colors",
-                    "point_count",
-                    "point_unit",
-                    "world_frame",
-                    "measurement_accuracy_verified",
-                )
-            }
-        )
+        if signature in self.preview_cache:
+            payload = self.preview_cache.pop(signature)
+            self.preview_cache[signature] = payload
+            return web.json_response(payload, headers={'X-Fusion-Preview-Cache': 'hit'})
+        # Read legacy artefacts off the event loop. Labels must come from the PLY,
+        # never from guessed device order or nearest-camera coordinates.
+        preview = {"source_labels_available": False, "point_device_ids": [], "devices": []}
+        try:
+            preview = await asyncio.to_thread(load_cloud_preview, path.parent / "pointcloud", ids)
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+            pass  # Historical results still support RGB preview, with an explicit UI notice.
+        payload = {k: data[k] for k in (
+            "points", "colors", "point_count", "point_unit", "world_frame",
+            "measurement_accuracy_verified",
+        )}
+        payload.update(preview)
+        payload.update(tolerance_profile=data.get("tolerance_profile", "strict"),
+                       strict_alignment_passed=data.get("strict_alignment_passed"),
+                       preview_only=data.get("preview_only", False))
+        self.preview_cache[signature] = payload
+        while len(self.preview_cache) > 2:
+            self.preview_cache.popitem(last=False)
+        return web.json_response(payload, headers={'X-Fusion-Preview-Cache': 'miss'})
 
     async def artifact(self, request):
         ident, name = request.match_info["job"], request.match_info["name"]
-        mapping = {
-            "pointcloud.ply": "result/pointcloud/multi_orbbec_world_rgb_pointcloud.ply",
-            "pointcloud.html": "result/pointcloud/multi_orbbec_world_rgb_pointcloud.html",
-            "mesh.ply": "result/tsdf/tsdf_mesh_clean.ply",
-            "mesh.html": "result/tsdf/tsdf_mesh_clean.html",
-            "calibration.json": "calibration/calibration_report.json",
-            "workflow.log": "workflow.log",
-            "alignment.json": "result/alignment_report.json",
-            "report.json": "result/fusion_result.json",
-        }
+        mapping = self.ARTIFACTS
         if not re.fullmatch("[0-9a-f]{32}", ident) or name not in mapping:
             raise web.HTTPNotFound()
         path = self.root / ident / mapping[name]
         if not path.is_file():
             raise web.HTTPNotFound()
         response = web.FileResponse(path)
-        response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+        filename = name
+        if name in ('pointcloud.ply', 'mesh.ply', 'pointcloud.html', 'mesh.html'):
+            try:
+                record = json.loads((self.root / ident / 'job.json').read_text())
+                if record.get('parameters', {}).get('tolerance_profile') == 'preview':
+                    filename = 'preview_' + name
+            except (OSError, ValueError, TypeError):
+                pass
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         return response
 
     async def close(self):

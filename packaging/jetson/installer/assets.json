@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "embedded": false,
+  "assets": {
+    "foundation": {
+      "relative_checkpoint": "pretrained_models/23-51-11/model_best_bp2.pth",
+      "bytes": 3298527334,
+      "sha256": "60e79bde9c6a00acea551625ff814fe06e5a6806e2c0c9829baee248de87c5f1"
+    },
+    "pose": {
+      "bytes": 7878574,
+      "sha256": "eb3bb8268828aeaf515cec23a4bfafd793944a86fe9af94ba7823609c14522a9"
+    }
+  },
+  "provenance": "Sizes and SHA256 read from the working Orin on 2026-11-13; local identity, not an upstream signature."
+}

@@ -1,0 +1,28 @@
+# Orin L4T R35.4.1 / Python 3.8 deployment, 2026-11-07.
+# Install only into .pose-venv. Reuse the existing NVIDIA torch build; do not
+# replace it with a generic PyPI torch wheel. The torchvision wheel is built
+# locally against that torch and CUDA 11.4, with TORCH_CUDA_ARCH_LIST=8.7.
+# Requires the deployment wheelhouse for the +mc.nv23.6 local build.
+ultralytics==8.4.204
+torch==2.1.0a0+41361538.nv23.6
+torchvision==0.16.2+mc.nv23.6
+numpy==1.24.4
+opencv-python==4.10.0.84
+matplotlib==3.7.5
+requests==2.32.4
+psutil==7.2.2
+polars==1.8.2
+nvidia-ml-py==13.615.71
+ultralytics-thop==2.2.5
+contourpy==1.1.1
+fonttools==4.57.0
+importlib-resources==6.4.5
+zipp==3.20.2
+safetensors==0.5.3
+ninja==1.11.1.1
+
+# Per-camera ByteTrack assignment; installed only in .pose-venv.
+lap==0.5.12
+
+# MQTT 3.1.1 telemetry client (callback API v2).
+paho-mqtt==2.1.0

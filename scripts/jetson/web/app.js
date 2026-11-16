@@ -192,17 +192,32 @@ async function updateStereo(device) {
     }
   } finally {clearTimeout(timer);device.busy=false;device.controller=null;}
 }
-for (const target of ['raw','stereo']) {
+for (const target of ['raw','stereo','human']) {
   document.querySelector(`#${target}-mode`).addEventListener('click',()=>{
     mode=target;
+    if(location.hash!==`#${target}`)location.hash=target;
     document.querySelector('#raw-mode').setAttribute('aria-pressed',String(target==='raw'));
     document.querySelector('#stereo-mode').setAttribute('aria-pressed',String(target==='stereo'));
+    document.querySelector('#human-mode').setAttribute('aria-pressed',String(target==='human'));
+    document.body.dataset.previewMode=target;
+    main.hidden=target==='human';
+    document.querySelector('#human-workspace').hidden=target!=='human';
+    document.querySelector('#preview-footer').hidden=target==='human';
+    if(viewer.open)viewer.close();
     document.querySelectorAll('.channels').forEach(e=>e.hidden=target!=='raw');
     stereoDevices.forEach(d=>{d.panel.hidden=target!=='stereo';if(target!=='stereo')d.controller?.abort();else d.views.cloud.draw();});
     channels.forEach(c=>c.controller?.abort());
+    document.dispatchEvent(new CustomEvent('multicamera:mode-change',{detail:{mode:target}}));
     tick();
   });
 }
+function restorePreviewMode(){
+  const target=location.hash.slice(1);
+  if(['raw','stereo','human'].includes(target)&&target!==mode)
+    document.querySelector(`#${target}-mode`).click();
+}
+window.addEventListener('hashchange',restorePreviewMode);
+restorePreviewMode();
 setInterval(()=>{if(mode==='stereo')tick();},2000);
 function changeDepthSettings(){
   try {localStorage.setItem('orin-depth-resolution',resolutionSelect.value);localStorage.setItem('orin-depth-quality',qualitySelect.value);}catch(e){}

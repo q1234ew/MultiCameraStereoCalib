@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "host": "127.0.0.1",
+  "advertised_host": null,
+  "port": 1883,
+  "node_id": "orin",
+  "topic_prefix": "multicamera/orin",
+  "username": null,
+  "password": null,
+  "tls": false,
+  "ca_file": null,
+  "interval_s": 1.0,
+  "legacy_enabled": false,
+  "legacy_mac": null
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "prefix": "/home/nvidia/multicamera-managed",
+  "user": "nvidia",
+  "listen": "0.0.0.0",
+  "preview_port": 8092,
+  "tracking_port": 8093,
+  "service_prefix": "multicamera-managed",
+  "environment_mode": "provision",
+  "devices_file": "/absolute/path/to/devices.json",
+  "calibration_dir": "/absolute/path/to/bundles",
+  "import_state_from": null,
+  "mqtt": {
+    "mode": "managed",
+    "node_id": "scs-orin-nx",
+    "port": 1883,
+    "listen": "127.0.0.1",
+    "external_config": null
+  },
+  "provision": {
+    "build_jobs": 2,
+    "asset_sources": {}
+  },
+  "deployment_profile": "auto"
+}

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from .core import load_config
+from .fusion_preview import load_cloud_preview
 from .fusion_geometry import (
     aggregate_poses,
     check_anchor_depth,
@@ -144,12 +145,13 @@ def calibrate(config_path, bundle_root, out, ids, side_mm=80.0, tag_id=-1, sampl
     return result
 
 
-def run_fusion(captures, extrinsics, out, frames=3, min_depth=0.2, max_depth=10):
+def run_fusion(captures, extrinsics, out, frames=3, min_depth=0.2, max_depth=10,
+               build_mesh=True, tolerance_profile='strict'):
     """Run the migrated algorithms on registered RGB-D, without any camera SDK dependency."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     reference = json.loads(Path(extrinsics).read_text())
-    alignment = check_anchor_depth(captures, reference)
+    alignment = check_anchor_depth(captures, reference, tolerance_profile)
     write_json(out / "alignment_report.json", alignment)
     if not alignment["passed"]:
         raise ValueError("标记外参与深度的尺度或方向不一致，暂停融合；请核对黑色码尺寸、标定与深度")
@@ -199,6 +201,8 @@ def run_fusion(captures, extrinsics, out, frames=3, min_depth=0.2, max_depth=10)
             ],
         ),
     ]
+    if not build_mesh:
+        jobs = jobs[:1]
     for name, script, extra in jobs:
         cmd = [sys.executable, str(script), *common, "--out", str(out / name), *extra]
         env = dict(os.environ, OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="1")
@@ -206,27 +210,20 @@ def run_fusion(captures, extrinsics, out, frames=3, min_depth=0.2, max_depth=10)
             proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, timeout=300)
         if proc.returncode:
             raise ValueError(f"{name} 融合失败，请检查任务日志")
-    import open3d as o3d  # Optional: only loaded inside the isolated fusion CLI process.
-
-    ply = out / "pointcloud/multi_orbbec_world_rgb_pointcloud.ply"
-    cloud = o3d.io.read_point_cloud(str(ply))
-    points = np.asarray(cloud.points)
-    colors = np.asarray(cloud.colors)
-    if not len(points) or not np.isfinite(points).all():
-        raise ValueError("融合点云为空或包含非有限坐标")
-    indices = np.linspace(0, len(points) - 1, min(12000, len(points))).astype(int)
-    reference = json.loads(Path(extrinsics).read_text())
+    preview = load_cloud_preview(out / "pointcloud", reference["cameras"])
     result = {
         "alignment_report": alignment,
-        "point_count": len(points),
-        "points": np.round(points[indices], 4).tolist(),
-        "colors": np.clip(np.rint(colors[indices] * 255), 0, 255).astype(int).tolist(),
+        "tolerance_profile": tolerance_profile,
+        "strict_alignment_passed": alignment.get("strict_passed", alignment["passed"]),
+        "preview_only": tolerance_profile == "preview",
+        **preview,
         "point_unit": "m",
         "world_frame": reference.get(
             "world_frame", reference.get("reference", {}).get("world_frame", "supplied_world_frame")
         ),
         "measurement_accuracy_verified": False,
-        "tsdf": json.loads((out / "tsdf/summary.json").read_text()),
+        "tsdf": json.loads((out / "tsdf/summary.json").read_text()) if build_mesh else None,
+        "build_mesh": build_mesh,
         "pointcloud": json.loads((out / "pointcloud/summary.json").read_text()),
     }
     write_json(out / "fusion_result.json", result)
@@ -258,6 +255,8 @@ def main():
     fuse.add_argument("--frames", type=int, default=3)
     fuse.add_argument("--max-depth-m", type=float, default=10)
     fuse.add_argument("--out", type=Path, required=True)
+    fuse.add_argument("--pointcloud-only", action="store_true")
+    fuse.add_argument("--tolerance-profile", choices=["strict", "preview"], default="strict")
     args = parser.parse_args()
     if args.action == "calibrate":
         result = calibrate(
@@ -280,7 +279,8 @@ def main():
         )
         return 0 if result["quality_passed"] else 2
     result = run_fusion(
-        args.captures, args.extrinsics, args.out, args.frames, max_depth=args.max_depth_m
+        args.captures, args.extrinsics, args.out, args.frames, max_depth=args.max_depth_m,
+        build_mesh=not args.pointcloud_only, tolerance_profile=args.tolerance_profile
     )
     print(json.dumps({"point_count": result["point_count"], "world_frame": result["world_frame"]}))
     return 0

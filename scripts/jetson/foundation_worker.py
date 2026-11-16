@@ -10,11 +10,46 @@ import time
 from pathlib import Path
 
 
+def checkpoint_digest(path, expected=None):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    if expected is not None and value != expected:
+        raise ValueError('FoundationStereo checkpoint SHA256 mismatch; refusing deserialization')
+    return value
+
+
+@contextlib.contextmanager
+def checkpoint_backbone_initialization():
+    """Full FoundationStereo state replaces EdgeNeXt weights via strict loading.
+
+    Do not fetch a second pretrained backbone merely to overwrite it moments later.
+    Only this private worker's initialization is affected; restore timm on all exits.
+    """
+    import timm
+    original = timm.create_model
+
+    def create(name, *args, **kwargs):
+        if name == 'edgenext_small':
+            kwargs['pretrained'] = False
+        return original(name, *args, **kwargs)
+
+    try:
+        timm.create_model = create
+        yield
+    finally:
+        timm.create_model = original
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--expected-sha256')
     args = parser.parse_args()
+    digest = checkpoint_digest(args.checkpoint, args.expected_sha256)
     protocol = sys.stdout
     # Upstream dependencies may print during import; keep protocol stdout isolated.
     with contextlib.redirect_stdout(sys.stderr):
@@ -34,8 +69,9 @@ def main():
         cfg = OmegaConf.load(args.checkpoint.parent / 'cfg.yaml')
         if 'vit_size' not in cfg:
             cfg.vit_size = 'vitl'
-        model = FoundationStereo(cfg)
-        checkpoint = torch.load(str(args.checkpoint), map_location='cpu')
+        with checkpoint_backbone_initialization():
+            model = FoundationStereo(cfg)
+        checkpoint = torch.load(str(args.checkpoint), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=True)
         del checkpoint
         import gc
@@ -45,12 +81,8 @@ def main():
         model = model.cuda().eval()
         gc.collect()
         ctypes.CDLL('libc.so.6').malloc_trim(0)
-        digest = hashlib.sha256()
-        with args.checkpoint.open('rb') as f:
-            for chunk in iter(lambda: f.read(4*1024*1024), b''):
-                digest.update(chunk)
     identity = {'model': 'FoundationStereo', 'checkpoint': str(args.checkpoint),
-                'checkpoint_sha256': digest.hexdigest(),
+                'checkpoint_sha256': digest,
                 'torch': torch.__version__}
     print(json.dumps({'ready': True, 'identity': identity}), file=protocol, flush=True)
     for line in sys.stdin:

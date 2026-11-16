@@ -1,0 +1,30 @@
+[Unit]
+Description=MultiCamera YOLO26 pose and independent camera tracking
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+WorkingDirectory=/home/nvidia/multicamera-jetson
+Environment=HOME=/home/nvidia
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=YOLO_AUTOINSTALL=false
+Environment=YOLO_CONFIG_DIR=/home/nvidia/multicamera-jetson/deployment/yolo26n-pose_20261107/settings
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/home/nvidia/multicamera-jetson/.pose-venv/bin/python -m scripts.jetson.tracking_service --weights deployment/yolo26n-pose_20261107/yolo26n-pose.pt --camera-fps 3
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+UMask=0077
+TasksMax=128
+MemoryAccounting=true
+MemoryLimit=5G
+MemoryMax=5G
+
+[Install]
+WantedBy=multi-user.target

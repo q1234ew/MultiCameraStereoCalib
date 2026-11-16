@@ -162,10 +162,19 @@ def validate_active(calibration, devices):
             raise ValueError("Invalid rigid camera-to-world transform")
 
 
-def check_anchor_depth(captures, calibration):
+TOLERANCE_PROFILES = {
+    'strict': {'ratio': [.95, 1.05], 'depth_p90_m': .05, 'normal_deg': 10},
+    'preview': {'ratio': [.90, 1.10], 'depth_p90_m': .15, 'normal_deg': 10},
+}
+
+
+def check_anchor_depth(captures, calibration, tolerance_profile='strict'):
     """Independent depth/marker-scale gate; stable PnP alone cannot establish alignment."""
     import json
 
+    if tolerance_profile not in TOLERANCE_PROFILES:
+        raise ValueError('Unsupported fusion tolerance profile')
+    limits = TOLERANCE_PROFILES[tolerance_profile]
     if calibration.get('source') != 'foundation_stereo_rectified':
         return {'applicable': False, 'passed': True}
     side = float(calibration['tag_side_mm']) * .001
@@ -214,15 +223,23 @@ def check_anchor_depth(captures, calibration):
                 expected_normal = camera_world[:3, 2]
                 cosine = abs(float(np.dot(basis[-1], expected_normal)))
                 normal_error = float(np.degrees(np.arccos(np.clip(cosine, 0, 1))))
-        passed = bool(len(ratios) >= 5 and .95 <= ratio <= 1.05 and p90 <= .05
-                      and normal_error is not None and normal_error <= 10)
-        checks[ident] = {'passed': passed, 'samples': len(ratios),
+        strict_passed = bool(len(ratios) >= 5 and .95 <= ratio <= 1.05 and p90 <= .05
+                             and normal_error is not None and normal_error <= 10)
+        passed = bool(len(ratios) >= 5 and limits['ratio'][0] <= ratio <= limits['ratio'][1]
+                      and p90 <= limits['depth_p90_m'] and normal_error is not None
+                      and normal_error <= limits['normal_deg'])
+        checks[ident] = {'passed': passed, 'strict_passed': strict_passed, 'samples': len(ratios),
                          'depth_to_tag_ratio': ratio, 'depth_error_p90_m': p90,
                          'plane_normal_error_deg': normal_error,
                          'depth_median_m': float(np.median(depths)) if depths else None,
                          'tag_expected_median_m': float(np.median(expected)) if expected else None}
-    return {'applicable': True, 'passed': all(c['passed'] for c in checks.values())
+    strict_all = all(c['strict_passed'] for c in checks.values()) and len(checks) >= 2
+    return {'tolerance_profile': tolerance_profile, 'strict_passed': strict_all,
+            'preview_only': tolerance_profile == 'preview',
+            'relaxed_acceptance_used': tolerance_profile == 'preview' and not strict_all,
+            'applicable': True, 'passed': all(c['passed'] for c in checks.values())
             and len(checks) >= 2, 'cameras': checks,
-            'ratio_range': [.95, 1.05], 'max_depth_error_p90_m': .05, 'max_plane_normal_error_deg': 10,
+            'ratio_range': limits['ratio'], 'max_depth_error_p90_m': limits['depth_p90_m'],
+            'max_plane_normal_error_deg': limits['normal_deg'],
             'measurement_accuracy_verified': False,
             'note': 'Projected static anchor depth consistency; not a metric accuracy certificate'}

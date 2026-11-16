@@ -1,29 +1,97 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orin 统一预览 · MultiCamera</title><link rel="stylesheet" href="/styles.css"><script src="/cloud.js" defer></script><script src="/app.js" defer></script><script src="/settings.js" defer></script><script src="/fusion.js" defer></script><script src="/photos.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orin 统一预览 · MultiCamera</title><link rel="icon" href="/icon.svg" type="image/svg+xml"><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/human.css"><script src="/cloud.js" defer></script><script src="/app.js" defer></script><script src="/settings.js" defer></script><script src="/fusion.js" defer></script><script src="/photos.js" defer></script><script src="/human-scene.js" defer></script><script src="/human.js" defer></script><script src="/human-controls.js" defer></script></head>
 <body>
-<header><div><h1>MultiCamera <span>/ Orin</span> 统一预览</h1><p>三台设备 · 原始画面与双目深度</p></div><nav aria-label="预览控制"><button id="fusion-open">多设备融合</button><button id="settings-open">设置与状态</button><button id="pause">暂停预览</button><button id="refresh" class="primary">刷新</button></nav></header>
-<div class="mode-bar" role="group" aria-label="画面模式"><button id="raw-mode" aria-pressed="true">原始画面</button><button id="stereo-mode" aria-pressed="false">双目校正 · 深度 · 点云</button><label class="resolution-label" for="depth-resolution">深度分辨率 <select id="depth-resolution"><option value="320x180">320×180 · 快速</option><option value="480x270" selected>480×270 · 标准</option><option value="640x360">640×360 · 精细</option><option value="960x540">960×540 · 高分辨率</option></select></label><label class="resolution-label" for="depth-quality">模型档位 <select id="depth-quality"><option value="fast">快速 · 8 次迭代</option><option value="standard">标准 · 16 次迭代</option><option value="fine">精细 · 32 次迭代</option></select></label><p>FoundationStereo · 深度 0.2–10 m · 暖色近 / 冷色远 / 黑色无效</p></div>
+<header><div><h1>MultiCamera <span>/ Orin</span> 统一预览</h1><p>三台设备 · 原始画面 · 双目深度 · 人体追踪</p></div><nav aria-label="预览控制"><button id="fusion-open">多设备融合</button><button id="settings-open">设置与状态</button><button id="pause">暂停预览</button><button id="refresh" class="primary">刷新</button></nav></header>
+<div class="mode-bar" role="group" aria-label="画面模式"><button id="raw-mode" aria-pressed="true">原始画面</button><button id="stereo-mode" aria-pressed="false">双目校正 · 深度 · 点云</button><button id="human-mode" aria-pressed="false">人体追踪</button><label class="resolution-label" for="depth-resolution">深度分辨率 <select id="depth-resolution"><option value="320x180">320×180 · 快速</option><option value="480x270" selected>480×270 · 标准</option><option value="640x360">640×360 · 精细</option><option value="960x540">960×540 · 高分辨率</option></select></label><label class="resolution-label" for="depth-quality">模型档位 <select id="depth-quality"><option value="fast">快速 · 8 次迭代</option><option value="standard">标准 · 16 次迭代</option><option value="fine">精细 · 32 次迭代</option></select></label><p>FoundationStereo · 深度 0.2–10 m · 暖色近 / 冷色远 / 黑色无效</p></div>
 <main id="devices" aria-label="设备画面"><p id="loading" role="status">正在连接设备…</p></main>
-<footer>点击任意画面可放大查看（保持原始比例显示）<span>独立快照 · 未硬件同步 · 深度精度待验收</span></footer>
+<section id="human-workspace" hidden aria-label="人体识别与追踪"><div class="human-content">
+<section class="page-heading"><div><div class="eyebrow">ORIN / HUMAN TRACKING</div><h2 class="human-title">人体识别与追踪</h2><p>三路相机 · 统一空间 · 匿名人员 ID</p></div><div class="human-page-actions"><button id="human-run-toggle" disabled>连接追踪服务…</button><button id="human-runtime-open" disabled>追踪运行设置</button><button id="human-replay-open">回放评测</button><button id="human-mqtt-open">MQTT 输出</button><button id="human-settings-open">演示显示设置</button><div class="mode-switch" aria-label="数据模式"><button id="human-demo-mode" aria-pressed="false">演示场景</button><button id="human-status-mode" aria-pressed="true">实时追踪</button></div></div></section>
+<p id="human-control-message" class="human-control-message" role="status" hidden></p><div class="notice" id="human-mode-notice"><span class="notice-dot"></span><div><strong>正在预览模拟追踪数据</strong><span>用于评审布局与交互。画面、轨迹、位置与运行指标均为演示，不代表 Orin 实时结果。</span></div></div>
+<section class="metrics" aria-label="追踪概览"><article><span>场景内人数 <small>去重</small></span><div><strong id="human-metric-people">3</strong><span>人</span></div><p id="human-metric-people-note">2 人稳定关联 · 1 人单路观察</p></article><article><span>参与画面</span><div><strong id="human-metric-cameras">3 / 3</strong><span>路</span></div><p id="human-metric-cameras-note">演示输入 · 非设备在线状态</p></article><article><span>追踪端到端延迟</span><div><strong id="human-metric-latency">128</strong><span>ms</span></div><p>模拟值 · 包含采集与关联</p></article><article><span>Orin 内存占用</span><div><strong id="human-metric-memory">5.2</strong><span>GB</span></div><p>模拟值 · 整机共享内存</p></article></section>
+<section class="workspace">
+<aside class="camera-column"><div class="section-title"><h2>相机画面</h2><label class="muted">画面模式 <select id="human-preview-mode" aria-label="相机预览模式"><option value="smooth">流畅预览 · 25 FPS</option><option value="exact">逐帧核对 · 跟随追踪</option></select></label></div><div id="human-camera-list"></div><p class="column-note">同一人员使用相同颜色；画面内编号为本机 ID。<br>点击人员可在场景与列表中定位。</p></aside>
+<section class="scene-panel panel"><div class="panel-heading"><div><h2>空间总览 <span class="tag">静态场景 + 动态人员</span></h2><p>演示区域 A · 8 × 6 m · 地面坐标系</p></div><span class="small-label">单位 m</span></div><div class="scene-toolbar"><div class="segmented" aria-label="场景视角"><button id="human-iso-view" aria-pressed="true">立体</button><button id="human-top-view" aria-pressed="false">俯视</button></div><div class="layer-controls"><label><input id="human-show-trails" type="checkbox" checked>轨迹</label><label><input id="human-show-fov" type="checkbox" checked>相机视野</label><button id="human-reset-view" aria-label="复位场景视角">复位</button></div></div><div id="human-scene" class="scene" aria-label="演示三维场景"></div><div class="scene-legend"><span><i class="dot" data-color="mint"></i>P-001</span><span><i class="dot" data-color="blue"></i>P-002</span><span><i class="dot" data-color="amber"></i>P-003</span><span class="legend-tip">点击标记查看人员</span></div><div class="playback"><button id="human-play-pause" aria-label="暂停演示">Ⅱ</button><div class="playback-track"><label for="human-timeline">演示时间 <output id="human-time-label">00:18</output></label><input id="human-timeline" type="range" min="0" max="60" value="18"></div><span class="time-end">01:00</span><button id="human-speed" aria-label="切换演示速度">1×</button></div><div class="scene-foot"><span>世界 X / Y 沿地面，Z 向上</span><span>点击人员联动三路画面</span></div></section>
+<aside class="inspector panel"><div class="panel-heading"><h2>人员详情</h2><span class="tag">匿名追踪</span></div><div id="human-person-detail"></div></aside>
+</section>
+<section class="bottom-grid"><div class="panel tracks-panel"><div class="panel-heading"><h2>人员轨迹 <span id="human-track-count" class="count">3</span></h2><label class="filter-label">筛选 <select id="human-track-filter" aria-label="筛选"><option value="all">全部人员</option><option value="linked">跨机已关联</option><option value="single">单路观察</option></select></label></div><div class="table-scroll"><table><thead><tr><th>统一 ID</th><th>观察来源 / 本机 ID</th><th>空间位置 X / Y / Z</th><th>关联状态</th><th>最近观察</th></tr></thead><tbody id="human-track-rows"></tbody></table></div></div><div class="panel events-panel"><div class="panel-heading"><h2>关联动态</h2><span class="tag">模拟事件</span></div><ol id="human-events"><li><time>00:18</time><div><strong>P-001 在相机 2 中持续可见</strong><p>位置与轨迹一致，保持统一 ID。</p></div></li><li><time>00:14</time><div><strong>P-003 暂仅在相机 3 中观察</strong><p>保留独立 ID，等待其他视角证据。</p></div></li><li><time>00:09</time><div><strong>P-002 完成双视角关联</strong><p>相机 2 / 3 的多帧证据一致。</p></div></li></ol></div></section>
+<footer>设计预览 v1 · YOLO26n-pose 检测 / 姿态 + 单机追踪 + 跨机融合<span>当前为匿名轨迹标记，不提供人脸身份识别</span></footer>
+</div><dialog id="human-settings"><form method="dialog"><div class="dialog-heading"><div><h2>演示显示设置</h2><p>仅调整演示画面；实时叠加请使用“追踪运行设置”。</p></div><button aria-label="关闭设置">✕</button></div><label class="setting-row"><span><strong>人体骨架</strong><small>在三路画面上显示姿态连线</small></span><input id="human-show-skeleton" type="checkbox" checked></label><label class="setting-row"><span><strong>检测框</strong><small>显示本机追踪编号与置信度</small></span><input id="human-show-boxes" type="checkbox" checked></label><label class="setting-row"><span><strong>轨迹长度</strong><small>场景中保留的位置历史</small></span><select id="human-trail-length"><option value="short">短 · 3 秒</option><option value="long" selected>标准 · 8 秒</option></select></label><div class="settings-info">位置参考点：双脚中点投影到地面。三维姿态另行展示，不把人体中心当作地面位置。</div><button class="primary" value="done">完成</button></form></dialog>
+
+<dialog id="human-runtime-dialog" aria-labelledby="human-runtime-title">
+<div class="dialog-heading"><div><h2 id="human-runtime-title">追踪运行设置</h2><p>应用后写入 Orin，服务重启后仍保留。</p></div><button id="human-runtime-close" aria-label="关闭运行设置">✕</button></div>
+<p id="human-runtime-effective" class="human-runtime-note"></p>
+<form id="human-runtime-form"><div class="human-runtime-grid">
+<label>单机跟踪器<select name="tracker"><option value="bytetrack">ByteTrack</option><option value="ocsort">OC-SORT</option><option value="tracktrack">TrackTrack</option></select></label>
+<label>每路追踪采集上限（帧/秒）<input name="camera_fps" type="number" min="0.5" max="25" step="0.5" required></label>
+<label>人体模型输入边长<select name="imgsz"><option value="320">320 · 性能优先</option><option value="480">480 · 均衡</option><option value="640">640 · 细节优先</option><option value="960">960</option></select></label>
+<label>新目标置信度阈值<input name="new_track_conf" type="number" min="0.15" max="0.75" step="0.05" required></label>
+<label>逐帧核对画质（50–90）<input name="jpeg_quality" type="number" min="50" max="90" step="1" required></label>
+<div class="human-runtime-checks"><label><input type="checkbox" name="draw_boxes">人体框与本机 ID</label><label><input type="checkbox" name="draw_skeleton">人体骨架</label></div>
+</div><p class="human-runtime-note">暂停或修改算法、频率、模型输入、目标阈值会重新建立轨迹并重新编号。流畅预览为960×540独立画面，画质设置用于逐帧核对。模型输入不改变相机采集分辨率；320档更注重速度，远处人体和脚踝精度需现场核对。</p>
+<div class="human-runtime-actions"><button type="button" id="human-runtime-reload">重新读取</button><button type="submit" class="primary" id="human-runtime-apply">应用到 Orin</button></div><p id="human-runtime-message" role="status"></p></form>
+</dialog>
+<dialog id="human-replay-dialog" aria-labelledby="human-replay-title"><div class="dialog-heading"><div><h2 id="human-replay-title">最近回放评测</h2><p>离线视频结果，不代表现场三路性能。</p></div><button id="human-replay-close" aria-label="关闭回放评测">✕</button></div><div id="human-replay-result" role="status">正在读取…</div></dialog>
+
+<dialog id="human-mqtt-dialog" aria-labelledby="human-mqtt-title"><div class="dialog-heading"><div><h2 id="human-mqtt-title">MQTT 输出</h2><p>在线状态和运行数据与实时轨迹分别上报。</p></div><button id="human-mqtt-close" aria-label="关闭 MQTT 输出">✕</button></div><p id="human-mqtt-state" class="human-runtime-note"></p><div id="human-mqtt-topics"></div><p class="human-runtime-note">实时轨迹不保留为历史消息；接收方应结合在线状态、时间和有效期使用。旧协议兼容 topic 仅输出字段已核验的对象，不填造温度或姿态。订阅凭据单独提供，不在网页展示。</p></dialog>
+<div id="human-toast" role="status" aria-live="polite"></div>
+</section>
+<footer id="preview-footer">点击任意画面可放大查看（保持原始比例显示）<span>独立快照 · 未硬件同步 · 深度精度待验收</span></footer>
 <dialog id="fusion-dialog" aria-labelledby="fusion-title">
 <div class="dialog-head"><h2 id="fusion-title">双目深度 · 多设备融合</h2><button id="fusion-close">关闭</button></div>
-<p>相机与场景保持静止。先用各设备共同可见的同一个 AprilTag 建立外参，再采集 FoundationStereo 深度并融合。世界坐标 X/Y 沿共同码边缘，Z 垂直码面。独立快照未硬件同步；一致性检查通过不代表测量精度验收。</p>
+<ol class="fusion-steps" aria-label="融合步骤"><li data-fusion-step="devices"><b>1</b> 检查设备<span>读取双目画面</span></li><li data-fusion-step="calibration"><b>2</b> 确认外参<span>匹配参与设备</span></li><li data-fusion-step="capture"><b>3</b> 采集与融合<span>保持场景静止</span></li><li data-fusion-step="result"><b>4</b> 查看结果<span>核验与导出</span></li></ol>
+<section class="fusion-next" aria-live="polite"><div><strong id="fusion-next-title">正在检查设备与外参…</strong><p id="fusion-next-note">检查完成后显示可执行的下一步。</p></div><div class="fusion-next-actions"><button type="button" id="fusion-check">重新检查连接</button><button type="button" class="primary" id="fusion-next-action" disabled>检查设备后继续</button></div></section>
+<section id="fusion-progress-panel" hidden aria-label="当前任务进度"><div><strong id="fusion-progress-title"></strong><span id="fusion-elapsed"></span></div><progress id="fusion-progress" max="1" aria-labelledby="fusion-progress-title"></progress><p id="fusion-progress-note">关闭窗口后任务仍会在 Orin 上继续。</p></section>
+<div class="fusion-workspace">
+<section class="fusion-stage" aria-label="融合点云查看器">
+<div class="fusion-stage-head"><div><h3>公共坐标系点云</h3><span class="fusion-badge">测量精度待验收</span></div><button id="fusion-expand" aria-pressed="false">放大查看</button></div>
+<p id="fusion-calibration" role="status">正在读取外参状态…</p>
+<p id="fusion-message" role="status" aria-live="polite"></p><p id="fusion-job-cache-note" class="fusion-help" hidden></p><p id="fusion-timings" class="fusion-help" hidden></p>
+<section id="fusion-recovery" class="fusion-recovery" aria-labelledby="fusion-recovery-title" hidden>
+<h4 id="fusion-recovery-title">融合暂不可用</h4><p id="fusion-recovery-reason"></p>
+<ol id="fusion-recovery-steps"><li>先核验各设备的双目校正、深度与单机点云。此步骤不计算跨机外参。<button id="fusion-check-single">查看单机深度与点云</button></li>
+<li>单机核验完成后，再采集共同 AprilTag 建立跨机外参。<button id="fusion-check-extrinsics">定位跨机外参设置</button></li></ol>
+<p id="fusion-recovery-note">单机预览仅供人工核验，不会自动判定标定通过或恢复已失效的外参。</p>
+</section>
+<p id="fusion-tolerance-note" class="fusion-help">严格档：比例±5%、P90≤5cm；法向≤10°。预览档允许更大错位，只用于观察。</p><p id="fusion-result-settings">当前显示结果：暂无</p>
+<fieldset id="fusion-layers" hidden><legend>当前结果 · 设备图层</legend><div id="fusion-layer-list"></div><p id="fusion-layer-note"></p></fieldset>
+<div class="fusion-toolbar" role="group" aria-label="点云视角">
+<button id="fusion-reset">复位视角</button><button id="fusion-fit">居中适配</button>
+<button id="fusion-level">世界 Z 朝上</button><button id="fusion-roll-left" aria-label="画面逆时针旋转15度">左转15°</button><button id="fusion-roll-right" aria-label="画面顺时针旋转15度">右转15°</button>
+<button id="fusion-zoom-in" aria-label="放大点云">放大＋</button><button id="fusion-zoom-out" aria-label="缩小点云">缩小－</button>
+<button data-cloud-view="front">正视</button><button data-cloud-view="top">俯视</button><button data-cloud-view="side">侧视</button><button data-cloud-view="iso">立体</button>
+</div>
+<div class="fusion-viewport"><canvas id="fusion-cloud" class="cloud-canvas"></canvas></div>
+<div class="fusion-display" role="group" aria-label="点云显示设置">
+<label>拖动方式<select id="fusion-drag"><option value="rotate">旋转</option><option value="pan">平移</option><option value="roll">滚转 · 摆正画面</option></select></label>
+<label>着色<select id="fusion-color"><option value="rgb">原始颜色</option><option value="height">世界 Z 高度</option><option value="device" disabled>设备分色</option></select></label>
+<label>点大小 <output id="fusion-size-value" for="fusion-point-size">2 px</output><input id="fusion-point-size" type="range" min="1" max="5" step="1" value="2"></label>
+<label class="fusion-check"><input id="fusion-axes" type="checkbox" checked>坐标轴</label><label class="fusion-check"><input id="fusion-grid" type="checkbox">XY 网格</label>
+</div>
+<p class="fusion-help">拖动自由旋转，可翻转至背面 · 滚转模式横拖摆正画面 · Shift / 右键 / 中键拖动平移 · 滚轮或双指缩放 · Q / E 滚转 · 双击 / F 居中 · Home 复位。世界 Z 朝上仅调整视角；AprilTag 坐标轴不代表已标定重力方向，导出点云坐标保持不变。</p>
+<section id="fusion-output" hidden><p id="fusion-summary"></p><button id="fusion-save">保存当前视图 PNG</button></section><div id="fusion-downloads" class="fusion-actions"></div>
+</section>
+<aside class="fusion-setup">
+<details open><summary>参与设备与采集设置</summary>
+<p>相机与场景保持静止。用共同可见的同一个 AprilTag 建立外参后，再采集深度并融合。</p>
 <form id="fusion-form">
-<fieldset id="fusion-inputs"><legend>参与设备与参数</legend><div id="fusion-devices" class="fusion-devices"><label><input type="checkbox" name="fusion-device" value="device_1" checked>设备 1</label><label><input type="checkbox" name="fusion-device" value="device_2" checked>设备 2</label><label><input type="checkbox" name="fusion-device" value="device_3">设备 3</label></div>
-<div class="controls-grid">
+<fieldset id="fusion-inputs"><legend>参与设备与参数</legend><div id="fusion-devices" class="fusion-devices"><label><input type="checkbox" name="fusion-device" value="device_1">设备 1 <small data-fusion-device-status="device_1">待检查</small></label><label><input type="checkbox" name="fusion-device" value="device_2">设备 2 <small data-fusion-device-status="device_2">待检查</small></label><label><input type="checkbox" name="fusion-device" value="device_3">设备 3 <small data-fusion-device-status="device_3">待检查</small></label></div><div class="fusion-selection-actions"><button type="button" id="fusion-use-calibrated">选择已有外参设备</button><button type="button" id="fusion-use-online">选择可用设备</button></div>
+<details class="fusion-calibration-options"><summary>外参标定参数 · 需要重新标定时设置</summary><div class="controls-grid">
 <label>码黑色外边框实测边长（mm）<input id="fusion-tag-size" type="number" min="10" max="1000" step="any" value="80" required></label>
 <label>AprilTag 36h11 编号（-1 自动）<input id="fusion-tag-id" type="number" min="-1" max="586" step="1" value="-1" required></label>
 <label>外参采样次数<input id="fusion-samples" type="number" min="3" max="8" step="1" value="3" required></label>
-<label>每台融合帧数<input id="fusion-frames" type="number" min="1" max="5" step="1" value="3" required></label>
+</div></details><div class="fusion-presets"><span>采集方案</span><button type="button" data-fusion-preset="quick">快速检查</button><button type="button" data-fusion-preset="balanced">均衡</button><button type="button" data-fusion-preset="detail">精细建模</button></div><div class="controls-grid"><label>融合容差<select id="fusion-tolerance"><option value="strict">严格 · ±5% / 5cm</option><option value="preview">预览 · ±10% / 15cm</option></select></label><label>输出内容<select id="fusion-output-mode"><option value="cloud">点云预览 · 更快</option><option value="mesh">点云 + TSDF 网格</option></select></label><label>每台融合帧数<input id="fusion-frames" type="number" min="1" max="5" step="1" value="3" required></label>
 <label>融合最大深度（m）<input id="fusion-max-depth" type="number" min="0.5" max="10" step="any" value="4" required></label>
-</div><p id="fusion-depth-settings"></p>
-<div class="fusion-actions"><button type="submit" name="action" value="calibrate">采集并标定外参</button><button type="submit" name="action" value="fuse" class="primary" id="fusion-start">采集深度并融合</button></div>
+<label>下次深度分辨率<select id="fusion-resolution"><option value="320x180">320×180 · 快速</option><option value="480x270">480×270 · 标准</option><option value="640x360">640×360 · 精细</option><option value="960x540">960×540 · 高分辨率</option></select></label>
+<label>下次模型档位<select id="fusion-quality"><option value="fast">快速 · 8 次迭代</option><option value="standard">标准 · 16 次迭代</option><option value="fine">精细 · 32 次迭代</option></select></label>
+</div><p id="fusion-depth-settings">仅用于下一次融合任务；首次打开取自主界面，此后独立保留。本次结果与主界面预览不受修改影响。</p>
+<section class="fusion-cache-box" aria-label="深度缓存"><label><input id="fusion-reuse-cache" type="checkbox" disabled>复用深度缓存：我确认相机和场景未变化</label><p id="fusion-cache-detail" role="status">正在读取缓存状态…</p><button type="button" id="fusion-clear-cache">清除缓存索引</button><p id="fusion-cost-note"></p></section><div class="fusion-actions"><button type="submit" name="action" value="calibrate" id="fusion-calibrate-start">重新采集共同码并标定</button><button type="submit" name="action" value="fuse" class="primary" id="fusion-start">开始采集与融合</button></div>
 </fieldset></form>
-<p id="fusion-calibration" role="status">正在读取外参状态…</p>
-<p id="fusion-message" role="status" aria-live="polite"></p><button id="fusion-refresh">刷新任务状态</button>
-<div id="fusion-downloads" class="fusion-actions"></div>
-<section id="fusion-output" hidden><h3>公共坐标系融合点云</h3><p id="fusion-summary"></p><canvas id="fusion-cloud" class="cloud-canvas"></canvas><button id="fusion-reset" class="cloud-reset">复位视角</button></section>
+</details>
+<button id="fusion-refresh">刷新任务状态</button>
+<p>世界 X/Y 沿共同码边缘，Z 垂直码面。显示操作只改变视图，不修改点云与标定。</p>
+<p>独立快照未硬件同步；一致性检查通过不代表测量精度验收。</p>
+</aside></div>
 </dialog>
 <dialog id="viewer" aria-labelledby="viewer-title"><div class="dialog-head"><h2 id="viewer-title"></h2><button id="close">关闭</button></div><img id="large" alt="放大画面"></dialog>
 <dialog id="settings-dialog" aria-labelledby="settings-title">

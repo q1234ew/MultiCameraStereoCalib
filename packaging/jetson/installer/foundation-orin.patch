@@ -1,0 +1,78 @@
+diff --git a/Utils.py b/Utils.py
+index 15fc84a..cbccf09 100644
+--- a/Utils.py
++++ b/Utils.py
+@@ -7,12 +7,7 @@
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ 
+-import os, sys, time,torch,torchvision,pickle,trimesh,itertools,datetime,imageio,logging,joblib,importlib,argparse
+-import torch.nn.functional as F
+-import torch.nn as nn
+-from functools import partial
+-import pandas as pd
+-import open3d as o3d
++import os, sys, torch, imageio, logging, importlib
+ import cv2
+ import numpy as np
+ # from transformations import *
+@@ -41,6 +36,7 @@ def set_seed(random_seed):
+ 
+ 
+ def toOpen3dCloud(points,colors=None,normals=None):
++  import open3d as o3d
+   cloud = o3d.geometry.PointCloud()
+   cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+   if colors is not None:
+@@ -138,4 +134,3 @@ def depth_uint8_decoding(depth_uint8, scale=1000):
+   depth_uint8 = depth_uint8.astype(float)
+   out = depth_uint8[...,0]*255*255 + depth_uint8[...,1]*255 + depth_uint8[...,2]
+   return out/float(scale)
+-
+diff --git a/depth_anything/dpt.py b/depth_anything/dpt.py
+index 442a04a..84cea72 100644
+--- a/depth_anything/dpt.py
++++ b/depth_anything/dpt.py
+@@ -150,11 +150,11 @@ class DPT_DINOv2(nn.Module):
+ 
+         assert encoder in ['vits', 'vitb', 'vitl']
+ 
+-        # in case the Internet connection is not stable, please load the DINOv2 locally
+-        # if localhub:
+-        #     self.pretrained = torch.hub.load('torchhub/facebookresearch_dinov2_main', 'dinov2_{:}14'.format(encoder), source='local', pretrained=False)
+-        # else:
+-        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_{:}14'.format(encoder), pretrained=pretrained_dino)
++        local_dinov2 = os.path.join(code_dir, '..', 'dinov2')
++        if os.path.isdir(local_dinov2):
++            self.pretrained = torch.hub.load(local_dinov2, 'dinov2_{:}14'.format(encoder), source='local', pretrained=pretrained_dino)
++        else:
++            self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_{:}14'.format(encoder), pretrained=pretrained_dino)
+ 
+ 
+         dim = self.pretrained.blocks[0].attn.qkv.in_features
+diff --git a/dinov2/dinov2/layers/attention.py b/dinov2/dinov2/layers/attention.py
+index f1d3dab..72218ba 100644
+--- a/dinov2/dinov2/layers/attention.py
++++ b/dinov2/dinov2/layers/attention.py
+@@ -7,6 +7,8 @@
+ #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
+ #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
+ 
++from __future__ import annotations
++
+ import logging
+ import os
+ import warnings
+diff --git a/dinov2/dinov2/layers/block.py b/dinov2/dinov2/layers/block.py
+index 7e83b71..7a7776c 100644
+--- a/dinov2/dinov2/layers/block.py
++++ b/dinov2/dinov2/layers/block.py
+@@ -7,6 +7,8 @@
+ #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
+ #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
+ 
++from __future__ import annotations
++
+ import logging
+ import os
+ from typing import Callable, List, Any, Tuple, Dict, Optional

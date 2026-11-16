@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "profile": "jetpack6-l4t36.4.3-aarch64",
+  "assets": {
+    "torch": {
+      "filename": "torch-2.8.0-cp310-cp310-linux_aarch64.whl",
+      "bytes": 225979378,
+      "sha256": "62a1beee9f2f147076a974d2942c90060c12771c94740830327cae705b2595fc",
+      "urls": [
+        "https://pypi.jetson-ai-lab.io/jp6/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl"
+      ]
+    },
+    "python-source": {
+      "filename": "Python-3.10.22.tar.xz",
+      "max_bytes": 31457280,
+      "sha256": "c61fe9b1a1a7ec2a0b0388e664187c378a5325a89e3606d220abf5bdfccb2543",
+      "urls": [
+        "https://www.python.org/ftp/python/3.10.22/Python-3.10.22.tar.xz"
+      ]
+    },
+    "foundation-source": {
+      "filename": "foundation-source.tar.gz",
+      "bytes": 18772924,
+      "sha256": "dcd14a14080d588600c6e0754d0ff9a8020fa9be70cc3d96f6b8f1193cf1946e",
+      "urls": [
+        "https://codeload.github.com/NVlabs/FoundationStereo/tar.gz/6e8806816b533e4d13ddbb95ffa907b797060a62"
+      ]
+    },
+    "torchvision-source": {
+      "filename": "torchvision-source.tar.gz",
+      "bytes": 13124572,
+      "sha256": "8c1f2951e98d8ada6e5a468f179af4be9f56d2ebc3ab057af873da61669806d7",
+      "urls": [
+        "https://codeload.github.com/pytorch/vision/tar.gz/refs/tags/v0.16.2"
+      ]
+    },
+    "torchvision-wheel": {
+      "filename": "torchvision-0.23.0-cp310-cp310-linux_aarch64.whl",
+      "bytes": 1548174,
+      "sha256": "907c4c1933789645ebb20dd9181d40f8647978e6bd30086ae7b01febb937d2d1",
+      "urls": [
+        "https://pypi.jetson-ai-lab.io/jp6/+f/907/c4c1933789645/torchvision-0.23.0-cp310-cp310-linux_aarch64.whl"
+      ]
+    },
+    "foundation": {
+      "relative_checkpoint": "pretrained_models/23-51-11/model_best_bp2.pth",
+      "bytes": 3298527334,
+      "sha256": "60e79bde9c6a00acea551625ff814fe06e5a6806e2c0c9829baee248de87c5f1",
+      "filename": "model_best_bp2.pth",
+      "urls": [],
+      "google_drive_folder": "https://drive.google.com/drive/folders/1VhPebc_mMxWKccrv7pdQLTvXYVcLYpsf"
+    },
+    "pose": {
+      "bytes": 7878574,
+      "sha256": "eb3bb8268828aeaf515cec23a4bfafd793944a86fe9af94ba7823609c14522a9",
+      "filename": "yolo26n-pose.pt",
+      "urls": [
+        "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-pose.pt"
+      ]
+    },
+    "pip": {
+      "filename": "pip-25.0.1-py3-none-any.whl",
+      "urls": [
+        "https://files.pythonhosted.org/packages/c9/bc/b7db44f5f39f9d0494071bddae6880eb645970366d0a200022a1a93d57f5/pip-25.0.1-py3-none-any.whl"
+      ],
+      "bytes": 1841526,
+      "sha256": "c46efd13b6aa8279f33f2864459c8ce587ea6a1a59ee20de055868d8f7688f7f"
+    }
+  },
+  "default_python310": "/usr/bin/python3",
+  "cuda_major": 12,
+  "cuda_runtime": "12.6",
+  "prebuilt_torchvision": true,
+  "requirements_suffix": "-jp6",
+  "cuda_apt_packages": [
+    "cuda-cudart-12-6",
+    "cuda-libraries-12-6",
+    "cuda-nvcc-12-6",
+    "cuda-cudart-dev-12-6",
+    "libcudnn9-cuda-12"
+  ]
+}

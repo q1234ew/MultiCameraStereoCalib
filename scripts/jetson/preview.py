@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from .fusion_controller import FusionController
 from .camera_settings import CameraSettings
 from .photos import PhotoController
 from .stereo_preview import QUALITY_PRESETS, RESOLUTIONS, StereoHub
+from .tracking_proxy import TrackingProxy
+from .web_assets import versioned_index
 
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 ASSETS = Path(__file__).with_name('web')
@@ -33,7 +36,8 @@ class SnapshotHub:
     async def _download(self, key):
         async with self.slots:
             async with self.session.get(self.urls[key], allow_redirects=False) as response:
-                if response.status != 200:
+                if (response.status != 200
+                        or response.headers.get('X-UStreamer-Online', '').lower() == 'false'):
                     raise ValueError('Camera unavailable')
                 body = bytearray()
                 async for chunk in response.content.iter_chunked(65536):
@@ -85,10 +89,15 @@ def make_preview_app(config: dict, bundle_root: Path | None = None) -> web.Appli
     settings = CameraSettings(config, hub, stereo, bundle_root)
     fusion = FusionController(config, stereo, settings, bundle_root)
     photos = PhotoController(config, hub, stereo, settings, fusion)
+    # Offline/depth requests cannot consume the real-time preview's upstream slots.
+    tracking_hub = SnapshotHub(config)
+    tracking = TrackingProxy(tracking_hub, config["devices"], settings=settings,
+        base_url=os.environ.get("MULTICAMERA_TRACKING_URL", "http://127.0.0.1:8093"))
 
     async def lifecycle(app):
         async with ClientSession(timeout=ClientTimeout(total=3), trust_env=False) as session:
             hub.session = session
+            tracking_hub.session = session
             yield
             await fusion.close()
             await stereo.close()
@@ -120,16 +129,30 @@ def make_preview_app(config: dict, bundle_root: Path | None = None) -> web.Appli
 
     async def asset(request):
         name = request.match_info.get('asset', 'index.html')
-        if name not in ('index.html', 'app.js', 'styles.css', 'cloud.js', 'settings.js', 'fusion.js', 'photos.js'):
+        if name not in (
+            'index.html', 'app.js', 'styles.css', 'cloud.js', 'settings.js', 'fusion.js',
+            'photos.js', 'human-scene.js', 'human.js', 'human.css', 'human-controls.js', 'icon.svg',
+        ):
             raise web.HTTPNotFound()
+        if name == 'index.html':
+            source, revision = versioned_index(ASSETS)
+            return web.Response(text=source, content_type='text/html',
+                                headers={'X-MultiCamera-UI': revision})
         return web.FileResponse(ASSETS / name)
 
     app.router.add_get('/', asset)
     app.router.add_get('/api/devices', devices)
     app.router.add_get('/api/status', settings.status)
+    app.router.add_get('/api/tracking/state', tracking.state)
+    app.router.add_post('/api/tracking/control', tracking.control)
+    app.router.add_get('/api/tracking/replay', tracking.replay)
+    app.router.add_get('/api/tracking/frame/{device}', tracking.frame)
+    app.router.add_get('/api/tracking/preview/{device}', tracking.preview.frame)
+    app.router.add_get('/api/tracking/preview-stream/{device}', tracking.preview.stream)
     app.router.add_post('/api/photos', photos.capture)
     app.router.add_get('/api/photos/{photo}/original.jpg', photos.original)
     app.router.add_get('/api/fusion/status', fusion.status)
+    app.router.add_post('/api/fusion/cache/clear', fusion.clear_cache)
     app.router.add_post('/api/fusion/jobs', fusion.start)
     app.router.add_get('/api/fusion/result/{job}', fusion.result)
     app.router.add_get('/api/fusion/files/{job}/{name}', fusion.artifact)

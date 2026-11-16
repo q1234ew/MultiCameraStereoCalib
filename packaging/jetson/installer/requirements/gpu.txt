@@ -1,0 +1,22 @@
+-r gpu-base.txt
+ultralytics==8.4.204
+lap==0.5.12
+paho-mqtt==2.1.0
+timm==1.0.27
+omegaconf==2.3.0
+einops==0.8.1
+scipy==1.10.1
+imageio==2.35.1
+huggingface-hub==0.36.2
+safetensors==0.5.3
+opencv-python==4.10.0.84
+matplotlib==3.7.5
+polars==1.8.2
+psutil==7.2.2
+nvidia-ml-py==13.615.71
+ultralytics-thop==2.2.5
+contourpy==1.1.1
+fonttools==4.57.0
+importlib-resources==6.4.5
+zipp==3.20.2
+PyYAML==6.0.2

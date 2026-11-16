@@ -34,14 +34,18 @@ class FoundationRunner:
             checkpoint = root / 'pretrained_models/23-51-11/model_best_bp2.pth'
             if not checkpoint.is_file():
                 raise ValueError('FoundationStereo checkpoint is unavailable')
-            log_path = Path.home()/'multicamera-jetson/validation/foundation-worker.log'
+            log_path = Path(os.environ.get('FOUNDATION_STEREO_LOG',
+                str(Path.home()/'multicamera-jetson/validation/foundation-worker.log')))
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log = log_path.open('a')
             env = dict(os.environ, XFORMERS_DISABLED='1', HF_HUB_OFFLINE='1',
                        OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
             self.process = subprocess.Popen(
-                ['/usr/bin/python3', str(Path(__file__).with_name('foundation_worker.py')),
-                 '--root', str(root), '--checkpoint', str(checkpoint)],
+                [os.environ.get('FOUNDATION_STEREO_PYTHON', '/usr/bin/python3'),
+                 str(Path(__file__).with_name('foundation_worker.py')),
+                 '--root', str(root), '--checkpoint', str(checkpoint),
+                 *(['--expected-sha256', os.environ['FOUNDATION_STEREO_CHECKPOINT_SHA256']]
+                   if os.environ.get('FOUNDATION_STEREO_CHECKPOINT_SHA256') else [])],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                 text=True, bufsize=1, env=env)
             ready = self._read(180)

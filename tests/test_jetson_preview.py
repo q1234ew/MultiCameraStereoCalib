@@ -1,5 +1,7 @@
 """Read-only preview routing, coalescing and bounded upstream handling."""
 import asyncio
+import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -21,10 +23,23 @@ def test_preview_assets_and_read_only_routes():
         async with TestClient(TestServer(make_preview_app(config()))) as client:
             response = await client.get('/')
             assert response.status == 200
-            assert '统一预览' in await response.text()
+            html = await response.text()
+            assert '统一预览' in html
+            digest = hashlib.sha256((ROOT / 'scripts/jetson/web/human.js').read_bytes()
+                                    ).hexdigest()[:16]
+            assert f'/human.js?v={digest}' in html
+            assert response.headers['Cache-Control'] == 'no-store'
+            revision = response.headers['X-MultiCamera-UI']
+            assert f'name="multicamera-ui-revision" content="{revision}"' in html
+            for url in re.findall(r'(?:src|href)="(/[^\"]+\?v=[a-f0-9]+)"', html):
+                asset = await client.get(url)
+                assert asset.status == 200
+                assert asset.headers['Cache-Control'] == 'no-store'
             assert "frame-ancestors 'none'" in response.headers['Content-Security-Policy']
             assert (await client.get('/app.js')).status == 200
             assert (await client.get('/styles.css')).status == 200
+            assert (await client.get('/human.js')).status == 200
+            assert (await client.get('/human.css')).status == 200
             response = await client.get('/api/devices')
             devices = (await response.json())['devices']
             assert len(devices) == 3 and all(len(d['channels']) == 3 for d in devices)
@@ -63,7 +78,7 @@ def test_coalesces_clients_and_negative_caches_failure():
     asyncio.run(check())
 
 
-@pytest.mark.parametrize('mode', ['valid', 'padded', 'oversize', 'redirect', 'invalid'])
+@pytest.mark.parametrize('mode', ['valid', 'padded', 'oversize', 'redirect', 'invalid', 'source_offline'])
 def test_upstream_validation(mode):
     async def check():
         requests = []
@@ -74,8 +89,10 @@ def test_upstream_validation(mode):
                 raise web.HTTPFound('/unexpected')
             body = {'valid': b'\xff\xd8jpeg\xff\xd9', 'oversize': b'x' * (MAX_IMAGE_BYTES + 1),
                     'padded': b'\xff\xd8jpeg\xff\xd9' + b'\x00' * 7,
-                    'invalid': b'<html>not JPEG</html>'}.get(mode)
-            return web.Response(body=body)
+                    'invalid': b'<html>not JPEG</html>',
+                    'source_offline': b'\xff\xd8placeholder\xff\xd9'}.get(mode)
+            return web.Response(body=body, headers={
+                'X-UStreamer-Online': 'false' if mode == 'source_offline' else 'true'})
 
         app = web.Application()
         app.router.add_get('/snapshot', source)
