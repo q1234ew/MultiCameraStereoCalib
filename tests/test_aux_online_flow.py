@@ -150,7 +150,8 @@ def test_stale_sampler_result_uses_source_time_not_completion_time(online):
     detections, qualities = guide._preview_detections, guide.last_qualities
     guide.invalidate_live()
     started = guide._clock()
-    guide._preview_ready((guide.context_key(), started, (time.time()-4, time.time()-4)),
+    old = time.time() - guide.MAX_AGE - 1
+    guide._preview_ready((guide.context_key(), started, (old, old)),
                          (detections, qualities), '')
     assert not guide._samples and not guide.last_qualities
 

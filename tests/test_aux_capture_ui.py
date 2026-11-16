@@ -347,7 +347,7 @@ def test_rejected_stale_stability_and_cumulative_drift_do_not_pass(panel):
     assert not panel._aux_guide.stability_reasons([det, det])
     shifted = replace(det, image_points=det.image_points + [5., 0.])
     assert panel._aux_guide.stability_reasons([shifted, det])
-    panel._aux_guide._clock = lambda: time.monotonic() + 5
+    panel._aux_guide._clock = lambda: time.monotonic() + panel._aux_guide.MAX_AGE + 1
     assert len(panel._aux_guide.stability_reasons([det, det])) == 2
 
 
@@ -383,9 +383,9 @@ def test_preview_ready_and_raw_stability_share_full_acceptance(panel, case):
     if case == 'missing':
         guide._preview_detections = []
     if case == 'stale':
-        guide._clock = lambda: 14.
+        guide._clock = lambda: 10. + guide.MAX_AGE + 1
     if case == 'quality_stale':
-        guide._preview_result_at = 6.
+        guide._preview_result_at = 10. - guide.MAX_AGE - 1
     guide.render()
     assert ('可以采集' in guide.action.text()) == (case == 'stable')
     assert bool(guide.stability_reasons(guide._preview_detections)) == (
@@ -545,7 +545,7 @@ def test_expired_preview_result_cannot_restore_a_revoked_ready_state(panel):
     guide.action.setText('保持静止，可以采集')
     guide.expire('ir')
     assert '可以采集' not in guide.action.text()
-    guide._preview_ready((guide.context_key(), guide._clock() - 5), None, '')
+    guide._preview_ready((guide.context_key(), guide._clock() - guide.MAX_AGE - 1), None, '')
     assert '可以采集' not in guide.action.text() and not guide.last_qualities
 
 

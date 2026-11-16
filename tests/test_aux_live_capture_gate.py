@@ -348,8 +348,8 @@ def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     panel, image = live_panel, board_image()
     guide = panel._aux_guide
     result = detection_result(panel, image)
-    stamp = time.time() - (4 if kind == 'stale_source' else .1)
-    delivered = 103.5 if kind == 'slow' else 100.1
+    stamp = time.time() - (guide.MAX_AGE + 1 if kind == 'stale_source' else .1)
+    delivered = 100. + guide.MAX_AGE + .5 if kind == 'slow' else 100.1
     if kind == 'invalidated':
         panel.test_clock[0] = 100.05
         panel._aux_guide.invalidate_live()
@@ -359,13 +359,13 @@ def test_old_sampler_result_cannot_restore_ready_evidence(live_panel, kind):
     assert panel._aux_guide.capture_problem()
     assert panel._aux_saved_count == 0 and not panel._aux_pairs
     if kind == 'slow':
-        assert '预检耗时3.5秒' in guide.capture_problem()
+        assert f'预检耗时{guide.MAX_AGE + .5:.1f}秒' in guide.capture_problem()
     elif kind == 'stale_source':
         assert '源帧已过期' in guide.capture_problem()
     assert '请让整板同时可见' not in guide.capture_problem()
 
 
-@pytest.mark.parametrize('age, accepted', [(2.2, True), (3., True), (3.001, False)])
+@pytest.mark.parametrize('age, accepted', [(2.2, True), (5., True), (5.001, False)])
 def test_temporary_precheck_age_accepts_measured_latency_but_stays_bounded(
         live_panel, monkeypatch, age, accepted):
     panel = live_panel
