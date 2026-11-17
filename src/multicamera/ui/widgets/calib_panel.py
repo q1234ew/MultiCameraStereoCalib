@@ -4415,11 +4415,14 @@ class CalibrationPanel(CalibrationReviewMixin, QWidget):
         self._log(f"正在后台导入多模态图片，板参数: {board_cfg.to_dict()}")
         self._set_aux_import_busy(True)
         worker = AuxImageImportWorker(folder, board_cfg, parent=self, modality=self._aux_modality(),
-                                      offline_recheck=True)
+                                      offline_recheck=True,
+                                      rgb_intrinsics=self._intrinsics.get(self._rgb_left_camera_id()))
         worker.review_saved = review_saved
         worker.auto_restore = auto_restore
         worker.import_context = (id(self._session), self._rgb_left_camera_id(),
                                  self._aux_camera_id(), self._aux_modality())
+        worker.rgb_intrinsics_context = deepcopy(worker.rgb_intrinsics.to_dict()
+                                                if worker.rgb_intrinsics is not None else None)
         worker.finished_ok.connect(self._on_import_aux_images_ready)
         worker.failed.connect(self._on_import_aux_images_failed)
         worker.finished.connect(worker.deleteLater)
@@ -4453,6 +4456,13 @@ class CalibrationPanel(CalibrationReviewMixin, QWidget):
                 (id(self._session), self._rgb_left_camera_id(), self._aux_camera_id(), self._aux_modality())):
             self._log("辅助板参数在导入期间已变更，已忽略旧检测结果，请重新导入")
             return
+        intr = self._intrinsics.get(self._rgb_left_camera_id())
+        if (worker is not None and hasattr(worker, 'rgb_intrinsics_context') and
+                worker.rgb_intrinsics_context != (intr.to_dict() if intr is not None else None)):
+            self._log('RGB固定内参在导入期间已变更，已忽略旧几何重检，请重新导入')
+            return
+        for message in getattr(worker, 'geometry_messages', []):
+            self._log(message)
         if not img_pairs and getattr(worker, 'review_saved', False):
             self._log('当前会话未找到可读取的融合配对原图；保留当前数据，请检查保存目录')
             return
@@ -4593,8 +4603,15 @@ class CalibrationPanel(CalibrationReviewMixin, QWidget):
                 report = outcome['report']
                 dialog.set_correspondence_report(report)
                 ids = report.get('suspect_ids', [])
-                self._log('角点编号方向检查（不改变图像配对）：' + ('请逐对复核 ' + '、'.join(ids) if ids else
-                    '未发现明确冲突或共识不足，仍须核对物理对应') + '；未自动纳入或修改原图')
+                if report.get('refinement_error'):
+                    message = '检查未通过，具体问题图像及原因见下条；不得视为编号正确'
+                elif ids:
+                    message = '请逐对复核 ' + '、'.join(ids)
+                elif report.get('unresolved_ids'):
+                    message = '尚未确定对应：' + '、'.join(report['unresolved_ids'])
+                else:
+                    message = '未发现明确编号冲突，仍须核对物理对应'
+                self._log('角点编号方向检查（不改变图像配对）：' + message + '；未自动纳入或修改原图')
                 if report.get('refinement_error'):
                     self._log('编号检查几何细化未通过：' + report['refinement_error'])
                 elif report.get('diagnostic_refinement'):

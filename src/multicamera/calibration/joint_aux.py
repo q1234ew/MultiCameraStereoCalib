@@ -387,7 +387,21 @@ def _fit(records, board, rgb_intrinsics, model_key, *, resolve_correspondence=Tr
     else:
         hypotheses = _rotation_hypotheses(records, board, rgb_intrinsics, seed)
     if not hypotheses:
-        raise ValueError('跨模态编号共识不足，未获得覆盖全部观测的初始化；请复核图像和角点')
+        issues = []
+        for key, rgb, aux in records:
+            for name, det, intr in (('RGB', rgb, rgb_intrinsics), ('IR/辅助', aux, seed)):
+                try:
+                    pose = _solve_board_pose(det, intr)
+                    error = _reprojection_error(det, *pose, intr) if pose else float('inf')
+                except cv2.error:
+                    error = float('inf')
+                if not np.isfinite(error) or error > 1.5:
+                    value = f'{error:.3f} px > 1.5 px' if np.isfinite(error) else '位姿无效'
+                    issues.append(f'[{key}] {name}初始化几何异常：{value}')
+        detail = '；'.join(issues) if issues else (
+            '无法建立完整旋转共识，涉及图像：' + '、'.join(str(row[0]) for row in records))
+        raise ValueError('跨模态编号共识不足，未获得覆盖全部观测的初始化；' + detail +
+                         '；请复核或补拍所列原图，不代表所有图像编号错误')
     attempts, valid = [], []
     for assignment in hypotheses:
         attempt = dict(orders=assignment)

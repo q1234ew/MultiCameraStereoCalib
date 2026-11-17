@@ -233,6 +233,55 @@ class PlanarPatternDetector:
         fallback.detection_info['attempts'] = attempts
         return fallback
 
+    def recheck_rgb_geometry(self, image, detection, intrinsics):
+        """Retry native SB after weak fixed-optics geometry; never fit camera optics.
+
+        This is an offline input check, not model selection by calibration RMS.
+        Both candidates face the unchanged original-image quality checks.
+        """
+        from .aux_capture_quality import assess_aux_frame
+        from .auxiliary import _solve_board_pose, _reprojection_error, _validate_intrinsics
+
+        if intrinsics is None or self.config.pattern_type != PatternType.CHESSBOARD:
+            return detection
+        if not assess_aux_frame(image, detection, self.config, modality='rgb').accepted:
+            return detection
+        try:
+            _validate_intrinsics(intrinsics, detection.image_size)
+        except ValueError:
+            detection.detection_info['geometry_recheck'] = dict(
+                status='skipped', reason='固定RGB内参与原图尺寸或参数不匹配')
+            return detection
+
+        def error(candidate):
+            try:
+                pose = _solve_board_pose(candidate, intrinsics)
+                value = _reprojection_error(candidate, *pose, intrinsics) if pose else float('inf')
+                return float(value) if np.isfinite(value) else float('inf')
+            except cv2.error:
+                return float('inf')
+
+        before = error(detection)
+        if before <= 1.5:
+            return detection
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        candidate = self._detect_sb(gray, 1, None, False)
+        quality = assess_aux_frame(image, candidate, self.config, modality='rgb')
+        after = error(candidate) if quality.accepted else float('inf')
+        accepted = quality.accepted and after <= 1.5
+        evidence = dict(status='recovered' if accepted else 'unresolved',
+            original_method=detection.detection_info.get('method'),
+            original_geometry_rms_px=before if np.isfinite(before) else None,
+            sb_geometry_rms_px=after if np.isfinite(after) else None,
+            rms_limit_px=1.5, original_points=detection.image_points.tolist(),
+            fixed_rgb_intrinsics=intrinsics.to_dict(),
+            sb_quality_reasons=list(quality.reasons), coordinate_space='original_pixels')
+        result = candidate if accepted else detection
+        if accepted:
+            result.detection_info['method'] = 'sb_geometry_native'
+        result.detection_info['geometry_recheck'] = evidence
+        return result
+
     def _detect_sb(self, gray, scale, roi, inverted):
         x, y, w, h = roi if roi is not None else (0, 0, gray.shape[1], gray.shape[0])
         work = gray[y:y+h, x:x+w]

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import traceback
+from copy import deepcopy
 from collections import Counter
 from pathlib import Path
 
@@ -102,7 +103,7 @@ class AuxImageImportWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, folder: str, board_config, parent=None, *, modality='ir',
-                 offline_recheck=False):
+                 offline_recheck=False, rgb_intrinsics=None):
         super().__init__(parent)
         self.folder = folder
         self.board_config = board_config
@@ -112,6 +113,8 @@ class AuxImageImportWorker(QThread):
         self.offline_reviews = {}
         self.import_context = None
         self.read_errors = []
+        self.rgb_intrinsics = deepcopy(rgb_intrinsics)
+        self.geometry_messages = []
 
     def run(self):
         try:
@@ -142,6 +145,18 @@ class AuxImageImportWorker(QThread):
                     continue
                 rgb_det = (detector.detect_offline(rgb) if self.offline_recheck
                            else detector.detect(rgb))
+                if self.offline_recheck:
+                    rgb_det = detector.recheck_rgb_geometry(rgb, rgb_det, self.rgb_intrinsics)
+                    check = rgb_det.detection_info.get('geometry_recheck')
+                    if check:
+                        status = {'recovered': '原尺寸SB重检恢复', 'unresolved': '重检未恢复',
+                                  'skipped': '未执行重检'}[check['status']]
+                        self.geometry_messages.append(
+                            f'[{key}] RGB原图几何检查：{status}；'
+                            f'原检测RMS={check.get("original_geometry_rms_px")} px，'
+                            f'原尺寸SB RMS={check.get("sb_geometry_rms_px")} px；'
+                            + ('重检已恢复，仍须逐对确认' if check['status'] == 'recovered' else
+                               check.get('reason', '未恢复，请复核或补拍此图像')))
                 aux_det = (detector.detect_offline(aux, modality=self.modality)
                            if self.offline_recheck else detector.detect(aux))
                 qualities = [assess_aux_frame(image, det, self.board_config,
